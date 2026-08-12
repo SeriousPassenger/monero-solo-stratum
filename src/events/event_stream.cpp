@@ -143,11 +143,11 @@ void EventStream::stop() noexcept {
     if (!running_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
-    close_descriptor(listener_);
     if (thread_.joinable()) {
         thread_.request_stop();
         thread_.join();
     }
+    close_descriptor(listener_);
     {
         std::lock_guard lock(clients_mutex_);
         for (auto &client : clients_) {
@@ -204,7 +204,7 @@ void EventStream::loop() noexcept {
 }
 
 void EventStream::accept_clients() {
-    for (;;) {
+    while (running()) {
         const int descriptor = ::accept4(listener_, nullptr, nullptr,
                                          SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (descriptor < 0) {
