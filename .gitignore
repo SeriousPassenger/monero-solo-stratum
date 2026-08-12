@@ -1,0 +1,12 @@
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/config.json
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sock
+compile_commands.json
+__pycache__/
+*.py[cod]

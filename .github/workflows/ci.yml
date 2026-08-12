@@ -1,0 +1,252 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: "1"
+
+jobs:
+  release:
+    name: Release / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04-gcc
+            os: ubuntu-22.04
+            cc: /usr/bin/gcc
+            cxx: /usr/bin/g++
+          - name: ubuntu-24.04-gcc
+            os: ubuntu-24.04
+            cc: /usr/bin/gcc
+            cxx: /usr/bin/g++
+          - name: ubuntu-24.04-clang
+            os: ubuntu-24.04
+            cc: /usr/bin/clang
+            cxx: /usr/bin/clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - name: Check out recursive source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify dependency pins
+        run: |
+          set -euo pipefail
+          git submodule status --recursive
+          ! git submodule status --recursive | grep -Eq '^[+-U]'
+          test "$(git -C third_party/monero-stratum-pow-verifier rev-parse HEAD)" = 856c015de433a23fe45d88a18dc08c821e50f1cb
+          test "$(git -C third_party/monero-stratum-pow-verifier/third_party/RandomX rev-parse HEAD)" = 6c4340ba4561aec9a3611c1aedf9931239777fb3
+          test "$(git -C third_party/nlohmann-json rev-parse HEAD)" = 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
+          test "$(git -C third_party/sqlite-amalgamation rev-parse HEAD)" = 15d0ff10ebc7e7225eced1de84bb52137000899b
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends binutils build-essential clang cmake libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
+          "$CC" --version
+          "$CXX" --version
+
+      - name: Configure and build
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_IGNORE_PREFIX_PATH=/usr/local \
+            -DCURL_NO_CURL_CMAKE=ON \
+            -DBUILD_TESTING=ON \
+            -DMSS_BUILD_TESTS=ON \
+            "-DMSS_GIT_COMMIT=$(git rev-parse HEAD)"
+          cmake --build build-release --parallel 2
+
+      - name: Require and run the exact server test inventory
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-release --show-only=json-v1 | python3 -c 'import json,sys; got={t["name"] for t in json.load(sys.stdin)["tests"]}; want={"monero_template_tests","rental_fanin_tests","runtime_tests","api_tests","config_tests","database_tests","entropy_tests","http_tests","logger_tests","monero_tests","protocol_tests","verifier_tests"}; assert got == want, {"missing":sorted(want-got),"extra":sorted(got-want)}'
+          ctest --test-dir build-release --output-on-failure --no-tests=error --parallel 1
+
+      - name: Validate CLI and staged install
+        run: |
+          set -euo pipefail
+          ./build-release/monero-solo-stratum --version | grep -Fx 'monero-solo-stratum 0.1.0'
+          ./build-release/monero-solo-stratum --check-config --config "$PWD/config.example.json" | grep -Fx 'configuration valid'
+          DESTDIR="$PWD/stage" cmake --install build-release
+          test -x stage/usr/bin/monero-solo-stratum
+          test -f stage/etc/monero-solo-stratum/config.example.json
+          test -f stage/usr/lib/systemd/system/monero-solo-stratum.service
+          grep -Fx 'ExecStartPre=/usr/bin/monero-solo-stratum --check-config --config /etc/monero-solo-stratum/config.json' stage/usr/lib/systemd/system/monero-solo-stratum.service
+          grep -Fx 'ExecStart=/usr/bin/monero-solo-stratum --config /etc/monero-solo-stratum/config.json' stage/usr/lib/systemd/system/monero-solo-stratum.service
+          ! readelf -d stage/usr/bin/monero-solo-stratum | grep -Eq '(RPATH|RUNPATH)'
+          ! ldd stage/usr/bin/monero-solo-stratum | grep -F 'not found'
+
+  verifier:
+    name: Standalone verifier / 3 tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out recursive source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential cmake ninja-build python3
+
+      - name: Configure, build, and test
+        run: |
+          set -euo pipefail
+          cmake -S third_party/monero-stratum-pow-verifier -B build-verifier -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=ON \
+            -DMSPV_BUILD_TESTS=ON \
+            -DMSPV_BUILD_EXAMPLES=ON \
+            -DMSPV_BUILD_BENCHMARK=OFF \
+            -DMSPV_BUILD_FAST_TESTS=OFF
+          cmake --build build-verifier --parallel 2
+          test -x build-verifier/mspv_verify
+          ctest --test-dir build-verifier --show-only=json-v1 | python3 -c 'import json,sys; got={t["name"] for t in json.load(sys.stdin)["tests"]}; want={"mspv-light","mspv-c-api","mspv-install-consumer"}; assert got == want, {"missing":sorted(want-got),"extra":sorted(got-want)}'
+          ctest --test-dir build-verifier --output-on-failure --no-tests=error --parallel 1
+
+  asan-ubsan:
+    name: ASan + UBSan / Clang
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out recursive source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential clang cmake libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
+
+      - name: Configure and build
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=/usr/bin/clang \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_IGNORE_PREFIX_PATH=/usr/local \
+            -DCURL_NO_CURL_CMAKE=ON \
+            -DBUILD_TESTING=ON \
+            -DMSS_BUILD_TESTS=ON \
+            -DMSS_ENABLE_SANITIZERS=ON \
+            -DMSS_ENABLE_TSAN=OFF \
+            -DMSPV_ENABLE_SANITIZERS=ON
+          cmake --build build-asan --parallel 2
+
+      - name: Run all tests under ASan and UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:halt_on_error=1:abort_on_error=1
+          LSAN_OPTIONS: exitcode=23
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-asan --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 12, [t["name"] for t in tests]'
+          ctest --test-dir build-asan --output-on-failure --no-tests=error --parallel 1
+
+  tsan:
+    name: ThreadSanitizer / GCC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out recursive source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential cmake libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
+
+      - name: Configure, build, and test
+        env:
+          TSAN_OPTIONS: halt_on_error=1:abort_on_error=1:second_deadlock_stack=1:history_size=7
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-tsan -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=/usr/bin/gcc \
+            -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+            -DCMAKE_IGNORE_PREFIX_PATH=/usr/local \
+            -DCURL_NO_CURL_CMAKE=ON \
+            -DBUILD_TESTING=ON \
+            -DMSS_BUILD_TESTS=ON \
+            -DMSS_ENABLE_SANITIZERS=OFF \
+            -DMSS_ENABLE_TSAN=ON \
+            -DMSPV_ENABLE_SANITIZERS=OFF
+          cmake --build build-tsan --parallel 2
+          ctest --test-dir build-tsan --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 12, [t["name"] for t in tests]'
+          ctest --test-dir build-tsan --output-on-failure --no-tests=error --parallel 1
+
+  source-archive:
+    name: Reproducible source archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out recursive source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential cmake coreutils findutils gzip libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3 tar
+
+      - name: Prove archive reproducibility and build its Git-free extraction
+        run: |
+          set -euo pipefail
+          scripts/test-source-archive.sh
+          archive="$RUNNER_TEMP/monero-solo-stratum-source.tar.gz"
+          extract_root="$RUNNER_TEMP/archive-extract"
+          build_root="$RUNNER_TEMP/archive-build"
+          scripts/make-source-archive.sh "$archive"
+          scripts/verify-source-archive.py "$archive"
+          sha256sum "$archive"
+          mkdir "$extract_root"
+          tar -C "$extract_root" -xzf "$archive"
+          test -z "$(find "$extract_root" -name .git -print -quit)"
+          cmake -S "$extract_root/monero-solo-stratum" -B "$build_root" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_IGNORE_PREFIX_PATH=/usr/local \
+            -DCURL_NO_CURL_CMAKE=ON \
+            -DBUILD_TESTING=ON \
+            -DMSS_BUILD_TESTS=ON
+          cmake --build "$build_root" --parallel 2
+          ctest --test-dir "$build_root" --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 12, [t["name"] for t in tests]'
+          ctest --test-dir "$build_root" --output-on-failure --no-tests=error --parallel 1
