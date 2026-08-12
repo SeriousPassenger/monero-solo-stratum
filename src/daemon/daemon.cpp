@@ -327,7 +327,12 @@ RpcObservation DaemonRpcClient::post(std::string_view absolute_url,
     curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 0L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_NOPROXY, "*");
+#if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS,
+                     static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
     curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "monero-solo-stratum/0.1.0");
     if (!username_.empty()) {
         curl_easy_setopt(curl.get(), CURLOPT_HTTPAUTH, CURLAUTH_DIGEST);
