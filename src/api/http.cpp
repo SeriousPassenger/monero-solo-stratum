@@ -199,11 +199,6 @@ struct HttpServer::Client {
     std::string peer;
 };
 
-struct HttpServer::Bucket {
-    double tokens{};
-    std::chrono::steady_clock::time_point updated{std::chrono::steady_clock::now()};
-};
-
 std::string http_reason_phrase(int status) {
     switch (status) {
     case 200: return "OK";

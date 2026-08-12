@@ -58,7 +58,11 @@ public:
 
 private:
     struct Client;
-    struct Bucket;
+    struct Bucket {
+        double tokens{};
+        std::chrono::steady_clock::time_point updated{
+            std::chrono::steady_clock::now()};
+    };
     void accept_loop() noexcept;
     void worker_loop() noexcept;
     void serve(Client client);
