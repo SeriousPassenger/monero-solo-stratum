@@ -1,0 +1,36 @@
+[Unit]
+Description=Monero solo Stratum server
+After=network-online.target monerod.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monero-solo-stratum
+Group=monero-solo-stratum
+StateDirectory=monero-solo-stratum
+RuntimeDirectory=monero-solo-stratum
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStartPre=@CMAKE_INSTALL_FULL_BINDIR@/monero-solo-stratum --check-config --config @CMAKE_INSTALL_FULL_SYSCONFDIR@/monero-solo-stratum/config.json
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/monero-solo-stratum --config @CMAKE_INSTALL_FULL_SYSCONFDIR@/monero-solo-stratum/config.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=90s
+LimitNOFILE=65536
+# Fast-mode RandomX and required large pages may need an operator-specific
+# LimitMEMLOCK value. Confirm local huge-page policy before enabling `require`.
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/monero-solo-stratum /run/monero-solo-stratum
+
+[Install]
+WantedBy=multi-user.target

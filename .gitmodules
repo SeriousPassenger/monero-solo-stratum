@@ -1,0 +1,9 @@
+[submodule "third_party/monero-stratum-pow-verifier"]
+	path = third_party/monero-stratum-pow-verifier
+	url = https://github.com/SeriousPassenger/monero-stratum-pow-verifier.git
+[submodule "third_party/nlohmann-json"]
+	path = third_party/nlohmann-json
+	url = https://github.com/nlohmann/json.git
+[submodule "third_party/sqlite-amalgamation"]
+	path = third_party/sqlite-amalgamation
+	url = https://github.com/azadkuh/sqlite-amalgamation.git

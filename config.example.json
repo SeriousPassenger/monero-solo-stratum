@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "network": "mainnet",
+  "wallet_address": "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A",
+  "blocknotify": null,
+  "stratum": {
+    "listen": [
+      "127.0.0.1:3333",
+      "[::1]:3333"
+    ],
+    "access_password": null,
+    "max_connections": 2048,
+    "max_connections_per_ip": 128,
+    "login_timeout_ms": 10000,
+    "idle_timeout_ms": 300000,
+    "max_line_bytes": 16384,
+    "max_output_bytes_per_connection": 1048576,
+    "max_json_depth": 32,
+    "job_history": 6,
+    "job_ttl_ms": 120000,
+    "max_pending_verifications_per_connection": 8,
+    "submit_workers": 0
+  },
+  "daemon": {
+    "rpc_url": "http://127.0.0.1:18081",
+    "rpc_username": null,
+    "rpc_password": null,
+    "zmq_address": null,
+    "poll_interval_ms": 20000,
+    "request_timeout_ms": 15000,
+    "max_concurrent_requests": 8,
+    "max_pending_requests": 256,
+    "max_response_bytes": 16777216,
+    "refresh_retry_ms": 1000,
+    "submit_attempts": 4,
+    "submit_retry_ms": 2000
+  },
+  "difficulty": {
+    "mode": "fixed",
+    "value": 1048576
+  },
+  "verifier": {
+    "enabled": true,
+    "memory_mode": "fast",
+    "workers": 0,
+    "seed_init_threads": 0,
+    "max_seeds": 2,
+    "pending_capacity": 256,
+    "max_outstanding": 512,
+    "max_input_size": 4096,
+    "max_buffered_input_bytes": 16777216,
+    "large_pages": "try",
+    "jit": "secure",
+    "aes": "auto",
+    "log_level": "info"
+  },
+  "entropy": {
+    "reseed_interval_seconds": 1800,
+    "max_reseed_age_seconds": 1860,
+    "max_generate_calls": 1048576
+  },
+  "database": {
+    "path": "/tmp/monero-solo-stratum.sqlite3",
+    "busy_timeout_ms": 5000,
+    "max_writer_queue_items": 100000,
+    "max_writer_queue_bytes": 67108864,
+    "retention_days": 0,
+    "store_rejected_shares": true
+  },
+  "events": {
+    "enabled": true,
+    "unix_socket": "/tmp/monero-solo-stratum-events.sock",
+    "permissions": "0660",
+    "max_clients": 8,
+    "max_pending_bytes_per_client": 1048576
+  },
+  "api": {
+    "enabled": true,
+    "listen": "127.0.0.1:8787",
+    "access_token": null,
+    "max_page_size": 1000,
+    "max_connections": 64,
+    "request_rate_per_second": 20,
+    "request_burst": 40,
+    "max_pending_bytes_per_connection": 2097152
+  },
+  "defense": {
+    "enabled": false,
+    "profile": "aggressive",
+    "ban_seconds": 7200,
+    "connection_rate_per_minute": 60,
+    "connection_burst": 20,
+    "request_rate_per_second": 50,
+    "request_burst": 100,
+    "submit_rate_per_second": 20,
+    "submit_burst": 40,
+    "malformed_limit": 10,
+    "auth_failure_limit": 10,
+    "unknown_job_limit": 20,
+    "duplicate_limit": 20,
+    "abuse_window_seconds": 60,
+    "hammer_rate_multiplier": 4,
+    "hammer_sustain_seconds": 5,
+    "candidate_rate_per_minute": 12,
+    "candidate_burst": 3,
+    "candidate_inflight_per_ip": 2,
+    "candidate_global_inflight": 64,
+    "false_candidate_limit": 3,
+    "false_candidate_window_seconds": 600,
+    "trusted_candidate_rejection_limit": 3,
+    "trusted_candidate_rejection_window_seconds": 600,
+    "verification_mismatch_limit": 10,
+    "verification_mismatch_window_seconds": 600
+  },
+  "logging": {
+    "level": "info",
+    "file": null
+  }
+}

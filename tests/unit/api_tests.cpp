@@ -1,0 +1,556 @@
+/*
+ * Copyright (c) 2026 SeriousPassenger
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "monero_solo/api.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <iostream>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <unistd.h>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+using Json = nlohmann::json;
+
+void require(const bool condition, const char *const message)
+{
+    if (!condition) throw std::runtime_error(message);
+}
+
+Json body(const monero_solo::HttpResponse &response)
+{
+    return Json::parse(response.body);
+}
+
+monero_solo::HttpRequest request(std::string path,
+                                 std::string query = {},
+                                 std::string method = "GET",
+                                 std::optional<std::string> token = "correct-token")
+{
+    monero_solo::HttpRequest result;
+    result.method = std::move(method);
+    result.path = std::move(path);
+    result.query = std::move(query);
+    result.target = result.path + (result.query.empty() ? "" : "?" + result.query);
+    result.version = "HTTP/1.1";
+    result.peer = "127.0.0.1";
+    if (token.has_value()) {
+        result.headers.emplace("authorization", "Bearer " + *token);
+    }
+    return result;
+}
+
+monero_solo::ApiReadinessSnapshot ready_snapshot()
+{
+    const monero_solo::ApiComponentState ready{true, false, std::nullopt};
+    return {
+        3736190,
+        ready,
+        ready,
+        ready,
+        ready,
+        ready,
+        ready,
+    };
+}
+
+monero_solo::ApiService make_service(monero_solo::ApiDataSource source,
+                                     std::optional<std::string> token =
+                                         "correct-token")
+{
+    monero_solo::ApiServiceOptions options;
+    options.api.enabled = false;
+    options.api.access_token = std::move(token);
+    options.api.max_page_size = 1000;
+    options.identity.version = "0.1.0";
+    options.identity.git_commit =
+        "0123456789abcdef0123456789abcdef01234567";
+    options.identity.session_id = "0123456789abcdef0123456789abcdef";
+    options.identity.started_unix_us = 1'700'000'000'000'000;
+    return monero_solo::ApiService(
+        std::move(options), nullptr, std::move(source),
+        [] { return std::int64_t{1'700'000'123'456'789}; });
+}
+
+void test_auth_method_and_health()
+{
+    monero_solo::ApiDataSource source;
+    source.readiness = [] { return ready_snapshot(); };
+    source.singleton = [](const monero_solo::ApiSingleton resource)
+        -> std::optional<Json> {
+        if (resource == monero_solo::ApiSingleton::summary) {
+            return Json{{"server", {{"version", "0.1.0"}}}};
+        }
+        return std::nullopt;
+    };
+    auto service = make_service(std::move(source));
+
+    const auto missing = service.handle(request("/v1/health/live", {}, "GET",
+                                                 std::nullopt));
+    require(missing.status == 401, "missing token did not return 401");
+    require(body(missing)["error"]["code"] == "authentication_required",
+            "wrong authentication error code");
+    require(missing.headers.size() == 1U &&
+                missing.headers.front().first == "WWW-Authenticate",
+            "401 omitted Bearer challenge");
+
+    const auto wrong = service.handle(request("/v1/health/live", {}, "GET",
+                                               "wrong-token"));
+    require(wrong.status == 401, "wrong token did not return 401");
+
+    const auto live = service.handle(request("/v1/health/live"));
+    const Json live_body = body(live);
+    require(live.status == 200 && live_body.size() == 3U,
+            "live envelope is wrong");
+    require(live_body["schema_version"] == 1 &&
+                live_body["generated_at"] == "2023-11-14T22:15:23.456789Z" &&
+                live_body["data"]["alive"] == true &&
+                live_body["data"]["uptime_seconds"] == 123,
+            "live endpoint fields are wrong");
+
+    const auto ready = service.handle(request("/v1/health/ready"));
+    const Json ready_body = body(ready);
+    require(ready.status == 200 && ready_body["data"]["ready"] == true &&
+                ready_body["data"]["components"].size() == 6U &&
+                ready_body["data"]["components"]["template"]["reason"].is_null(),
+            "ready endpoint is wrong");
+
+    const auto summary = service.handle(request("/v1/summary"));
+    require(summary.status == 200 &&
+                body(summary)["data"]["server"]["version"] == "0.1.0",
+            "summary callback route failed");
+
+    const auto method = service.handle(request("/v1/summary", {}, "POST"));
+    require(method.status == 405 && method.headers.front().first == "Allow" &&
+                body(method)["error"]["code"] == "method_not_allowed",
+            "control method was not rejected exactly");
+
+    const auto root = service.handle(request("/"));
+    require(root.status == 404 &&
+                body(root)["error"]["code"] == "not_found",
+            "root unexpectedly exposed HTML/dashboard content");
+}
+
+void test_not_ready_and_null_empty_auth_semantics()
+{
+    monero_solo::ApiDataSource source;
+    source.readiness = [] {
+        monero_solo::ApiReadinessSnapshot snapshot = ready_snapshot();
+        snapshot.verifier = {false, false, "current seed preparing"};
+        return snapshot;
+    };
+    auto service = make_service(std::move(source), std::nullopt);
+    const auto response = service.handle(
+        request("/v1/health/ready", {}, "GET", std::nullopt));
+    require(response.status == 503 && body(response)["data"]["ready"] == false &&
+                body(response)["data"]["components"]["verifier"]["reason"] ==
+                    "current seed preparing",
+            "readiness failure contract is wrong");
+
+    monero_solo::ApiDataSource empty_source;
+    empty_source.readiness = [] { return ready_snapshot(); };
+    auto empty_token_service = make_service(std::move(empty_source), "");
+    require(empty_token_service
+                .handle(request("/v1/health/live", {}, "GET", std::nullopt))
+                .status == 200,
+            "empty API token did not disable authentication");
+}
+
+void test_collection_cursor_and_strict_queries()
+{
+    struct State {
+        int calls{};
+        std::uint64_t last_after{};
+    } state;
+    monero_solo::ApiDataSource source;
+    source.collection = [&](const monero_solo::ApiCollectionRequest &query) {
+        ++state.calls;
+        state.last_after = query.after_database_id;
+        require(query.resource == monero_solo::ApiCollection::shares,
+                "wrong collection resource");
+        require(query.limit == 2U, "wrong collection limit");
+        require(query.filters.at("status") == "accepted",
+                "collection lost filters");
+        if (query.after_database_id == 0) {
+            return monero_solo::ApiCollectionResult{
+                Json::array({Json{{"id", "1"}}, Json{{"id", "2"}}}), 2};
+        }
+        require(query.after_database_id == 2U,
+                "cursor decoded wrong database ID");
+        return monero_solo::ApiCollectionResult{
+            Json::array({Json{{"id", "3"}}}), std::nullopt};
+    };
+    auto service = make_service(std::move(source));
+    const auto first = service.handle(
+        request("/v1/shares", "status=accepted&limit=2"));
+    const Json first_body = body(first);
+    require(first.status == 200 && first_body["data"].size() == 2U &&
+                first_body["page"]["limit"] == 2 &&
+                first_body["page"]["next_cursor"].is_string(),
+            "first collection page is wrong");
+    const std::string cursor = first_body["page"]["next_cursor"];
+
+    const auto second = service.handle(request(
+        "/v1/shares", "status=accepted&limit=2&cursor=" + cursor));
+    require(second.status == 200 && body(second)["data"].size() == 1U &&
+                body(second)["page"]["next_cursor"].is_null() &&
+                state.last_after == 2U,
+            "second cursor page is wrong");
+
+    const auto wrong_endpoint = service.handle(request(
+        "/v1/events", "type=share_result&limit=2&cursor=" + cursor));
+    require(wrong_endpoint.status == 400 &&
+                body(wrong_endpoint)["error"]["code"] == "invalid_cursor",
+            "cursor was reusable across resource tags");
+    const auto wrong_filters = service.handle(request(
+        "/v1/shares", "status=stale&limit=2&cursor=" + cursor));
+    require(wrong_filters.status == 400 &&
+                body(wrong_filters)["error"]["code"] == "invalid_cursor",
+            "cursor was reusable across filters");
+    const auto unknown = service.handle(
+        request("/v1/shares", "status=accepted&wat=1"));
+    require(unknown.status == 400 &&
+                body(unknown)["error"]["code"] == "invalid_query",
+            "unknown collection filter was accepted");
+    const auto duplicate = service.handle(
+        request("/v1/shares", "status=accepted&status=stale"));
+    require(duplicate.status == 400, "duplicate query filter was accepted");
+    const auto invalid_enum = service.handle(
+        request("/v1/shares", "status=accepted,%20stale"));
+    require(invalid_enum.status == 400, "whitespace enum list was accepted");
+    const auto injection = service.handle(
+        request("/v1/shares", "worker_id=1%20OR%201=1"));
+    require(injection.status == 400, "SQL-like numeric filter was accepted");
+    const auto overflow = service.handle(request(
+        "/v1/shares", "worker_id=18446744073709551615"));
+    require(overflow.status == 400 &&
+                body(overflow)["error"]["code"] == "invalid_query",
+            "out-of-range SQLite identifier was accepted");
+    const auto detail_overflow = service.handle(
+        request("/v1/shares/18446744073709551615"));
+    require(detail_overflow.status == 400 &&
+                body(detail_overflow)["error"]["code"] == "invalid_id",
+            "out-of-range SQLite detail ID was accepted");
+}
+
+void test_detail_sensitive_view_and_missing_readers()
+{
+    monero_solo::ApiDataSource source;
+    source.detail = [](const monero_solo::ApiDetailRequest &query)
+        -> std::optional<Json> {
+        if (query.resource == monero_solo::ApiDetail::submission &&
+            query.id == "7") {
+            require(query.include_blobs && query.authenticated,
+                    "sensitive detail flags are wrong");
+            return Json{{"submission", {{"id", "7"},
+                                         {"frozen_block_blob", "00"}}},
+                        {"attempts", Json::array()},
+                        {"reconciliations", Json::array()},
+                        {"blocknotify", nullptr}};
+        }
+        return std::nullopt;
+    };
+    auto authenticated = make_service(std::move(source));
+    const auto detail = authenticated.handle(
+        request("/v1/submissions/7", "include_blobs=true"));
+    require(detail.status == 200 &&
+                body(detail)["data"]["submission"]["id"] == "7",
+            "authenticated sensitive detail failed");
+    const auto invalid_id = authenticated.handle(request("/v1/shares/00"));
+    require(invalid_id.status == 400 &&
+                body(invalid_id)["error"]["code"] == "invalid_id",
+            "noncanonical decimal detail ID was accepted");
+    const auto missing = authenticated.handle(request("/v1/shares/8"));
+    require(missing.status == 404, "missing detail did not return 404");
+
+    monero_solo::ApiDataSource public_source;
+    public_source.detail = [](const monero_solo::ApiDetailRequest &)
+        -> std::optional<Json> { return Json::object(); };
+    auto public_service = make_service(std::move(public_source), std::nullopt);
+    const auto forbidden = public_service.handle(request(
+        "/v1/submissions/7", "include_blobs=true", "GET", std::nullopt));
+    require(forbidden.status == 403 &&
+                body(forbidden)["error"]["code"] == "sensitive_view_disabled",
+            "public API exposed sensitive blobs");
+
+    monero_solo::ApiDataSource no_readers;
+    auto unavailable = make_service(std::move(no_readers));
+    require(unavailable.handle(request("/v1/summary")).status == 503,
+            "missing summary snapshot did not report not ready");
+    require(unavailable.handle(request("/v1/shares")).status == 500,
+            "missing collection reader did not report query failure");
+    require(unavailable.handle(request("/v1/rounds/current")).status == 503,
+            "missing current round did not report 503");
+}
+
+void test_sqlite_backed_persisted_resources()
+{
+    std::string pattern = "/tmp/monero-solo-api-test-XXXXXX";
+    std::vector<char> writable(pattern.begin(), pattern.end());
+    writable.push_back('\0');
+    const int descriptor = mkstemp(writable.data());
+    require(descriptor >= 0, "could not create API test database path");
+    (void)close(descriptor);
+    const std::string path(writable.data());
+    struct Cleanup {
+        std::string path;
+        ~Cleanup()
+        {
+            std::error_code ignored;
+            (void)std::filesystem::remove(path, ignored);
+            (void)std::filesystem::remove(path + "-wal", ignored);
+            (void)std::filesystem::remove(path + "-shm", ignored);
+        }
+    } cleanup{path};
+
+    monero_solo::Database database({path, 5000, false});
+    monero_solo::PublicId session_public{};
+    session_public[0] = 1;
+    const std::int64_t session = database.start_session({
+        session_public,
+        1'700'000'000'000'000,
+        "0.1.0",
+        std::string("856c015de433a23fe45d88a18dc08c821e50f1cb"),
+    });
+    const std::int64_t worker = database.upsert_worker(
+        {"rig-a", "rigid-a", 1'700'000'001'000'000});
+    monero_solo::PublicId connection_public{};
+    connection_public[0] = 2;
+    const std::int64_t connection = database.insert_connection({
+        connection_public,
+        session,
+        worker,
+        AF_INET,
+        {127, 0, 0, 1},
+        33333,
+        "127.0.0.1:3333",
+        "XMRig/6.26.0",
+        1'700'000'001'000'000,
+    });
+    monero_solo::Hash32 prev{};
+    monero_solo::Hash32 seed{};
+    prev[0] = 3;
+    seed[0] = 4;
+    const std::int64_t template_id = database.insert_public_template({
+        session,
+        1,
+        3736190,
+        prev,
+        seed,
+        std::nullopt,
+        "1000",
+        std::nullopt,
+        8,
+        {1, 2, 3},
+        {4, 5, 6},
+        1'700'000'002'000'000,
+        "startup",
+    });
+    monero_solo::PublicId job_public{};
+    monero_solo::PublicId entropy{};
+    job_public[0] = 5;
+    entropy[0] = 6;
+    std::array<std::uint8_t, 8> target{};
+    target.fill(0xff);
+    const std::int64_t job = database.insert_private_job({
+        job_public,
+        connection,
+        template_id,
+        3736190,
+        entropy,
+        seed,
+        std::string("1"),
+        "1048576",
+        target,
+        "1000",
+        39,
+        8,
+        {7, 8, 9},
+        {10, 11, 12},
+        1'700'000'003'000'000,
+        1'700'000'003'100'000,
+        1'700'000'123'000'000,
+    });
+    std::array<std::uint8_t, 4> nonce{1, 2, 3, 4};
+    const std::int64_t share = database.insert_share({
+        connection,
+        worker,
+        job,
+        1,
+        std::string("integer"),
+        std::string("2"),
+        1'700'000'004'000'000,
+        nonce,
+        std::string("1048576"),
+        std::string("1000"),
+        false,
+        false,
+        "not_candidate",
+        "received",
+        "pending",
+    });
+    const auto accepted = database.accept_share(
+        share,
+        1'700'000'004'500'000,
+        "1048576",
+        monero_solo::HashrateSource::verified);
+    require(accepted.accepted, "API fixture share did not accept");
+
+    monero_solo::ApiDataSource live;
+    live.readiness = [] { return ready_snapshot(); };
+    live.singleton = [template_id](const monero_solo::ApiSingleton resource)
+        -> std::optional<Json> {
+        if (resource == monero_solo::ApiSingleton::summary) {
+            return Json{{"server",
+                         {{"version", "0.1.0"},
+                          {"git_commit",
+                           "0123456789abcdef0123456789abcdef01234567"},
+                          {"session_id",
+                           "01000000000000000000000000000000"},
+                          {"started_at", "2023-11-14T22:13:20.000000Z"},
+                          {"uptime_seconds", 5},
+                          {"network", "mainnet"},
+                          {"verification", "verified"},
+                          {"stratum_authentication", "enabled"},
+                          {"api_authentication", "enabled"}}}};
+        }
+        if (resource == monero_solo::ApiSingleton::daemon) {
+            return Json{{"ready", true},
+                        {"rpc_state", "healthy"},
+                        {"zmq_state", "disabled"},
+                        {"height", 3736190},
+                        {"template_generation", "1"},
+                        {"template_id", std::to_string(template_id)}};
+        }
+        return std::nullopt;
+    };
+    auto source = monero_solo::make_sqlite_api_data_source({
+        {path, 5000, false},
+        monero_solo::HashrateSource::verified,
+        std::move(live),
+        [] { return std::int64_t{1'700'000'005'000'000}; },
+        [] {
+            return monero_solo::DatabaseWriterStats{
+                .queued_items = 7,
+                .queued_bytes = 3584,
+                .priority_items = 2,
+            };
+        },
+    });
+    auto service = make_service(std::move(source));
+
+    const Json connections = body(service.handle(request("/v1/connections")));
+    require(connections["data"].size() == 1U &&
+                connections["data"][0]["id"] ==
+                    "02000000000000000000000000000000" &&
+                connections["data"][0]["session_id"] ==
+                    "01000000000000000000000000000000" &&
+                connections["data"][0]["peer"] == "127.0.0.1" &&
+                connections["data"][0]["worker_id"] == std::to_string(worker),
+            "SQLite connection serialization is wrong");
+
+    const Json jobs = body(service.handle(request(
+        "/v1/jobs", "include_blobs=true")));
+    require(jobs["data"].size() == 1U &&
+                jobs["data"][0]["id"] ==
+                    "05000000000000000000000000000000" &&
+                jobs["data"][0]["private_entropy"] ==
+                    "06000000000000000000000000000000" &&
+                jobs["data"][0]["hashing_blob"] == "0a0b0c",
+            "SQLite job/blob serialization is wrong");
+
+    const Json shares = body(service.handle(request("/v1/shares")));
+    require(shares["data"].size() == 1U &&
+                shares["data"][0]["id"] == std::to_string(share) &&
+                shares["data"][0]["status"] == "accepted" &&
+                shares["data"][0]["credited_difficulty"] == "1048576" &&
+                shares["data"][0]["height"] == 3736190,
+            "SQLite share serialization is wrong");
+
+    const Json minimum = body(service.handle(
+        request("/v1/shares", "min_difficulty=1048576")));
+    require(minimum["data"].size() == 1U,
+            "SQLite minimum-difficulty filter rejected an equal value");
+    const Json above_minimum = body(service.handle(
+        request("/v1/shares", "min_difficulty=1048577")));
+    require(above_minimum["data"].empty(),
+            "SQLite minimum-difficulty filter accepted a smaller value");
+
+    const Json share_detail = body(service.handle(
+        request("/v1/shares/" + std::to_string(share))));
+    require(share_detail["data"]["share"]["status"] == "accepted" &&
+                share_detail["data"]["submission_url"].is_null(),
+            "SQLite share detail is wrong");
+
+    const Json rounds = body(service.handle(request("/v1/rounds/current")));
+    require(rounds["data"]["state"] == "open" &&
+                rounds["data"]["accepted_share_count"] == "1" &&
+                rounds["data"]["credited_difficulty"] == "1048576",
+            "SQLite current-round serialization is wrong");
+
+    const Json events = body(service.handle(request("/v1/events")));
+    require(events["data"].size() >= 3U &&
+                events["data"][0]["session_id"] ==
+                    "01000000000000000000000000000000" &&
+                events["data"][0]["payload"]["payload_schema_version"] == 1,
+            "SQLite event serialization is wrong");
+
+    const auto summary_response = service.handle(request("/v1/summary"));
+    const Json summary = body(summary_response);
+    require(summary_response.status == 200 &&
+                summary["data"].size() == 8U &&
+                summary["data"]["connections"]["active"] == 1 &&
+                summary["data"]["connections"]["total"] == "1" &&
+                summary["data"]["workers"]["active"] == 1 &&
+                summary["data"]["shares"]["accepted"] == "1" &&
+                summary["data"]["shares"]["total"] == "1" &&
+                summary["data"]["candidates"]["total"] == "0" &&
+                summary["data"]["round"]["state"] == "open" &&
+                summary["data"]["daemon"]["rpc"] == "healthy" &&
+                summary["data"]["hashrate"]["source"] == "verified",
+            "SQLite summary aggregation/merge is wrong");
+
+    const auto persistence_response = service.handle(request("/v1/persistence"));
+    const Json persistence = body(persistence_response);
+    require(persistence_response.status == 200 &&
+                persistence["data"]["schema_version"] == 1 &&
+                persistence["data"]["journal_mode"] == "wal" &&
+                persistence["data"]["synchronous"] == "full" &&
+                persistence["data"]["foreign_keys"] == true &&
+                persistence["data"]["unresolved_candidates"] == "0" &&
+                persistence["data"]["pending_blocknotify"] == "0" &&
+                persistence["data"]["writer_queue_items"] == 7 &&
+                persistence["data"]["writer_queue_bytes"] == 3584 &&
+                persistence["data"]["writer_priority_items"] == 2 &&
+                persistence["data"]["last_commit_at"].is_string(),
+            "SQLite persistence snapshot is wrong");
+}
+
+} // namespace
+
+int main()
+{
+    try {
+        test_auth_method_and_health();
+        test_not_ready_and_null_empty_auth_semantics();
+        test_collection_cursor_and_strict_queries();
+        test_detail_sensitive_view_and_missing_readers();
+        test_sqlite_backed_persisted_resources();
+        std::cout << "API service tests passed\n";
+        return 0;
+    }
+    catch (const std::exception &error) {
+        std::cerr << "API service test failure: " << error.what() << '\n';
+        return 1;
+    }
+}
