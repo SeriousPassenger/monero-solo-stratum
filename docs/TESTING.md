@@ -6,7 +6,8 @@ run; the release/handoff record should include the actual configure command,
 compiler, test output, and sanitizer/regtest results.
 
 The server build prerequisites apply, and a test-enabled configure additionally
-requires Bash and `jq` for the installed human-monitor fixture.
+requires Bash, `jq`, and Python 3.10 or newer for the installed monitor
+fixtures. The TUI itself uses only the Python standard library.
 
 ## Standard build and tests
 
@@ -44,11 +45,34 @@ ctest --test-dir build -R 'config|database|protocol' --output-on-failure
 | `http_tests` | Real TCP HTTP framing, empty-body enforcement, transfer-encoding rejection, duplicate headers, and transport-error envelopes |
 | `runtime_tests` | In-process mock `monerod`, real Stratum/API sockets, private jobs, trusted share persistence, restart state, candidate/template round-boundary gating, fail-closed template validation, verbose post-commit job/share JSONL correlation, entropy opt-in/out, and configured-secret non-disclosure |
 | `rental_fanin_tests` | 200 simultaneous authenticated miners across three loopback source IPs, fixed event/worker thread count, refresh delivery to every miner, bounded concurrent submits, connection reaping, and timing/RSS diagnostics |
-| `watch_status_tests` | Stubbed API monitor runs, argument-only configuration, human-readable units/time, TTY color modes, luck/effort progress boundaries through 1000%, current-round timestamped top shares, configured-cap-safe share requests, and complete non-null NDJSON snapshots |
+| `watch_status_tests` | Legacy stubbed-API rendering and arguments plus split-TUI parsing, adaptive mixed-event sampling, themes/layouts, source fallbacks, host/monerod metrics, bounded history, selection, empty-field-pruned JSON export, rotation/truncation and noninteractive render fixtures |
 
-Tests are standalone C++ executables with nonzero failure exit; no third-party
-unit-test framework is required. CTest applies a 180-second default per-test
-timeout; the bounded rental fan-in regression has a 120-second override.
+Server tests are standalone C++ executables with nonzero failure exit; the
+monitor checks use Bash and Python's standard-library `unittest`. No
+third-party unit-test framework is required. CTest applies a 180-second default
+per-test timeout; the bounded rental fan-in regression has a 120-second
+override.
+
+The single named `watch_status_tests` CTest entry intentionally runs two
+implementations: the Bash fixture first and then the Python standard-library
+test program. This preserves the exact 13-name server test inventory while
+covering both the compatibility renderer and the split-screen engine. They can
+also be run directly while iterating:
+
+```sh
+bash tests/integration/watch_status_tests.sh scripts/watch-status.sh
+python3 tests/integration/watch_status_tui_tests.py scripts/watch-status-tui.py
+python3 -c 'import ast,pathlib,sys; [ast.parse(pathlib.Path(p).read_text()) for p in sys.argv[1:]]' \
+  scripts/watch-status-tui.py tests/integration/watch_status_tui_tests.py
+```
+
+The automated TUI tests exercise model/render functions without needing a real
+terminal. Before release, also run `mss-watch-status` in a terminal against a
+live local API, monerod RPC, and rotating JSONL event log. Confirm status-only,
+events-only, both pane orders, automatic stacking at a narrow width, pause and
+scroll behavior, multi-row selection, JSON export, each theme, and recovery
+after log rename/truncation. This manual check is presentation evidence, not a
+substitute for the deterministic tests.
 
 ## Example configuration validation
 

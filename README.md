@@ -159,11 +159,33 @@ socat - UNIX-CONNECT:/tmp/monero-solo-stratum-events.sock
 ./scripts/watch-status.sh --interval 5
 ```
 
-`watch-status.sh` is a lightweight terminal monitor rather than a full-screen
-TUI. It renders human-readable hashrate, uptime, round work, verifier/storage
-pressure, share/candidate counters, timestamped top shares from the current
-round, and recent high-difficulty shares. On a TTY it adds color automatically;
-redirected output stays plain ASCII.
+`watch-status.sh` is the single entry point for both monitoring styles. In an
+interactive terminal it opens a dependency-free Python split-screen monitor:
+the compact status pane stays readable on the left while an adaptively sampled
+event stream flows on the right. Redirected output, `--once`, `--no-clear`, and
+`--plain` retain the lightweight Bash/jq monitor and its stable line-oriented
+format unless a split-monitor-only option explicitly selects the Python
+renderer. Installed builds provide `mss-watch-status`; the interactive engine
+is also installed directly as `mss-watch-status-tui`.
+
+The status pane groups related information instead of displaying an exhaustive
+metric table. It includes:
+
+- readiness, network, height, uptime, daemon RPC and ZMQ state;
+- current network difficulty and monerod inbound/outbound peer counts;
+- connections, workers, verified hashrate, shares, round luck and effort;
+- active RandomX seed/verifier state and queue/failure pressure;
+- compact CPU, network I/O, RAM, disk-space and disk-I/O load indicators; and
+- current-round top and recent-high shares with human-readable difficulty and
+  UTC timestamps.
+
+Monero peer data comes from the local, read-only `monerod` RPC endpoint. Pool
+state comes from the `/v1` API. Host data is sampled locally from Linux `/proc`
+and `statvfs`; disk I/O follows the filesystem device selected by `--disk-path`
+when Linux exposes an exact device match, avoiding RAID-member double counts.
+No privileged helper or monitoring agent is started. If a source is
+unavailable, its field is marked unavailable rather than blocking the rest of
+the display.
 
 The `Luck` bar derives cumulative block probability from total round effort as
 `100 * (1 - exp(-effort / 100))`. The `Effort` bar shows the current 100%
@@ -174,17 +196,108 @@ to the cycling bar.
 Configuration uses command-line arguments:
 
 ```sh
-./scripts/watch-status.sh --once --color never
-./scripts/watch-status.sh --interval 2 --bar-width 32
+./scripts/watch-status.sh
+./scripts/watch-status.sh --view both --layout vertical
+./scripts/watch-status.sh --reverse --theme tokyo-neon --event-rate 3
+./scripts/watch-status.sh --view events --stream-filter high-shares,templates
+./scripts/watch-status.sh --ui tty --theme black --view events --once
+./scripts/watch-status.sh --event-log /var/lib/monero-solo-stratum/debug.jsonl
+./scripts/watch-status.sh --once --color never       # legacy snapshot
+./scripts/watch-status.sh --plain --interval 2       # legacy live output
 ./scripts/watch-status.sh --snapshot-file ./status-snapshots.ndjson
 ./scripts/watch-status.sh \
   --api-url http://127.0.0.1:8787 \
-  --api-token 'optional-bearer-token'
+  --api-token 'optional-bearer-token' \
+  --monero-rpc-url http://127.0.0.1:18081
 ```
 
-Run `./scripts/watch-status.sh --help` for all options. Installed builds provide
-the same tool as `mss-watch-status`. The monitor requires only Bash, `curl`, and
-`jq`.
+The default `--view both` can be changed to `status` or `events`. A
+comma-separated `--stream-filter` selects one or more stable stream categories:
+`high-shares`, `exceptional-shares`, `templates`, `jobs`, `connections`,
+`candidates`, `system`, and `misc`. For example,
+`--stream-filter high-shares,templates` keeps accepted high shares and template
+events. The categories correspond to the labels in the runtime filter dialog;
+they are not regular expressions or arbitrary event-code prefixes.
+Layout `auto` chooses side-by-side panes when the terminal is wide enough and
+stacked panes otherwise; `vertical` and `horizontal` force the split, and
+`--reverse` swaps pane order. The event sampler keeps important errors,
+candidate and non-accepted-share events visible while rate-limiting repetitive
+accepted shares, templates, jobs and connection traffic toward `--event-rate`
+rows per second. It follows truncation and rotation without loading an
+unbounded log history.
+
+### Interactive keys and runtime configuration
+
+The most common changes require one keystroke and do not restart the server:
+
+| Key | Action |
+| --- | --- |
+| `1`, `2`, `3` | Show status only, events only, or both panes |
+| `r` / `l` | Reverse pane order / cycle automatic, vertical and horizontal layouts |
+| `p` | Pause or resume the event viewport |
+| Arrow keys, `PgUp`, `PgDn`, `Home`, `End` | Browse the retained event rows |
+| `Space` / `x` | Select or deselect the focused event row |
+| `Enter` | Inspect the complete focused event |
+| `f` | Edit stream filters |
+| `o` | Change refresh/event rates, share floor, view, layout and theme |
+| `t` / `F5` | Cycle themes / refresh status immediately |
+| `e` | Export selected rows after entering an output filename |
+| `?` / `q` | Open key help / quit |
+
+Inside the filter dialog, `Space` toggles the focused category, `A` selects
+all, `N` selects none, `Enter` applies the choices, and `Esc` cancels them.
+
+Exports are JSON, omit empty fields, and contain only the explicitly selected
+event rows. The in-TUI dialog offers `mss-selected-events.json` as an editable
+filename suggestion; the operator confirms the destination and any overwrite.
+Bulk serialization and `fsync` run outside the UI thread. Pausing affects the
+view, not the server or its event log.
+
+### Themes
+
+Three richer palettes target the full-screen curses UI (`--ui curses`):
+
+- `nerv-asuka`: Evangelion NERV/Asuka-inspired red, orange, black and warning
+  accents;
+- `tokyo-neon`: Tokyo-night cyan, magenta and retrowave violet;
+- `windows-classic`: a nostalgic Windows-classic desktop palette without any
+  claim of Windows platform support.
+
+Two restrained palettes are designed for the line-oriented TTY UI
+(`--ui tty`) on an attached terminal:
+
+- `black`: a high-contrast black theme with deliberately distinct health,
+  warning and selection states;
+- `windows-classic-tty`: a reduced-color Windows-classic variant.
+
+`--ui auto` chooses curses for an attached capable terminal and the TTY
+renderer otherwise. Redirected output is deliberately uncolored. `--ui plain`
+forces unstyled line output, while `--ui tty` enables its selected restrained
+palette only when stdout is an attached terminal. `--theme auto` selects a
+suitable base for that renderer.
+Runtime theme changes are available under `o`. Theme color never changes the
+underlying health labels, selection marker, or exported JSON.
+
+Runtime image placeholders (operator-provided captures will replace these):
+
+- `docs/images/watch-status-split.png` — both pane orders and the reorganized
+  status metrics;
+- `docs/images/watch-status-export.png` — paused stream, multi-row selection
+  and the JSON export dialog.
+
+Capture guidance is recorded in [docs/images/README.md](docs/images/README.md).
+
+<!-- After adding the files, replace the list above with:
+![Split status and event panes](docs/images/watch-status-split.png)
+![Event selection and JSON export](docs/images/watch-status-export.png)
+-->
+
+Run `./scripts/watch-status.sh --help` for every startup option. The split TUI
+requires Python 3.10 or newer and only its standard library. The legacy monitor
+requires Bash, `curl`, and `jq`. Reading a mode-0600 event log still requires
+the invoking account to have ordinary filesystem permission; do not weaken log
+permissions merely to run the monitor. A remote API token remains supported,
+and the operator remains responsible for securing remote API/RPC transport.
 
 ## Security and scope
 

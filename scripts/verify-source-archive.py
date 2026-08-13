@@ -186,6 +186,7 @@ def verify(archive_path: pathlib.Path, expected_root: str) -> tuple[int, int, in
                     "scripts/test-source-archive.sh",
                     "scripts/verify-source-archive.py",
                     "scripts/watch-status.sh",
+                    "scripts/watch-status-tui.py",
                 }:
                     expected_mode = 0o755
                 if stat.S_IMODE(member.mode) != expected_mode:
@@ -271,12 +272,15 @@ def verify(archive_path: pathlib.Path, expected_root: str) -> tuple[int, int, in
         "THIRD_PARTY_NOTICES.md",
         "config.example.json",
         "docs/TESTING.md",
+        "docs/images/README.md",
         "include/monero_solo/runtime.hpp",
         "scripts/make-source-archive.sh",
         "scripts/test-source-archive.sh",
         "scripts/verify-source-archive.py",
         "scripts/watch-status.sh",
+        "scripts/watch-status-tui.py",
         "src/main.cpp",
+        "tests/integration/watch_status_tui_tests.py",
         "src/runtime/runtime.cpp",
         "tests/regtest/run_monero_regtest.py",
         "third_party/monero-stratum-pow-verifier/CMakeLists.txt",
@@ -304,7 +308,7 @@ def verify(archive_path: pathlib.Path, expected_root: str) -> tuple[int, int, in
     }
     absent = sorted(required - relative_members)
     if absent:
-        fail(f"required nlohmann/json subset entries are absent: {absent}")
+        fail(f"required release entries are absent: {absent}")
 
     assert archive_mtime is not None
     return len(members), len(actual_files) + 1, archive_mtime

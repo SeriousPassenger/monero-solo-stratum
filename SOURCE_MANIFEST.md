@@ -75,6 +75,14 @@ header content. Upstream tests, fuzz fixtures, tools, and unrelated auxiliary
 licenses are deliberately excluded because they are neither built nor needed
 to reproduce this program.
 
+The first-party operator tools are included as source, installed beside the
+server, and covered by `SHA256SUMS`: the Bash compatibility entry point
+`scripts/watch-status.sh` and the Python 3.10+ standard-library split-screen
+engine `scripts/watch-status-tui.py`. Its deterministic test source
+`tests/integration/watch_status_tui_tests.py` is required by the archive
+verifier. Python is not a server build dependency and neither monitor is
+loaded into the mining process.
+
 ## Reproducible release staging
 
 The checked-in release tool creates the narrow nlohmann/json subset, excludes

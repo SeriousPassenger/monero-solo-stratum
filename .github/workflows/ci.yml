@@ -96,11 +96,18 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/watch-status.sh
+          python3 -c 'import ast,pathlib,sys; [ast.parse(pathlib.Path(p).read_text(encoding="utf-8"), filename=p) for p in sys.argv[1:]]' scripts/watch-status-tui.py tests/integration/watch_status_tui_tests.py
+          scripts/watch-status.sh --help | grep -F -- '--view MODE'
+          scripts/watch-status-tui.py --help | grep -F -- '--event-rate'
           ./build-release/monero-solo-stratum --version | grep -Fx 'monero-solo-stratum 0.1.0'
           ./build-release/monero-solo-stratum --check-config --config "$PWD/config.example.json" | grep -Fx 'configuration valid'
           DESTDIR="$PWD/stage" cmake --install build-release
           test -x stage/usr/bin/monero-solo-stratum
           test -x stage/usr/bin/mss-watch-status
+          test -x stage/usr/bin/mss-watch-status-tui
+          python3 -c 'import ast,pathlib,sys; [ast.parse(pathlib.Path(p).read_text(encoding="utf-8"), filename=p) for p in sys.argv[1:]]' stage/usr/bin/mss-watch-status-tui
+          stage/usr/bin/mss-watch-status --help | grep -F -- '--plain'
+          stage/usr/bin/mss-watch-status-tui --help | grep -F -- '--theme'
           test -f stage/etc/monero-solo-stratum/config.example.json
           test -f stage/usr/lib/systemd/system/monero-solo-stratum.service
           grep -Fx 'ExecStartPre=/usr/bin/monero-solo-stratum --check-config --config /etc/monero-solo-stratum/config.json' stage/usr/lib/systemd/system/monero-solo-stratum.service
@@ -242,6 +249,9 @@ jobs:
           mkdir "$extract_root"
           tar -C "$extract_root" -xzf "$archive"
           test -z "$(find "$extract_root" -name .git -print -quit)"
+          test -x "$extract_root/monero-solo-stratum/scripts/watch-status.sh"
+          test -x "$extract_root/monero-solo-stratum/scripts/watch-status-tui.py"
+          python3 -c 'import ast,pathlib,sys; [ast.parse(pathlib.Path(p).read_text(encoding="utf-8"), filename=p) for p in sys.argv[1:]]' "$extract_root/monero-solo-stratum/scripts/watch-status-tui.py" "$extract_root/monero-solo-stratum/tests/integration/watch_status_tui_tests.py"
           cmake -S "$extract_root/monero-solo-stratum" -B "$build_root" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
