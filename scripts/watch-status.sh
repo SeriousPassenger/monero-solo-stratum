@@ -208,14 +208,19 @@ while :; do
         --argjson top "$top" \
         --argjson high "$high" '
         def number_or_null: try tonumber catch null;
+        def repeated($text; $count):
+          if $count > 0 then $text * $count else "" end;
         def fixed($places):
           . as $number |
           pow(10; $places) as $scale |
           (($number * $scale) | round) as $scaled |
           (($scaled / $scale) | floor) as $whole |
           (($scaled - ($whole * $scale)) | fabs | floor | tostring) as $fraction |
+          (if $places > ($fraction | length) then
+             repeated("0"; $places - ($fraction | length))
+           else "" end) as $padding |
           if $places == 0 then "\($whole)"
-          else "\($whole).\("0" * ($places - ($fraction | length)))\($fraction)"
+          else "\($whole).\($padding)\($fraction)"
           end;
         def flexible:
           fabs as $magnitude |
@@ -276,11 +281,11 @@ while :; do
           [46, 40, 34, 70, 106, 142, 178, 214, 208, 196][$index];
         def progress($percent; $shade):
           (if $percent < 0 then 0
-           elif $percent > 100 then 100
+          elif $percent > 100 then 100
            else $percent end) as $bounded |
           ($bounded * $bar_width / 100 | floor) as $filled |
-          ("#" * $filled) as $marks |
-          ("-" * ($bar_width - $filled)) as $empty |
+          repeated("#"; $filled) as $marks |
+          repeated("-"; $bar_width - $filled) as $empty |
           if $color then
             "[\(shaded(palette($shade); $marks))\(sgr("2"))\($empty)\(sgr("0"))]"
           else "[\($marks)\($empty)]" end;
