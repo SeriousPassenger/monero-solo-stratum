@@ -59,7 +59,7 @@ Startup is fail-closed:
 
 1. Strictly parse and statically validate the explicit config file.
 2. Open SQLite, require `foreign_keys=ON`, `journal_mode=WAL`, and
-   `synchronous=FULL`, validate schema v1, and recover interrupted durable
+   `synchronous=FULL`, validate schema v2, and recover interrupted durable
    states.
 3. Create the server session/open round and restore bans and active duplicate
    identities.
@@ -160,10 +160,16 @@ nonterminal candidates are reconciled before another due dispatch. Candidate
 acceptance and round close are conditional transactions, so replays and
 restart recovery cannot logically accept a candidate twice.
 
-## Deliberate v1 limitations
+While a submitted candidate remains unresolved, publication of a
+higher-height template is held; same-height refreshes remain available. This
+prevents a daemon ZMQ tip signal from assigning new-height work to the round
+whose close is still awaiting daemon authority.
+
+## Deliberate v2 limitations
 
 There is no built-in TLS, proxy-protocol trust, pool upstream/failover, vardiff,
-NiceHash/self-select mode, multiple payout identities, wallet accounting,
-dashboard, hot reload, administrative HTTP mutation, or orphan/reorg reopening
-of closed rounds. Templates that require miner signature material are
-unsupported and fail closed.
+NiceHash nonce-splitting/self-select mode, multiple payout identities, wallet
+accounting, dashboard, hot reload, administrative HTTP mutation, or
+orphan/reorg reopening of closed rounds. A narrow NiceHash compact-target wire
+profile is supported without reserving or rewriting a nonce byte. Templates
+that require miner signature material are unsupported and fail closed.

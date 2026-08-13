@@ -143,7 +143,8 @@ The first implementation MUST NOT contain:
 - upstream failover strategies;
 - splitter/mapper abstractions, nonce splitting, or extra-nonce splitters;
 - donation mining;
-- NiceHash mode or NiceHash-specific compatibility;
+- NiceHash nonce-splitting mode; a narrow legacy compact-target wire profile
+  may be selected from the declared agent without changing nonce ownership;
 - self-select mining;
 - multiple daemon/pool identities;
 - a verifier subprocess or the historical verifier Unix-socket protocol;
@@ -4769,7 +4770,8 @@ These are settled and MUST NOT be casually re-opened by the next agent:
 - clean standalone implementation, not GPL source extraction;
 - ordinary XMRig CryptoNote `simple` mode only;
 - one configured monerod and primary payout address;
-- no upstream pools, splitters, donation, NiceHash, or dashboard assets;
+- no upstream pools, splitters, donation, NiceHash nonce splitting, or
+  dashboard assets;
 - in-process pinned verifier public C API, no verifier socket/service;
 - verifier may be disabled only as explicitly labeled trusted/claimed mode;
 - claimed network candidate bypasses verifier waiting;

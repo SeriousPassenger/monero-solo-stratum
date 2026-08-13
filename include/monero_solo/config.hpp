@@ -95,6 +95,9 @@ struct ApiConfig {
     std::uint64_t request_rate_per_second{20};
     std::uint64_t request_burst{40};
     std::uint64_t max_pending_bytes_per_connection{2097152};
+    std::uint64_t top_shares_limit{100};
+    std::uint64_t recent_high_shares_limit{100};
+    std::uint64_t recent_high_share_min_difficulty{20000000000ULL};
 };
 
 struct DefenseConfig {
@@ -129,6 +132,7 @@ struct DefenseConfig {
 struct LoggingConfig {
     std::string level{"info"};
     std::optional<std::string> file;
+    bool include_private_job_entropy{};
 };
 
 struct Config {

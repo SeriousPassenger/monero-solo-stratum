@@ -143,7 +143,7 @@ class RecordBuilder final {
     case PublicStringKey::connection_public_id: return "connection_public_id";
     case PublicStringKey::worker_public_id: return "worker_public_id";
     case PublicStringKey::template_public_id: return "template_public_id";
-    case PublicStringKey::job_id: return "job_id";
+    case PublicStringKey::job_public_id: return "job_public_id";
     case PublicStringKey::share_public_id: return "share_public_id";
     case PublicStringKey::candidate_key: return "candidate_key";
     case PublicStringKey::round_public_id: return "round_public_id";
@@ -159,6 +159,19 @@ class RecordBuilder final {
     case PublicStringKey::status: return "status";
     case PublicStringKey::reason_code: return "reason_code";
     case PublicStringKey::peer: return "peer";
+    case PublicStringKey::agent_profile: return "agent_profile";
+    case PublicStringKey::seed_hash: return "seed_hash";
+    case PublicStringKey::target: return "target";
+    case PublicStringKey::target_encoding: return "target_encoding";
+    case PublicStringKey::fetch_reason: return "fetch_reason";
+    case PublicStringKey::assigned_difficulty: return "assigned_difficulty";
+    case PublicStringKey::network_difficulty: return "network_difficulty";
+    case PublicStringKey::actual_difficulty: return "actual_difficulty";
+    case PublicStringKey::credited_difficulty: return "credited_difficulty";
+    case PublicStringKey::nonce: return "nonce";
+    case PublicStringKey::claimed_hash: return "claimed_hash";
+    case PublicStringKey::computed_hash: return "computed_hash";
+    case PublicStringKey::provenance: return "provenance";
     case PublicStringKey::key_count: break;
     }
     return {};
@@ -194,9 +207,35 @@ class RecordBuilder final {
     case IntegerKey::listener_count: return "listener_count";
     case IntegerKey::reconciliation_id: return "reconciliation_id";
     case IntegerKey::cycle: return "cycle";
+    case IntegerKey::verifier_queue_ns: return "verifier_queue_ns";
+    case IntegerKey::verifier_hash_ns: return "verifier_hash_ns";
+    case IntegerKey::verifier_total_ns: return "verifier_total_ns";
     case IntegerKey::key_count: break;
     }
     return {};
+}
+
+[[nodiscard]] std::string_view key_name(const SensitiveHexKey key) noexcept
+{
+    switch (key) {
+    case SensitiveHexKey::private_job_entropy: return "private_job_entropy";
+    case SensitiveHexKey::key_count: break;
+    }
+    return {};
+}
+
+[[nodiscard]] bool valid_sensitive_hex(const SensitiveHexKey key,
+                                       const std::string_view value) noexcept
+{
+    const std::size_t expected =
+        key == SensitiveHexKey::private_job_entropy ? 32U : 0U;
+    if (expected == 0U || value.size() != expected) return false;
+    for (const char character : value) {
+        const bool digit = character >= '0' && character <= '9';
+        const bool lower = character >= 'a' && character <= 'f';
+        if (!digit && !lower) return false;
+    }
+    return true;
 }
 
 [[nodiscard]] bool append_timestamp(RecordBuilder &record) noexcept
@@ -305,11 +344,19 @@ void validate_file_configuration(const std::optional<std::string> &file)
 }
 
 Logger::Logger(const Severity threshold,
-               const std::optional<std::string> &file)
-    : threshold_(threshold)
+               const std::optional<std::string> &file,
+               const bool allow_sensitive)
+    : threshold_(threshold), allow_sensitive_(allow_sensitive)
 {
     if (!valid_severity(threshold_)) {
         throw LoggerError("invalid logging threshold");
+    }
+    if (allow_sensitive_ &&
+        (static_cast<std::uint8_t>(threshold_) <
+             static_cast<std::uint8_t>(Severity::debug) ||
+         !file || file->empty())) {
+        throw LoggerError(
+            "sensitive logging requires debug or trace and a file target");
     }
     if (!file || file->empty()) {
         fd_ = STDERR_FILENO;
@@ -404,7 +451,8 @@ bool Logger::enabled(const Severity severity) const noexcept
 void Logger::log(const Severity severity,
                  const std::string_view stable_code,
                  const std::initializer_list<PublicStringField> strings,
-                 const std::initializer_list<IntegerField> integers) noexcept
+                 const std::initializer_list<IntegerField> integers,
+                 const std::initializer_list<SensitiveHexField> sensitive) noexcept
 {
     if (!valid_severity(severity)) {
         rejected_.fetch_add(1, std::memory_order_relaxed);
@@ -415,7 +463,11 @@ void Logger::log(const Severity severity,
         return;
     }
     if (!valid_code(stable_code) ||
-        strings.size() + integers.size() > max_fields) {
+        strings.size() + integers.size() + sensitive.size() > max_fields ||
+        (sensitive.size() != 0U &&
+         (!allow_sensitive_ ||
+          static_cast<std::uint8_t>(severity) <
+              static_cast<std::uint8_t>(Severity::debug)))) {
         rejected_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -442,6 +494,18 @@ void Logger::log(const Severity severity,
         }
         seen_integers[key] = true;
     }
+    std::array<bool, static_cast<std::size_t>(SensitiveHexKey::key_count)>
+        seen_sensitive{};
+    for (const SensitiveHexField &field : sensitive) {
+        const std::size_t key = static_cast<std::size_t>(field.key);
+        if (key >= seen_sensitive.size() || seen_sensitive[key] ||
+            key_name(field.key).empty() ||
+            !valid_sensitive_hex(field.key, field.value)) {
+            rejected_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        seen_sensitive[key] = true;
+    }
 
     try {
         const std::lock_guard<std::mutex> lock(mutex_);
@@ -463,6 +527,12 @@ void Logger::log(const Severity severity,
             valid = valid && (first || record.append(',')) &&
                     record.append_json_string(key_name(field.key)) &&
                     record.append(':') && record.append_uint(field.value);
+            first = false;
+        }
+        for (const SensitiveHexField &field : sensitive) {
+            valid = valid && (first || record.append(',')) &&
+                    record.append_json_string(key_name(field.key)) &&
+                    record.append(':') && record.append_json_string(field.value);
             first = false;
         }
         valid = valid && record.append("}}\n");

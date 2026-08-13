@@ -24,6 +24,7 @@
 #include <utility>
 
 #include <arpa/inet.h>
+#include <openssl/bn.h>
 #include <sqlite3.h>
 
 namespace monero_solo {
@@ -467,6 +468,126 @@ Json hashrate_json(const HashrateWindows &windows, const std::string &source)
     };
 }
 
+using BnPtr = std::unique_ptr<BIGNUM, decltype(&BN_free)>;
+using BnCtxPtr = std::unique_ptr<BN_CTX, decltype(&BN_CTX_free)>;
+
+BnPtr make_bn()
+{
+    BIGNUM *value = BN_new();
+    if (value == nullptr) throw DatabaseError("allocate exact effort integer");
+    return BnPtr(value, &BN_free);
+}
+
+BnPtr decimal_bn(const std::string_view value)
+{
+    if (!decimal_string(value)) {
+        throw DatabaseError("invalid decimal round effort value");
+    }
+    BIGNUM *parsed = nullptr;
+    const std::string owned(value);
+    if (BN_dec2bn(&parsed, owned.c_str()) !=
+            static_cast<int>(owned.size()) ||
+        parsed == nullptr) {
+        if (parsed != nullptr) BN_free(parsed);
+        throw DatabaseError("parse exact round effort integer");
+    }
+    return BnPtr(parsed, &BN_free);
+}
+
+std::string bn_decimal(const BIGNUM *const value)
+{
+    char *encoded = BN_bn2dec(value);
+    if (encoded == nullptr) {
+        throw DatabaseError("encode exact round effort integer");
+    }
+    std::string result(encoded);
+    OPENSSL_free(encoded);
+    return result;
+}
+
+class ExactEffort final {
+public:
+    ExactEffort()
+        : numerator_(make_bn()), denominator_(make_bn()),
+          context_(BN_CTX_new(), &BN_CTX_free)
+    {
+        BN_zero(numerator_.get());
+        if (!context_ || BN_one(denominator_.get()) != 1) {
+            throw DatabaseError("initialize exact round effort arithmetic");
+        }
+    }
+
+    void add(const std::string_view credited,
+             const std::string_view network_difficulty)
+    {
+        if (!decimal_string(network_difficulty, false)) {
+            throw DatabaseError("invalid round effort network difficulty");
+        }
+        BnPtr work = decimal_bn(credited);
+        BnPtr difficulty = decimal_bn(network_difficulty);
+        BnPtr left = make_bn();
+        BnPtr right = make_bn();
+        BnPtr sum = make_bn();
+        BnPtr product = make_bn();
+        BnPtr divisor = make_bn();
+        BnPtr reduced_numerator = make_bn();
+        BnPtr reduced_denominator = make_bn();
+        if (BN_mul(left.get(), numerator_.get(), difficulty.get(),
+                   context_.get()) != 1 ||
+            BN_mul(right.get(), work.get(), denominator_.get(),
+                   context_.get()) != 1 ||
+            BN_add(sum.get(), left.get(), right.get()) != 1 ||
+            BN_mul(product.get(), denominator_.get(), difficulty.get(),
+                   context_.get()) != 1 ||
+            BN_gcd(divisor.get(), sum.get(), product.get(), context_.get()) != 1 ||
+            BN_div(reduced_numerator.get(), nullptr, sum.get(), divisor.get(),
+                   context_.get()) != 1 ||
+            BN_div(reduced_denominator.get(), nullptr, product.get(),
+                   divisor.get(), context_.get()) != 1 ||
+            BN_copy(numerator_.get(), reduced_numerator.get()) == nullptr ||
+            BN_copy(denominator_.get(), reduced_denominator.get()) == nullptr) {
+            throw DatabaseError("accumulate exact round effort");
+        }
+    }
+
+    [[nodiscard]] std::string micro_percent() const
+    {
+        BnPtr scale = decimal_bn("100000000");
+        BnPtr scaled = make_bn();
+        BnPtr quotient = make_bn();
+        if (BN_mul(scaled.get(), numerator_.get(), scale.get(),
+                   context_.get()) != 1 ||
+            BN_div(quotient.get(), nullptr, scaled.get(), denominator_.get(),
+                   context_.get()) != 1) {
+            throw DatabaseError("divide exact round effort");
+        }
+        return bn_decimal(quotient.get());
+    }
+
+private:
+    BnPtr numerator_;
+    BnPtr denominator_;
+    mutable BnCtxPtr context_;
+};
+
+std::string effort_micro_percent(const std::string_view credited,
+                                 const std::string_view network_difficulty)
+{
+    ExactEffort effort;
+    effort.add(credited, network_difficulty);
+    return effort.micro_percent();
+}
+
+std::string format_micro_percent(std::string value)
+{
+    if (!decimal_string(value)) {
+        throw DatabaseError("invalid effort percentage");
+    }
+    if (value.size() <= 6U) value.insert(0, 7U - value.size(), '0');
+    value.insert(value.size() - 6U, 1, '.');
+    return value;
+}
+
 bool contains_oversize_blob(const Json &value)
 {
     static const std::set<std::string_view> blob_fields = {
@@ -525,6 +646,8 @@ std::string_view api_collection_path(const ApiCollection resource) noexcept
     case ApiCollection::templates: return "/v1/templates";
     case ApiCollection::jobs: return "/v1/jobs";
     case ApiCollection::shares: return "/v1/shares";
+    case ApiCollection::top_shares: return "/v1/shares/top";
+    case ApiCollection::recent_high_shares: return "/v1/shares/recent-high";
     case ApiCollection::hashes: return "/v1/hashes";
     case ApiCollection::submissions: return "/v1/submissions";
     case ApiCollection::rounds: return "/v1/rounds";
@@ -551,6 +674,11 @@ ApiService::ApiService(ApiServiceOptions options,
         expected_authorization_ = "Bearer " + *options_.api.access_token;
     }
     if (options_.api.max_page_size == 0 || options_.api.max_page_size > 10'000 ||
+        options_.api.top_shares_limit == 0 ||
+        options_.api.top_shares_limit > 100 ||
+        options_.api.recent_high_shares_limit == 0 ||
+        options_.api.recent_high_shares_limit > 100 ||
+        options_.api.recent_high_share_min_difficulty == 0 ||
         options_.api.max_connections == 0 ||
         options_.api.request_rate_per_second == 0 ||
         options_.api.request_burst == 0 ||
@@ -879,6 +1007,10 @@ HttpResponse ApiService::handle_collection(
     const bool authenticated,
     const std::int64_t now_unix_us) const
 {
+    const bool top_shares = route.resource == ApiCollection::top_shares;
+    const bool recent_high_shares =
+        route.resource == ApiCollection::recent_high_shares;
+    const bool bounded_ranking = top_shares || recent_high_shares;
     QueryMap parameters = parse_query(request.query);
     for (const auto &[name, unused] : parameters) {
         (void)unused;
@@ -888,17 +1020,29 @@ HttpResponse ApiService::handle_collection(
         }
     }
 
-    std::uint64_t limit_value = kDefaultPageSize;
+    const std::uint64_t ranking_limit = top_shares ?
+        options_.api.top_shares_limit : options_.api.recent_high_shares_limit;
+    std::uint64_t limit_value = bounded_ranking ? ranking_limit :
+                                                       kDefaultPageSize;
     if (const auto limit = parameters.find("limit"); limit != parameters.end()) {
         if (!canonical_unsigned(limit->second, false, &limit_value) ||
-            limit_value > options_.api.max_page_size) {
+            limit_value > options_.api.max_page_size ||
+            (bounded_ranking && limit_value > ranking_limit)) {
             throw ApiRequestError(400, "invalid_query", "Invalid page limit");
         }
+    }
+    if (bounded_ranking && parameters.contains("cursor")) {
+        throw ApiRequestError(400, "invalid_query",
+                              "Ranked share views are bounded snapshots");
     }
 
     QueryMap filters = parameters;
     filters.erase("cursor");
     filters.erase("limit");
+    if (recent_high_shares) {
+        filters.emplace("min_actual_difficulty", std::to_string(
+            options_.api.recent_high_share_min_difficulty));
+    }
     const auto invalid = [](const std::string &message) {
         throw ApiRequestError(400, "invalid_query", message);
     };
@@ -960,6 +1104,10 @@ HttpResponse ApiService::handle_collection(
     if (const auto minimum = filters.find("min_difficulty");
         minimum != filters.end() && !decimal_string(minimum->second, false)) {
         invalid("Invalid minimum difficulty");
+    }
+    if (const auto minimum = filters.find("min_actual_difficulty");
+        minimum != filters.end() && !decimal_string(minimum->second, false)) {
+        invalid("Invalid minimum actual difficulty");
     }
     if (const auto blobs = filters.find("include_blobs");
         blobs != filters.end() && blobs->second == "true" &&
@@ -1052,6 +1200,22 @@ HttpResponse ApiService::handle_collection(
         {"data", std::move(result.rows)},
         {"page", {{"limit", limit_value}, {"next_cursor", next_cursor}}},
     };
+    if (top_shares) {
+        const auto round = filters.find("round_id");
+        document["selection"] = {
+            {"kind", "top_actual_difficulty"},
+            {"round_id", round == filters.end() ? Json(nullptr) :
+                                                  Json(round->second)},
+            {"configured_limit", ranking_limit},
+        };
+    }
+    else if (recent_high_shares) {
+        document["selection"] = {
+            {"kind", "recent_high_actual_difficulty"},
+            {"min_actual_difficulty", filters.at("min_actual_difficulty")},
+            {"configured_limit", ranking_limit},
+        };
+    }
     if (contains_oversize_blob(document)) {
         return error(413, "response_too_large",
                      "Requested blob exceeds the response bound", now_unix_us);
@@ -1114,7 +1278,7 @@ HttpResponse ApiService::handle_authenticated(const HttpRequest &request,
         return singleton_response(ApiSingleton::current_round, now_unix_us);
     }
 
-    static const std::array<CollectionRoute, 10> collections = {{
+    static const std::array<CollectionRoute, 12> collections = {{
         {ApiCollection::connections, "/v1/connections", 1,
          {"active", "worker_id", "peer", "after_time", "before_time"}},
         {ApiCollection::workers, "/v1/workers", 2,
@@ -1127,6 +1291,10 @@ HttpResponse ApiService::handle_authenticated(const HttpRequest &request,
         {ApiCollection::shares, "/v1/shares", 5,
          {"status", "connection_id", "worker_id", "job_id", "candidate_id",
           "height", "min_difficulty", "after_time", "before_time"}},
+        {ApiCollection::top_shares, "/v1/shares/top", 11,
+         {"round_id"}},
+        {ApiCollection::recent_high_shares, "/v1/shares/recent-high", 12,
+         {}},
         {ApiCollection::hashes, "/v1/hashes", 6,
          {"role", "share_status", "connection_id", "worker_id", "job_id",
           "after_time", "before_time"}},
@@ -1483,14 +1651,22 @@ std::string divide_decimal_string(const std::string &value,
 class SqliteApiReader final {
 public:
     SqliteApiReader(DatabaseOptions options,
+                    ApiConfig api,
                     const HashrateSource source,
                     std::function<std::int64_t()> clock,
                     std::function<DatabaseWriterStats()> writer_stats)
-        : options_(std::move(options)), source_(source), clock_(std::move(clock)),
+        : options_(std::move(options)), api_(std::move(api)), source_(source), clock_(std::move(clock)),
           writer_stats_(std::move(writer_stats))
     {
         if (options_.path.empty()) {
             throw std::invalid_argument("SQLite API reader path is empty");
+        }
+        if (api_.top_shares_limit == 0 || api_.top_shares_limit > 100 ||
+            api_.recent_high_shares_limit == 0 ||
+            api_.recent_high_shares_limit > 100 ||
+            api_.recent_high_share_min_difficulty == 0) {
+            throw std::invalid_argument(
+                "invalid API share-statistics configuration");
         }
         sqlite3 *opened = nullptr;
         const int flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
@@ -1526,9 +1702,9 @@ public:
             ReadStatement schema(database_,
                                  "SELECT value FROM schema_meta "
                                  "WHERE key='schema_version'");
-            if (!schema.row() || schema.text(0) != "1" || schema.row()) {
+            if (!schema.row() || schema.text(0) != "2" || schema.row()) {
                 throw DatabaseError(
-                    "read-only API database schema is not version 1");
+                    "read-only API database schema is not version 2");
             }
         }
         catch (...) {
@@ -1561,6 +1737,11 @@ private:
         const ApiCollectionRequest &request,
         const RowFormatter &formatter,
         bool synthetic_hash_cursor = false);
+    [[nodiscard]] ApiCollectionResult run_bounded_collection(
+        std::string sql,
+        std::vector<QueryBinding> bindings,
+        const ApiCollectionRequest &request,
+        const RowFormatter &formatter);
     [[nodiscard]] Json connection_resource(ReadStatement &statement);
     [[nodiscard]] Json worker_resource(ReadStatement &statement);
     [[nodiscard]] Json template_resource(ReadStatement &statement,
@@ -1570,6 +1751,10 @@ private:
     [[nodiscard]] Json hash_resource(ReadStatement &statement);
     [[nodiscard]] Json submission_resource(ReadStatement &statement);
     [[nodiscard]] Json round_resource(ReadStatement &statement);
+    [[nodiscard]] Json round_effort(
+        std::int64_t round_id,
+        bool finalized,
+        std::optional<std::uint64_t> finalized_segment_count);
     [[nodiscard]] Json ban_resource(ReadStatement &statement);
     [[nodiscard]] Json event_resource(ReadStatement &statement);
     [[nodiscard]] HashrateWindows hashrate(std::string_view scope,
@@ -1585,6 +1770,7 @@ private:
     [[nodiscard]] Json persistence();
 
     DatabaseOptions options_;
+    ApiConfig api_;
     HashrateSource source_;
     std::function<std::int64_t()> clock_;
     std::function<DatabaseWriterStats()> writer_stats_;
@@ -1666,6 +1852,29 @@ ApiCollectionResult SqliteApiReader::run_collection(
     if (result.rows.size() > request.limit) {
         result.rows.erase(result.rows.end() - 1);
         result.next_database_id = cursor_ids[request.limit - 1U];
+    }
+    return result;
+}
+
+ApiCollectionResult SqliteApiReader::run_bounded_collection(
+    std::string sql,
+    std::vector<QueryBinding> bindings,
+    const ApiCollectionRequest &request,
+    const RowFormatter &formatter)
+{
+    if (request.after_database_id != 0) {
+        throw DatabaseError("bounded API ranking received a cursor");
+    }
+    sql += " LIMIT ?" + std::to_string(bindings.size() + 1U);
+    bindings.push_back(integer_binding(static_cast<std::int64_t>(request.limit)));
+    ReadStatement statement(database_, sql);
+    apply_bindings(statement, bindings);
+    ApiCollectionResult result;
+    while (statement.row()) {
+        if (statement.integer(0) <= 0) {
+            throw DatabaseError("API row has invalid database ID");
+        }
+        result.rows.push_back(formatter(statement));
     }
     return result;
 }
@@ -1802,6 +2011,7 @@ Json SqliteApiReader::share_resource(ReadStatement &row)
         {"computed_meets_network_target",
          row.is_null(32) ? Json(nullptr) : Json(row.integer(32) != 0)},
         {"candidate_id", nullable_decimal(row, 33)},
+        {"round_id", nullable_decimal(row, 34)},
     };
 }
 
@@ -1820,6 +2030,12 @@ Json SqliteApiReader::hash_resource(ReadStatement &row)
         {"connection_id", hex_encode(row.blob(7))},
         {"worker_id", nullable_decimal(row, 8)},
         {"job_id", nullable_blob_hex(row, 9)},
+        {"assigned_difficulty", nullable_text(row, 10)},
+        {"actual_difficulty", nullable_text(row, 11)},
+        {"network_difficulty", nullable_text(row, 12)},
+        {"credited_difficulty", nullable_text(row, 13)},
+        {"provenance", row.text(14)},
+        {"round_id", nullable_decimal(row, 15)},
     };
 }
 
@@ -1852,6 +2068,12 @@ Json SqliteApiReader::submission_resource(ReadStatement &row)
 
 Json SqliteApiReader::round_resource(ReadStatement &row)
 {
+    const bool finalized = !row.is_null(10);
+    std::optional<std::uint64_t> finalized_segment_count;
+    if (!row.is_null(11)) {
+        finalized_segment_count =
+            static_cast<std::uint64_t>(row.integer(11));
+    }
     return Json{
         {"id", std::to_string(row.integer(0))},
         {"opened_at", format_rfc3339_utc_us(row.integer(1))},
@@ -1862,7 +2084,54 @@ Json SqliteApiReader::round_resource(ReadStatement &row)
         {"miner_tx_hash", nullable_blob_hex(row, 6)},
         {"block_id", nullable_blob_hex(row, 7)},
         {"credited_difficulty", row.text(8)},
+        {"estimated_hashes", row.text(8)},
         {"accepted_share_count", std::to_string(row.integer(9))},
+        {"effort_finalized_at", nullable_timestamp(row, 10)},
+        {"effort", round_effort(row.integer(0), finalized,
+                                finalized_segment_count)},
+    };
+}
+
+Json SqliteApiReader::round_effort(
+    const std::int64_t round_id,
+    const bool finalized,
+    const std::optional<std::uint64_t> finalized_segment_count)
+{
+    Json segments = Json::array();
+    ExactEffort total;
+    ReadStatement rows(
+        database_,
+        "SELECT source,network_difficulty_dec,credited_difficulty_dec,"
+        "accepted_share_count FROM round_work_segments WHERE round_id=?1 "
+        "ORDER BY source,length(network_difficulty_dec),network_difficulty_dec");
+    rows.bind(1, round_id);
+    while (rows.row()) {
+        const std::string source = rows.text(0);
+        const std::string network_difficulty = rows.text(1);
+        const std::string estimated_hashes = rows.text(2);
+        total.add(estimated_hashes, network_difficulty);
+        segments.push_back({
+            {"source", source},
+            {"network_difficulty", network_difficulty},
+            {"estimated_hashes", estimated_hashes},
+            {"accepted_share_count", std::to_string(rows.integer(3))},
+            {"effort_percent", format_micro_percent(
+                effort_micro_percent(estimated_hashes,
+                                     network_difficulty))},
+        });
+    }
+    if (finalized_segment_count.has_value() &&
+        *finalized_segment_count != segments.size()) {
+        throw DatabaseError("finalized round effort segment count changed");
+    }
+    return {
+        {"unit", "percent"},
+        {"value", format_micro_percent(total.micro_percent())},
+        {"precision", "0.000001"},
+        {"rounding", "down"},
+        {"basis", "credited_assigned_difficulty/network_difficulty"},
+        {"finalized", finalized},
+        {"segments", std::move(segments)},
     };
 }
 
@@ -2111,7 +2380,7 @@ ApiCollectionResult SqliteApiReader::collection(
             "s.verifier_seed_id_dec,s.verifier_queue_ns,s.verifier_hash_ns,"
             "s.verifier_total_ns,ch.hash,co.hash,ch.meets_share_target,"
             "co.meets_share_target,ch.meets_network_target,co.meets_network_target,"
-            "s.candidate_id FROM shares s JOIN connections c ON c.id=s.connection_id "
+            "s.candidate_id,s.round_id FROM shares s JOIN connections c ON c.id=s.connection_id "
             "LEFT JOIN private_jobs pj ON pj.id=s.job_id "
             "LEFT JOIN share_hashes ch ON ch.share_id=s.id AND ch.role='claimed' "
             "LEFT JOIN share_hashes co ON co.share_id=s.id AND co.role='computed' "
@@ -2149,11 +2418,65 @@ ApiCollectionResult SqliteApiReader::collection(
             std::move(sql), std::move(bindings), request,
             [this](ReadStatement &row) { return share_resource(row); });
     }
+    case ApiCollection::top_shares:
+    case ApiCollection::recent_high_shares: {
+        const std::uint64_t configured_limit =
+            request.resource == ApiCollection::top_shares ?
+                api_.top_shares_limit : api_.recent_high_shares_limit;
+        ApiCollectionRequest bounded_request = request;
+        bounded_request.limit = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(request.limit, configured_limit));
+        sql =
+            "SELECT s.id,c.public_id,s.worker_id,pj.public_job_id,"
+            "s.request_sequence,s.miner_request_id_type,s.miner_request_id_text,"
+            "s.received_unix_us,s.completed_unix_us,s.nonce,pj.height,"
+            "s.assigned_difficulty_dec,s.actual_difficulty_dec,"
+            "s.network_difficulty_dec,s.height_is_older,s.claimed_candidate,"
+            "s.candidate_admission,s.status,s.error_code,s.error_message,"
+            "s.provenance,s.credited_difficulty_dec,s.verifier_ticket_dec,"
+            "s.verifier_seed_id_dec,s.verifier_queue_ns,s.verifier_hash_ns,"
+            "s.verifier_total_ns,ch.hash,co.hash,ch.meets_share_target,"
+            "co.meets_share_target,ch.meets_network_target,co.meets_network_target,"
+            "s.candidate_id,s.round_id FROM shares s JOIN connections c "
+            "ON c.id=s.connection_id LEFT JOIN private_jobs pj ON pj.id=s.job_id "
+            "LEFT JOIN share_hashes ch ON ch.share_id=s.id AND ch.role='claimed' "
+            "LEFT JOIN share_hashes co ON co.share_id=s.id AND co.role='computed' "
+            "WHERE s.status='accepted' AND s.actual_difficulty_dec IS NOT NULL";
+        if (request.resource == ApiCollection::top_shares) {
+            if (const auto round = request.filters.find("round_id");
+                round != request.filters.end()) {
+                add_integer("s.round_id", std::stoll(round->second));
+            }
+            sql += " ORDER BY length(s.actual_difficulty_dec) DESC,"
+                   "s.actual_difficulty_dec DESC,s.id DESC";
+        }
+        else {
+            const std::string minimum = std::to_string(
+                api_.recent_high_share_min_difficulty);
+            const std::string greater_length = placeholder();
+            bindings.push_back(text_binding(minimum));
+            const std::string equal_length = placeholder();
+            bindings.push_back(text_binding(minimum));
+            const std::string lexical_minimum = placeholder();
+            bindings.push_back(text_binding(minimum));
+            sql += " AND (length(s.actual_difficulty_dec)>length(" +
+                   greater_length + ") OR (length(s.actual_difficulty_dec)="
+                   "length(" + equal_length + ") AND "
+                   "s.actual_difficulty_dec>=" + lexical_minimum + "))"
+                   " ORDER BY s.received_unix_us DESC,s.id DESC";
+        }
+        return run_bounded_collection(
+            std::move(sql), std::move(bindings), bounded_request,
+            [this](ReadStatement &row) { return share_resource(row); });
+    }
     case ApiCollection::hashes: {
         sql =
             "SELECT sh.share_id,sh.role,sh.hash,sh.meets_share_target,"
             "sh.meets_network_target,s.received_unix_us,s.status,c.public_id,"
-            "s.worker_id,pj.public_job_id FROM share_hashes sh JOIN shares s "
+            "s.worker_id,pj.public_job_id,s.assigned_difficulty_dec,"
+            "s.actual_difficulty_dec,s.network_difficulty_dec,"
+            "s.credited_difficulty_dec,s.provenance,s.round_id "
+            "FROM share_hashes sh JOIN shares s "
             "ON s.id=sh.share_id JOIN connections c ON c.id=s.connection_id "
             "LEFT JOIN private_jobs pj ON pj.id=s.job_id WHERE 1=1";
         const std::uint64_t last_share = request.after_database_id / 2U;
@@ -2217,7 +2540,9 @@ ApiCollectionResult SqliteApiReader::collection(
         sql =
             "SELECT r.id,r.opened_unix_us,r.closed_unix_us,r.state,"
             "r.accepted_candidate_id,r.accepted_height,r.miner_tx_hash,r.block_id,"
-            "r.credited_difficulty_dec,r.accepted_share_count FROM rounds r WHERE 1=1";
+            "r.credited_difficulty_dec,r.accepted_share_count,"
+            "r.effort_finalized_unix_us,r.finalized_effort_segment_count "
+            "FROM rounds r WHERE 1=1";
         add_after_id("r.id");
         if (const auto state = request.filters.find("state");
             state != request.filters.end()) add_list("r.state", state->second);
@@ -2363,7 +2688,7 @@ std::optional<Json> SqliteApiReader::share_detail(const std::string_view id)
         "s.verifier_ticket_dec,s.verifier_seed_id_dec,s.verifier_queue_ns,"
         "s.verifier_hash_ns,s.verifier_total_ns,ch.hash,co.hash,"
         "ch.meets_share_target,co.meets_share_target,ch.meets_network_target,"
-        "co.meets_network_target,s.candidate_id FROM shares s JOIN connections c "
+        "co.meets_network_target,s.candidate_id,s.round_id FROM shares s JOIN connections c "
         "ON c.id=s.connection_id LEFT JOIN private_jobs pj ON pj.id=s.job_id "
         "LEFT JOIN share_hashes ch ON ch.share_id=s.id AND ch.role='claimed' "
         "LEFT JOIN share_hashes co ON co.share_id=s.id AND co.role='computed' "
@@ -2485,7 +2810,8 @@ std::optional<Json> SqliteApiReader::current_round()
         database_,
         "SELECT id,opened_unix_us,closed_unix_us,state,accepted_candidate_id,"
         "accepted_height,miner_tx_hash,block_id,credited_difficulty_dec,"
-        "accepted_share_count FROM rounds WHERE state='open'");
+        "accepted_share_count,effort_finalized_unix_us,"
+        "finalized_effort_segment_count FROM rounds WHERE state='open'");
     if (!row.row()) return std::nullopt;
     Json result = round_resource(row);
     if (row.row()) throw DatabaseError("database contains multiple open rounds");
@@ -2638,6 +2964,9 @@ Json SqliteApiReader::summary(Json live_summary,
         {"id", open_round->at("id")},
         {"state", open_round->at("state")},
         {"opened_at", open_round->at("opened_at")},
+        {"estimated_hashes", open_round->at("estimated_hashes")},
+        {"accepted_share_count", open_round->at("accepted_share_count")},
+        {"effort", open_round->at("effort")},
     };
 
     return Json{
@@ -2718,7 +3047,7 @@ Json SqliteApiReader::persistence()
     }
 
     return Json{
-        {"schema_version", 1},
+        {"schema_version", 2},
         {"journal_mode", journal},
         {"synchronous", synchronous},
         {"foreign_keys", foreign_keys_enabled},
@@ -2762,7 +3091,7 @@ ApiDataSource make_sqlite_api_data_source(SqliteApiDataSourceOptions options)
 {
     if (!options.clock) options.clock = [] { return unix_time_us(); };
     auto reader = std::make_shared<SqliteApiReader>(
-        options.database, options.active_hashrate_source, options.clock,
+        options.database, options.api, options.active_hashrate_source, options.clock,
         std::move(options.writer_stats));
     ApiDataSource live = std::move(options.live);
     ApiDataSource result;

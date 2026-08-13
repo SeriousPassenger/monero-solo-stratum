@@ -140,6 +140,13 @@ The payout address is public and may be logged. Database private job blobs and
 hash material are intentionally persisted for reconstruction/audit and are
 available only through an authenticated sensitive API view. They are not
 wallet secrets, but should still be treated as operationally sensitive.
+The 16-byte private job entropy is the one explicit logging exception: it may
+be copied to a mode-0600 JSONL file only when
+`logging.include_private_job_entropy=true` and debug/trace is selected. It is
+never accepted by stderr logging and does not permit DRBG state, seed key,
+password, token, full private blob, or wallet-secret fields. Leave the setting
+off except for a bounded diagnostic run and protect/rotate the resulting file
+like the database.
 
 Store config mode 0600 under the service account. Keep database/log directories
 non-world-writable. Never embed daemon credentials in `rpc_url`. Nonempty

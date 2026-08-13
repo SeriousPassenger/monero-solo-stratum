@@ -5,6 +5,9 @@ class. It does not claim that a command passed on a machine where it was not
 run; the release/handoff record should include the actual configure command,
 compiler, test output, and sanitizer/regtest results.
 
+The server build prerequisites apply, and a test-enabled configure additionally
+requires Bash and `jq` for the installed human-monitor fixture.
+
 ## Standard build and tests
 
 ```sh
@@ -31,16 +34,17 @@ ctest --test-dir build -R 'config|database|protocol' --output-on-failure
 | --- | --- |
 | `config_tests` | Defaults/required keys, strict/duplicate JSON, unknown keys, address and cross-capacity/security rules, no-shell blocknotify tokenizer, and complete example config loading |
 | `entropy_tests` | Exact HMAC-DRBG construction vector, independent/reseed behavior, failure atomicity, and timed retry/backoff |
-| `logger_tests` | JSONL schema/time/severity/typed-field output, filtering and bounds, mode-0600 append/open safety, stderr/failure containment, and concurrent noninterleaving writes |
+| `logger_tests` | JSONL schema/time/severity/typed-field output, filtering and bounds, opt-in sensitive-entropy gating, mode-0600 append/open safety, stderr/failure containment, and concurrent noninterleaving writes |
 | `monero_tests` | Legacy Keccak/address validation, share/network target boundaries, constant-time hash comparison, block/parser/mutation vectors, duplicate and candidate keys |
 | `monero_template_tests` | Realistic daemon template parse/regeneration, private reserved-byte mutation, exact nonce/frozen candidate reconstruction |
-| `database_tests` | Schema/pragmas, sessions/jobs/shares/duplicates, candidate journaling/attempt/reconciliation state, bounded writer item/byte reserve and priority ordering/stats, rounds/hashrate, bans/verdicts/events, strict event-payload validation, hook recovery, orphan lifecycle cleanup, duplicate-capacity reclamation, and restart event attribution |
+| `database_tests` | Schema/pragmas, sessions/jobs/shares/duplicates, candidate journaling/attempt/reconciliation state, bounded writer item/byte reserve and priority ordering/stats, durable share-to-round assignment, exact/frozen round effort segments, rounds/hashrate, bans/verdicts/events, strict event-payload validation, hook recovery, orphan lifecycle cleanup, duplicate-capacity reclamation, and restart event attribution |
 | `verifier_tests` | Exact server-to-native config mapping, known RandomX answer, tag/ticket/seed correlation, rotation/release, completion draining, cancel and drain shutdown |
-| `api_tests` | Bearer/null-empty semantics, GET-only/errors/health, strict filters/cursor binding, sensitive views, persisted SQLite resources and detail shapes |
-| `protocol_tests` | Duplicate registry bounds/lifecycle, defense/ban admission, loopback Stratum login/job/submit/keepalive/framing, Unix event stream, blocknotify supervisor |
+| `api_tests` | Bearer/null-empty semantics, GET-only/errors/health, strict filters/cursor binding, sensitive views, persisted SQLite resources/detail shapes, mixed-difficulty hashrate/effort, and bounded top/recent-high share rankings |
+| `protocol_tests` | Duplicate registry bounds/lifecycle, defense/ban admission, loopback Stratum login/job/submit/keepalive/framing, ordinary and NiceHash compact-target simple-mode jobs, full nonce preservation, Unix event stream, blocknotify supervisor |
 | `http_tests` | Real TCP HTTP framing, empty-body enforcement, transfer-encoding rejection, duplicate headers, and transport-error envelopes |
-| `runtime_tests` | In-process mock `monerod`, real Stratum/API sockets, private jobs, trusted share persistence, restart state, fail-closed template validation, parseable lifecycle/candidate JSONL records, and configured-secret non-disclosure |
+| `runtime_tests` | In-process mock `monerod`, real Stratum/API sockets, private jobs, trusted share persistence, restart state, candidate/template round-boundary gating, fail-closed template validation, verbose post-commit job/share JSONL correlation, entropy opt-in/out, and configured-secret non-disclosure |
 | `rental_fanin_tests` | 200 simultaneous authenticated miners across three loopback source IPs, fixed event/worker thread count, refresh delivery to every miner, bounded concurrent submits, connection reaping, and timing/RSS diagnostics |
+| `watch_status_tests` | Stubbed API monitor run, human-readable daemon/hashrate/round/verifier output, configured-cap-safe share requests, and complete non-null NDJSON snapshots |
 
 Tests are standalone C++ executables with nonzero failure exit; no third-party
 unit-test framework is required. CTest applies a 180-second default per-test

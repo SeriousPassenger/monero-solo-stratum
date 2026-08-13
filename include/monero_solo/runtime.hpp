@@ -55,7 +55,7 @@ private:
     struct VerificationResult;
 
     void validate_daemon_network();
-    void refresh_template(std::string reason);
+    [[nodiscard]] bool refresh_template(std::string reason);
     [[nodiscard]] std::shared_ptr<TemplateContext> parse_template(
         const RpcObservation &observation, std::string reason);
     [[nodiscard]] std::optional<StratumJob> make_job(const MinerConnection &connection);
@@ -88,6 +88,13 @@ private:
         bool claimed_path, bool bypass_admission,
         std::optional<bool> *admission_acquired = nullptr);
     [[nodiscard]] bool reconcile_candidate(const CandidateTask &task);
+    [[nodiscard]] bool candidate_height_allowed_unlocked(
+        std::uint64_t height) const noexcept;
+    void register_candidate_boundary_unlocked(std::int64_t candidate_id,
+                                              std::uint64_t height);
+    void activate_accepted_candidate_fence_unlocked(std::uint64_t height);
+    void release_candidate_boundary_unlocked(std::int64_t candidate_id) noexcept;
+    void release_candidate_boundary(std::int64_t candidate_id) noexcept;
     [[nodiscard]] ApiDataSource api_data_source();
     void emit(std::string type, nlohmann::json data,
               std::optional<std::int64_t> connection_id = std::nullopt,
@@ -153,6 +160,9 @@ private:
     std::unordered_set<std::int64_t> reconciling_candidates_;
     std::vector<std::jthread> candidate_threads_;
     std::counting_semaphore<4> reconciliation_slots_{4};
+    mutable std::mutex candidate_boundary_mutex_;
+    std::map<std::int64_t, std::uint64_t> unresolved_candidate_heights_;
+    std::optional<std::uint64_t> accepted_candidate_height_fence_;
     std::jthread template_thread_;
     std::jthread committed_event_thread_;
 };

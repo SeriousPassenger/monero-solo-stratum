@@ -74,7 +74,13 @@ void test_defaults_and_required_fields()
             "verifier auto-worker defaults differ");
     require(config.verifier.max_seeds == 2, "seed default differs");
     require(config.database.retention_days == 0, "retention default differs");
+    require(config.api.top_shares_limit == 100 &&
+                config.api.recent_high_shares_limit == 100 &&
+                config.api.recent_high_share_min_difficulty == 20'000'000'000ULL,
+            "share analytics defaults differ");
     require(!config.stratum.access_password, "null password must stay disabled");
+    require(!config.logging.include_private_job_entropy,
+            "private job entropy logging default differs");
 
     std::string empty_zmq = valid_config();
     empty_zmq.replace(empty_zmq.find("\"zmq_address\":null"), 18,
@@ -108,6 +114,86 @@ void test_defaults_and_required_fields()
                 explicit_config.verifier.workers == 9 &&
                 explicit_config.verifier.seed_init_threads == 11,
             "explicit worker counts changed during parsing");
+}
+
+void test_private_job_entropy_logging_gate()
+{
+    std::string enabled = valid_config();
+    enabled.replace(enabled.find("\"logging\":{}"), 12,
+                    "\"logging\":{\"level\":\"debug\","
+                    "\"file\":\"/tmp/mss-debug.jsonl\","
+                    "\"include_private_job_entropy\":true}");
+    const auto parsed = monero_solo::parse_config_json(
+        enabled, {.validate_paths = false,
+                  .validate_blocknotify_executable = false});
+    require(parsed.logging.include_private_job_entropy,
+            "private job entropy logging gate did not parse");
+
+    std::string stderr_target = valid_config();
+    stderr_target.replace(stderr_target.find("\"logging\":{}"), 12,
+        "\"logging\":{\"level\":\"debug\","
+        "\"include_private_job_entropy\":true}");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            stderr_target, {.validate_paths = false,
+                            .validate_blocknotify_executable = false});
+    }, "private job entropy logging to stderr was accepted");
+
+    std::string info_level = valid_config();
+    info_level.replace(info_level.find("\"logging\":{}"), 12,
+        "\"logging\":{\"level\":\"info\","
+        "\"file\":\"/tmp/mss-debug.jsonl\","
+        "\"include_private_job_entropy\":true}");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            info_level, {.validate_paths = false,
+                         .validate_blocknotify_executable = false});
+    }, "private job entropy logging at info was accepted");
+}
+
+void test_api_share_analytics_bounds()
+{
+    std::string configured = valid_config();
+    configured.replace(configured.find("\"api\":{\"enabled\":false}"), 23,
+        "\"api\":{\"enabled\":false,\"top_shares_limit\":7,"
+        "\"recent_high_shares_limit\":9,"
+        "\"recent_high_share_min_difficulty\":123}");
+    const auto parsed = monero_solo::parse_config_json(
+        configured, {.validate_paths = false,
+                     .validate_blocknotify_executable = false});
+    require(parsed.api.top_shares_limit == 7 &&
+                parsed.api.recent_high_shares_limit == 9 &&
+                parsed.api.recent_high_share_min_difficulty == 123,
+            "share analytics settings did not parse");
+
+    std::string too_many_top = valid_config();
+    too_many_top.replace(too_many_top.find("\"api\":{\"enabled\":false}"), 23,
+        "\"api\":{\"enabled\":false,\"top_shares_limit\":101}");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            too_many_top, {.validate_paths = false,
+                           .validate_blocknotify_executable = false});
+    }, "top-share cap above 100 accepted");
+
+    std::string zero_recent = valid_config();
+    zero_recent.replace(zero_recent.find("\"api\":{\"enabled\":false}"), 23,
+        "\"api\":{\"enabled\":false,\"recent_high_shares_limit\":0}");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            zero_recent, {.validate_paths = false,
+                          .validate_blocknotify_executable = false});
+    }, "zero recent-high share cap accepted");
+
+    std::string zero_threshold = valid_config();
+    zero_threshold.replace(zero_threshold.find("\"api\":{\"enabled\":false}"),
+                           23,
+        "\"api\":{\"enabled\":false,"
+        "\"recent_high_share_min_difficulty\":0}");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            zero_threshold, {.validate_paths = false,
+                             .validate_blocknotify_executable = false});
+    }, "zero recent-high share threshold accepted");
 }
 
 void test_strict_json_and_unknown_keys()
@@ -218,6 +304,10 @@ void test_complete_example_config()
             "example payout address differs");
     require(config.stratum.listen.size() == 2,
             "example listener count differs");
+    require(config.api.top_shares_limit == 100 &&
+                config.api.recent_high_shares_limit == 100 &&
+                config.api.recent_high_share_min_difficulty == 20'000'000'000ULL,
+            "example share analytics defaults differ");
     require(config.verifier.enabled, "example must default to verified mode");
     require(config.events.enabled && config.api.enabled && !config.defense.enabled,
             "example data/simple-defense defaults differ");
@@ -231,6 +321,8 @@ int main(int argc, char **argv)
         require(argc >= 1 && argv[0] != nullptr,
                 "test executable path is unavailable");
         test_defaults_and_required_fields();
+        test_api_share_analytics_bounds();
+        test_private_job_entropy_logging_gate();
         test_strict_json_and_unknown_keys();
         test_cross_capacity_and_security_rules();
         test_blocknotify_tokenizer(argv[0]);

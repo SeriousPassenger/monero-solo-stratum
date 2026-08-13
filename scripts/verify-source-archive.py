@@ -185,6 +185,7 @@ def verify(archive_path: pathlib.Path, expected_root: str) -> tuple[int, int, in
                     "scripts/make-source-archive.sh",
                     "scripts/test-source-archive.sh",
                     "scripts/verify-source-archive.py",
+                    "scripts/watch-status.sh",
                 }:
                     expected_mode = 0o755
                 if stat.S_IMODE(member.mode) != expected_mode:
@@ -274,6 +275,7 @@ def verify(archive_path: pathlib.Path, expected_root: str) -> tuple[int, int, in
         "scripts/make-source-archive.sh",
         "scripts/test-source-archive.sh",
         "scripts/verify-source-archive.py",
+        "scripts/watch-status.sh",
         "src/main.cpp",
         "src/runtime/runtime.cpp",
         "tests/regtest/run_monero_regtest.py",

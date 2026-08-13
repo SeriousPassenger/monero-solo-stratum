@@ -840,7 +840,7 @@ struct Database::Impl {
 
             Transaction transaction(db);
             execute(db, kSchemaSql);
-            execute(db, "PRAGMA user_version = 1");
+            execute(db, "PRAGMA user_version = 2");
             transaction.commit();
             return;
         }
@@ -848,7 +848,8 @@ struct Database::Impl {
         Statement statement(
             db, "SELECT value FROM schema_meta WHERE key='schema_version'");
         require(statement.row(), "database schema_version is missing");
-        require(statement.text(0) == "1", "unsupported database schema version");
+        require(statement.text(0) == "2",
+                "unsupported database schema version (expected clean schema v2)");
         require(!statement.row(), "database has duplicate schema_version metadata");
     }
 
@@ -931,6 +932,7 @@ struct Database::Impl {
         std::int64_t template_id{};
         std::int64_t job_id{};
         std::int64_t share_id{};
+        std::int64_t round_id{};
         std::int64_t height{};
         Hash32 miner_tx_hash{};
         CandidateState state{CandidateState::journaled};
@@ -941,7 +943,7 @@ struct Database::Impl {
         Statement statement(
             db,
             "SELECT c.connection_id,s.worker_id,j.template_id,c.job_id,c.first_share_id,"
-            "c.height,c.miner_tx_hash,c.state "
+            "s.round_id,c.height,c.miner_tx_hash,c.state "
             "FROM candidates c "
             "JOIN private_jobs j ON j.id=c.job_id "
             "JOIN shares s ON s.id=c.first_share_id WHERE c.id=?1");
@@ -955,9 +957,10 @@ struct Database::Impl {
         result.template_id = statement.integer(2);
         result.job_id = statement.integer(3);
         result.share_id = statement.integer(4);
-        result.height = statement.integer(5);
-        result.miner_tx_hash = exact_array<32>(statement.blob(6), "miner transaction hash");
-        result.state = parse_candidate_state(statement.text(7));
+        result.round_id = statement.integer(5);
+        result.height = statement.integer(6);
+        result.miner_tx_hash = exact_array<32>(statement.blob(7), "miner transaction hash");
+        result.state = parse_candidate_state(statement.text(8));
         // Candidate correlation stays bound to its immutable originating
         // connection/job/share. The event itself is emitted by whichever
         // server process performs this state transition, including restart
@@ -1015,6 +1018,22 @@ struct Database::Impl {
                     "candidate is not eligible for daemon acceptance");
         }
 
+        Statement open_round(db, "SELECT id FROM rounds WHERE state='open'");
+        require(open_round.row(), "candidate acceptance found no open round");
+        const std::int64_t closed_round_id = open_round.integer(0);
+        require(!open_round.row(), "candidate acceptance found multiple open rounds");
+        require(closed_round_id == context.round_id,
+                "candidate origin round is no longer the open round");
+
+        Statement contaminated(
+            db,
+            "SELECT 1 FROM shares s JOIN private_jobs j ON j.id=s.job_id "
+            "WHERE s.round_id=?1 AND j.height>?2 LIMIT 1");
+        contaminated.bind(context.round_id, 1);
+        contaminated.bind(context.height, 2);
+        require(!contaminated.row(),
+                "candidate origin round contains a higher-height share");
+
         const CandidateState accepted_state = by_reconciliation
                                                     ? CandidateState::accepted_by_reconciliation
                                                     : CandidateState::accepted;
@@ -1048,11 +1067,6 @@ struct Database::Impl {
         suppress.bind(accepted_unix_us, 1);
         suppress.bind(candidate_id, 2);
         suppress.done();
-
-        Statement open_round(db, "SELECT id FROM rounds WHERE state='open'");
-        require(open_round.row(), "candidate acceptance found no open round");
-        const std::int64_t closed_round_id = open_round.integer(0);
-        require(!open_round.row(), "candidate acceptance found multiple open rounds");
 
         Statement close_round(
             db,
@@ -1109,6 +1123,127 @@ struct Database::Impl {
             notify.bind(context.miner_tx_hash, 2);
             notify.done();
         }
+        (void)try_finalize_round_unlocked(closed_round_id, accepted_unix_us);
+        return true;
+    }
+
+    void add_round_work_segment_unlocked(
+        std::int64_t round_id, HashrateSource source,
+        std::string_view network_difficulty,
+        std::string_view credited_difficulty)
+    {
+        require(round_id > 0, "round work segment has an invalid round ID");
+        require_uint128(network_difficulty, "round network difficulty", false);
+        require_uint128(credited_difficulty, "round credited difficulty", false);
+
+        Statement select(
+            db,
+            "SELECT credited_difficulty_dec,accepted_share_count "
+            "FROM round_work_segments WHERE round_id=?1 AND source=?2 "
+            "AND network_difficulty_dec=?3");
+        select.bind(round_id, 1);
+        select.bind(to_string(source), 2);
+        select.bind(network_difficulty, 3);
+        if (select.row()) {
+            const std::string updated = add_uint128(
+                select.text(0), credited_difficulty);
+            const std::int64_t count = select.integer(1);
+            require(count < std::numeric_limits<std::int64_t>::max(),
+                    "round work segment share counter overflow");
+            Statement update(
+                db,
+                "UPDATE round_work_segments SET credited_difficulty_dec=?1,"
+                "accepted_share_count=?2 WHERE round_id=?3 AND source=?4 "
+                "AND network_difficulty_dec=?5");
+            update.bind(updated, 1);
+            update.bind(count + 1, 2);
+            update.bind(round_id, 3);
+            update.bind(to_string(source), 4);
+            update.bind(network_difficulty, 5);
+            update.done();
+            require(sqlite3_changes(db) == 1,
+                    "round work segment update failed");
+            return;
+        }
+
+        Statement insert(
+            db,
+            "INSERT INTO round_work_segments(round_id,source,"
+            "network_difficulty_dec,credited_difficulty_dec,accepted_share_count) "
+            "VALUES(?1,?2,?3,?4,1)");
+        insert.bind(round_id, 1);
+        insert.bind(to_string(source), 2);
+        insert.bind(network_difficulty, 3);
+        insert.bind(credited_difficulty, 4);
+        insert.done();
+    }
+
+    bool try_finalize_round_unlocked(std::int64_t round_id,
+                                     std::int64_t finalized_unix_us)
+    {
+        require(round_id > 0, "round finalization has an invalid round ID");
+        Statement round(
+            db,
+            "SELECT state,closed_unix_us,credited_difficulty_dec,"
+            "accepted_share_count,effort_finalized_unix_us "
+            "FROM rounds WHERE id=?1");
+        round.bind(round_id, 1);
+        require(round.row(), "round finalization target does not exist");
+        const std::string state = round.text(0);
+        if (state == "open" || !round.is_null(4)) {
+            return false;
+        }
+        require(state == "closed" && !round.is_null(1),
+                "round has an invalid persisted state");
+        const std::int64_t closed_unix_us = round.integer(1);
+        const std::string credited_total = round.text(2);
+        const std::int64_t accepted_total = round.integer(3);
+
+        Statement pending(
+            db,
+            "SELECT 1 FROM shares WHERE round_id=?1 "
+            "AND status IN ('received','verifying') LIMIT 1");
+        pending.bind(round_id, 1);
+        if (pending.row()) {
+            return false;
+        }
+
+        std::string segment_total = "0";
+        std::int64_t share_count = 0;
+        std::int64_t segment_count = 0;
+        Statement segments(
+            db,
+            "SELECT credited_difficulty_dec,accepted_share_count "
+            "FROM round_work_segments WHERE round_id=?1 ORDER BY source,"
+            "network_difficulty_dec");
+        segments.bind(round_id, 1);
+        while (segments.row()) {
+            segment_total = add_uint128(segment_total, segments.text(0));
+            const std::int64_t count = segments.integer(1);
+            require(count > 0 &&
+                        share_count <= std::numeric_limits<std::int64_t>::max() - count,
+                    "round work segment share count is invalid");
+            share_count += count;
+            require(segment_count < std::numeric_limits<std::int64_t>::max(),
+                    "round work segment count overflow");
+            ++segment_count;
+        }
+        require(segment_total == credited_total,
+                "round work segments do not match credited difficulty");
+        require(share_count == accepted_total,
+                "round work segments do not match accepted share count");
+
+        Statement finalize(
+            db,
+            "UPDATE rounds SET effort_finalized_unix_us=?1,"
+            "finalized_effort_segment_count=?2 WHERE id=?3 AND state='closed' "
+            "AND effort_finalized_unix_us IS NULL");
+        finalize.bind(std::max(finalized_unix_us, closed_unix_us), 1);
+        finalize.bind(segment_count, 2);
+        finalize.bind(round_id, 3);
+        finalize.done();
+        require(sqlite3_changes(db) == 1,
+                "round effort changed while being finalized");
         return true;
     }
 
@@ -1333,8 +1468,8 @@ std::uint32_t Database::schema_version() const
         impl_->db, "SELECT value FROM schema_meta WHERE key='schema_version'");
     require(statement.row(), "database schema_version is missing");
     const std::string value = statement.text(0);
-    require(value == "1", "unsupported database schema version");
-    return 1;
+    require(value == "2", "unsupported database schema version (expected 2)");
+    return 2;
 }
 
 std::int64_t Database::start_session(const SessionStart &session)
@@ -1441,6 +1576,14 @@ InterruptedRuntimeRecovery Database::recover_interrupted_runtime(
 
     std::scoped_lock lock(impl_->mutex);
     Transaction transaction(impl_->db);
+    std::vector<std::int64_t> pending_rounds;
+    Statement pending_round_query(
+        impl_->db,
+        "SELECT DISTINCT round_id FROM shares "
+        "WHERE status IN ('received','verifying') ORDER BY round_id");
+    while (pending_round_query.row()) {
+        pending_rounds.push_back(pending_round_query.integer(0));
+    }
     Statement cancel_shares(
         impl_->db,
         "UPDATE shares SET status='cancelled',provenance='pending',"
@@ -1469,6 +1612,9 @@ InterruptedRuntimeRecovery Database::recover_interrupted_runtime(
     stop_sessions.done();
     result.sessions_stopped = static_cast<std::uint64_t>(
         sqlite3_changes(impl_->db));
+    for (const std::int64_t round_id : pending_rounds) {
+        (void)impl_->try_finalize_round_unlocked(round_id, recovered_unix_us);
+    }
     transaction.commit();
     return result;
 }
@@ -1517,6 +1663,21 @@ std::int64_t Database::current_open_round_id() const
     const std::int64_t id = statement.integer(0);
     require(!statement.row(), "database contains multiple open rounds");
     return id;
+}
+
+std::optional<std::uint64_t> Database::latest_accepted_height() const
+{
+    std::scoped_lock lock(impl_->mutex);
+    Statement statement(
+        impl_->db,
+        "SELECT accepted_height FROM rounds WHERE state='closed' "
+        "ORDER BY id DESC LIMIT 1");
+    if (!statement.row()) {
+        return std::nullopt;
+    }
+    const std::int64_t height = statement.integer(0);
+    require(height > 0, "latest accepted round height is invalid");
+    return static_cast<std::uint64_t>(height);
 }
 
 std::int64_t Database::insert_event(const EventInsert &event)
@@ -1964,11 +2125,12 @@ std::int64_t Database::insert_share(const ShareInsert &share)
 
     Statement statement(
         impl_->db,
-        "INSERT INTO shares(connection_id,worker_id,job_id,request_sequence,"
+        "INSERT INTO shares(round_id,connection_id,worker_id,job_id,request_sequence,"
         "miner_request_id_type,miner_request_id_text,received_unix_us,nonce,"
         "assigned_difficulty_dec,network_difficulty_dec,height_is_older,"
         "claimed_candidate,candidate_admission,status,provenance) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)");
+        "SELECT id,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15 "
+        "FROM rounds WHERE state='open'");
     statement.bind(share.connection_id, 1);
     statement.bind_optional(share.worker_id, 2);
     statement.bind_optional(share.job_id, 3);
@@ -1985,6 +2147,8 @@ std::int64_t Database::insert_share(const ShareInsert &share)
     statement.bind(share.status, 14);
     statement.bind(share.provenance, 15);
     statement.done();
+    require(sqlite3_changes(impl_->db) == 1,
+            "share insert found no unique open round");
     return last_insert_id(impl_->db);
 }
 
@@ -2518,16 +2682,15 @@ CandidateReconciliationStartResult Database::start_candidate_reconciliation(
     Transaction transaction(impl_->db);
     Statement candidate(
         impl_->db,
-        "SELECT state,reconciliation_exhausted_unix_us FROM candidates WHERE id=?1");
+        "SELECT state FROM candidates WHERE id=?1");
     candidate.bind(reconciliation.candidate_id, 1);
     require(candidate.row(), "reconciliation candidate does not exist");
     const CandidateState candidate_state = parse_candidate_state(candidate.text(0));
-        require(candidate_state == CandidateState::journaled ||
+    require(candidate_state == CandidateState::journaled ||
                 candidate_state == CandidateState::dispatching ||
                 candidate_state == CandidateState::retry_wait ||
                 candidate_state == CandidateState::ambiguous,
             "candidate state does not permit reconciliation evidence");
-    require(candidate.is_null(1), "candidate reconciliation is already exhausted");
 
     Statement existing(
         impl_->db,
@@ -2772,12 +2935,12 @@ void Database::schedule_candidate_reconciliation(std::int64_t candidate_id,
         impl_->db,
         "UPDATE candidates SET next_reconciliation_unix_us=?1,"
         "updated_unix_us=max(updated_unix_us,?1) WHERE id=?2 "
-        "AND state='ambiguous' AND reconciliation_exhausted_unix_us IS NULL");
+        "AND state='ambiguous'");
     statement.bind(next_unix_us, 1);
     statement.bind(candidate_id, 2);
     statement.done();
     require(sqlite3_changes(impl_->db) == 1,
-            "candidate is absent, nonambiguous, or reconciliation-exhausted");
+            "candidate is absent or nonambiguous");
 }
 
 bool Database::exhaust_candidate_reconciliation(std::int64_t candidate_id,
@@ -2822,7 +2985,7 @@ std::vector<CandidateRecovery> Database::recoverable_candidates() const
         "reconciliation_cycle_count,created_unix_us,next_reconciliation_unix_us "
         "FROM candidates "
         "WHERE state IN ('journaled','dispatching','retry_wait','ambiguous') "
-        "AND reconciliation_exhausted_unix_us IS NULL ORDER BY id");
+        "ORDER BY id");
     std::vector<CandidateRecovery> result;
     while (statement.row()) {
         CandidateRecovery value;
@@ -2909,7 +3072,9 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
     Statement share(
         impl_->db,
         "SELECT s.status,s.connection_id,s.worker_id,s.job_id,"
-        "s.assigned_difficulty_dec,s.provenance,c.session_id,j.template_id "
+        "s.assigned_difficulty_dec,s.provenance,c.session_id,j.template_id,"
+        "s.round_id,s.network_difficulty_dec,j.network_difficulty_dec,"
+        "j.assigned_difficulty_dec "
         "FROM shares s JOIN connections c ON c.id=s.connection_id "
         "LEFT JOIN private_jobs j ON j.id=s.job_id WHERE s.id=?1");
     share.bind(acceptance.share_id, 1);
@@ -2933,6 +3098,19 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
     std::optional<std::int64_t> template_id;
     if (!share.is_null(7)) {
         template_id = share.integer(7);
+    }
+    const std::int64_t round_id = share.integer(8);
+    require(!share.is_null(9),
+            "accepted share has no snapshotted network difficulty");
+    const std::string network_difficulty = share.text(9);
+    require_uint128(network_difficulty, "share network difficulty", false);
+    if (!share.is_null(10)) {
+        require(share.text(10) == network_difficulty,
+                "share network difficulty differs from its private job");
+    }
+    if (!share.is_null(11)) {
+        require(share.text(11) == acceptance.assigned_difficulty_dec,
+                "accepted difficulty differs from the private job assignment");
     }
 
     if (prior_status != "received" && prior_status != "verifying") {
@@ -2993,27 +3171,35 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
 
     Statement round(
         impl_->db,
-        "SELECT id,credited_difficulty_dec,accepted_share_count "
-        "FROM rounds WHERE state='open'");
-    require(round.row(), "share acceptance found no open round");
-    const std::int64_t round_id = round.integer(0);
-    const std::string credited = add_uint128(round.text(1),
+        "SELECT credited_difficulty_dec,accepted_share_count,state,"
+        "effort_finalized_unix_us FROM rounds WHERE id=?1");
+    round.bind(round_id, 1);
+    require(round.row(), "share acceptance found no assigned round");
+    const std::string credited = add_uint128(round.text(0),
                                              acceptance.assigned_difficulty_dec);
-    const std::int64_t accepted_count = round.integer(2);
+    const std::int64_t accepted_count = round.integer(1);
+    const std::string round_state = round.text(2);
+    require(round_state == "open" || round_state == "closed",
+            "share assigned round has an invalid state");
+    require(round.is_null(3),
+            "share acceptance attempted to mutate finalized round effort");
     require(accepted_count < std::numeric_limits<std::int64_t>::max(),
             "round accepted-share counter overflow");
-    require(!round.row(), "share acceptance found multiple open rounds");
+
+    impl_->add_round_work_segment_unlocked(
+        round_id, acceptance.source, network_difficulty,
+        acceptance.assigned_difficulty_dec);
 
     Statement update_round(
         impl_->db,
         "UPDATE rounds SET credited_difficulty_dec=?1,accepted_share_count=?2 "
-        "WHERE id=?3 AND state='open'");
+        "WHERE id=?3 AND effort_finalized_unix_us IS NULL");
     update_round.bind(credited, 1);
     update_round.bind(accepted_count + 1, 2);
     update_round.bind(round_id, 3);
     update_round.done();
     require(sqlite3_changes(impl_->db) == 1,
-            "open round changed during share acceptance");
+            "assigned round changed during share acceptance");
 
     const std::int64_t event_id = impl_->insert_event_unlocked(EventInsert{
         .session_id = session_id,
@@ -3028,6 +3214,10 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
         .round_id = round_id,
         .payload_json = std::string(kEmptyPayload),
     });
+    if (round_state == "closed") {
+        (void)impl_->try_finalize_round_unlocked(
+            round_id, acceptance.completed_unix_us);
+    }
     transaction.commit();
     return ShareAcceptanceResult{
         .accepted = true,
@@ -3721,14 +3911,12 @@ bool Database::finalize_share(std::int64_t share_id,
         Statement context(
             impl_->db,
             "SELECT c.session_id,s.connection_id,s.worker_id,p.template_id,s.job_id,"
-            "s.candidate_id FROM shares s JOIN connections c ON c.id=s.connection_id "
+            "s.candidate_id,s.round_id FROM shares s "
+            "JOIN connections c ON c.id=s.connection_id "
             "LEFT JOIN private_jobs p ON p.id=s.job_id WHERE s.id=?1");
         context.bind(share_id, 1);
         require(context.row(), "finalized share context disappeared");
-        Statement round(impl_->db, "SELECT id FROM rounds WHERE state='open'");
-        require(round.row(), "finalized share found no open round");
-        const std::int64_t round_id = round.integer(0);
-        require(!round.row(), "finalized share found multiple open rounds");
+        const std::int64_t round_id = context.integer(6);
         impl_->insert_event_unlocked(EventInsert{
             .session_id = context.integer(0),
             .created_unix_us = value.completed_unix_us,
@@ -3746,6 +3934,8 @@ bool Database::finalize_share(std::int64_t share_id,
             .round_id = round_id,
             .payload_json = std::string(kEmptyPayload),
         });
+        (void)impl_->try_finalize_round_unlocked(
+            round_id, value.completed_unix_us);
     }
     transaction.commit();
     return changed;

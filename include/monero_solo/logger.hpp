@@ -31,7 +31,7 @@ enum class PublicStringKey : std::uint8_t {
     connection_public_id,
     worker_public_id,
     template_public_id,
-    job_id,
+    job_public_id,
     share_public_id,
     candidate_key,
     round_public_id,
@@ -47,6 +47,27 @@ enum class PublicStringKey : std::uint8_t {
     status,
     reason_code,
     peer,
+    agent_profile,
+    seed_hash,
+    target,
+    target_encoding,
+    fetch_reason,
+    assigned_difficulty,
+    network_difficulty,
+    actual_difficulty,
+    credited_difficulty,
+    nonce,
+    claimed_hash,
+    computed_hash,
+    provenance,
+    key_count,
+};
+
+// Sensitive fields have a separate closed key space and an explicit logger
+// construction gate. They can never be written to stderr, and their values
+// must use the exact bounded encoding required by the key.
+enum class SensitiveHexKey : std::uint8_t {
+    private_job_entropy,
     key_count,
 };
 
@@ -78,6 +99,9 @@ enum class IntegerKey : std::uint8_t {
     listener_count,
     reconciliation_id,
     cycle,
+    verifier_queue_ns,
+    verifier_hash_ns,
+    verifier_total_ns,
     key_count,
 };
 
@@ -89,6 +113,11 @@ struct PublicStringField {
 struct IntegerField {
     IntegerKey key{};
     std::uint64_t value{};
+};
+
+struct SensitiveHexField {
+    SensitiveHexKey key{};
+    std::string_view value;
 };
 
 class LoggerError : public std::runtime_error {
@@ -106,12 +135,13 @@ void validate_file_configuration(
 class Logger final {
   public:
     static constexpr std::size_t max_code_bytes = 64;
-    static constexpr std::size_t max_public_string_bytes = 256;
-    static constexpr std::size_t max_fields = 16;
+    static constexpr std::size_t max_public_string_bytes = 512;
+    static constexpr std::size_t max_fields = 24;
     static constexpr std::size_t max_record_bytes = 16384;
 
     explicit Logger(Severity threshold,
-                    const std::optional<std::string> &file = std::nullopt);
+                    const std::optional<std::string> &file = std::nullopt,
+                    bool allow_sensitive = false);
     ~Logger() noexcept;
 
     Logger(const Logger &) = delete;
@@ -127,7 +157,8 @@ class Logger final {
     void log(Severity severity,
              std::string_view stable_code,
              std::initializer_list<PublicStringField> strings = {},
-             std::initializer_list<IntegerField> integers = {}) noexcept;
+             std::initializer_list<IntegerField> integers = {},
+             std::initializer_list<SensitiveHexField> sensitive = {}) noexcept;
 
     [[nodiscard]] Severity threshold() const noexcept { return threshold_; }
     [[nodiscard]] bool file_backed() const noexcept { return owns_fd_; }
@@ -143,6 +174,7 @@ class Logger final {
     Severity threshold_;
     int fd_{-1};
     bool owns_fd_{};
+    bool allow_sensitive_{};
     mutable std::mutex mutex_;
     std::array<char, max_record_bytes> record_buffer_{};
     std::atomic<std::uint64_t> written_{};

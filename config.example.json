@@ -82,7 +82,10 @@
     "max_connections": 64,
     "request_rate_per_second": 20,
     "request_burst": 40,
-    "max_pending_bytes_per_connection": 2097152
+    "max_pending_bytes_per_connection": 2097152,
+    "top_shares_limit": 100,
+    "recent_high_shares_limit": 100,
+    "recent_high_share_min_difficulty": 20000000000
   },
   "defense": {
     "enabled": false,
@@ -114,6 +117,7 @@
   },
   "logging": {
     "level": "info",
-    "file": null
+    "file": null,
+    "include_private_job_entropy": false
   }
 }

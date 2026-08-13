@@ -66,9 +66,11 @@ monero_solo::ApiReadinessSnapshot ready_snapshot()
 
 monero_solo::ApiService make_service(monero_solo::ApiDataSource source,
                                      std::optional<std::string> token =
-                                         "correct-token")
+                                         "correct-token",
+                                     monero_solo::ApiConfig api = {})
 {
     monero_solo::ApiServiceOptions options;
+    options.api = std::move(api);
     options.api.enabled = false;
     options.api.access_token = std::move(token);
     options.api.max_page_size = 1000;
@@ -399,12 +401,123 @@ void test_sqlite_backed_persisted_resources()
         "received",
         "pending",
     });
-    const auto accepted = database.accept_share(
-        share,
-        1'700'000'004'500'000,
-        "1048576",
-        monero_solo::HashrateSource::verified);
+    const auto accepted = database.accept_share({
+        .share_id = share,
+        .completed_unix_us = 1'700'000'004'500'000,
+        .assigned_difficulty_dec = "1048576",
+        .source = monero_solo::HashrateSource::verified,
+        .actual_difficulty_dec = "25000000000",
+        .verifier_ticket_dec = std::nullopt,
+        .verifier_seed_id_dec = std::nullopt,
+        .verifier_queue_ns = std::nullopt,
+        .verifier_hash_ns = std::nullopt,
+        .verifier_total_ns = std::nullopt,
+    });
     require(accepted.accepted, "API fixture share did not accept");
+    monero_solo::Hash32 computed_hash{};
+    computed_hash[0] = 0xaa;
+    database.insert_share_hash(share, "computed", computed_hash, true, false);
+
+    const auto insert_fractional_share =
+        [&](const std::uint8_t public_marker,
+            const std::uint64_t request_sequence,
+            const std::string &assigned_difficulty,
+            const std::string &network_difficulty,
+            const std::string &actual_difficulty,
+            const std::int64_t received_unix_us) {
+            monero_solo::PublicId fractional_job_public{};
+            monero_solo::PublicId fractional_entropy{};
+            fractional_job_public[0] = public_marker;
+            fractional_entropy[0] = static_cast<std::uint8_t>(
+                public_marker + 16U);
+            const std::int64_t fractional_job = database.insert_private_job({
+                fractional_job_public,
+                connection,
+                template_id,
+                3736190,
+                fractional_entropy,
+                seed,
+                std::string("1"),
+                assigned_difficulty,
+                target,
+                network_difficulty,
+                39,
+                8,
+                {7, 8, public_marker},
+                {10, 11, public_marker},
+                received_unix_us - 500'000,
+                received_unix_us - 400'000,
+                1'700'000'123'000'000,
+            });
+            std::array<std::uint8_t, 4> fractional_nonce{
+                public_marker, 2, 3, 4};
+            const std::int64_t fractional_share = database.insert_share({
+                connection,
+                worker,
+                fractional_job,
+                request_sequence,
+                std::string("integer"),
+                std::to_string(request_sequence),
+                received_unix_us,
+                fractional_nonce,
+                assigned_difficulty,
+                network_difficulty,
+                false,
+                false,
+                "not_candidate",
+                "received",
+                "pending",
+            });
+            const auto result = database.accept_share({
+                .share_id = fractional_share,
+                .completed_unix_us = received_unix_us + 100'000,
+                .assigned_difficulty_dec = assigned_difficulty,
+                .source = monero_solo::HashrateSource::verified,
+                .actual_difficulty_dec = actual_difficulty,
+                .verifier_ticket_dec = std::nullopt,
+                .verifier_seed_id_dec = std::nullopt,
+                .verifier_queue_ns = std::nullopt,
+                .verifier_hash_ns = std::nullopt,
+                .verifier_total_ns = std::nullopt,
+            });
+            require(result.accepted,
+                    "fractional API fixture share did not accept");
+            require(result.round_id == accepted.round_id,
+                    "fixture shares unexpectedly crossed rounds");
+            return fractional_share;
+        };
+    const std::int64_t threshold_share = insert_fractional_share(
+        7, 2, "1", "200000000", "20000000000",
+        1'700'000'004'100'000);
+    const std::int64_t below_threshold_share = insert_fractional_share(
+        8, 3, "2", "400000000", "19999999999",
+        1'700'000'004'200'000);
+
+    monero_solo::Hash32 candidate_key{};
+    monero_solo::Hash32 miner_tx_hash{};
+    candidate_key[0] = 0xc1;
+    miner_tx_hash[0] = 0xc2;
+    const auto candidate = database.journal_candidate({
+        .candidate_key = candidate_key,
+        .first_share_id = share,
+        .job_id = job,
+        .connection_id = connection,
+        .height = 3736190,
+        .peer_family = AF_INET,
+        .peer_address = {127, 0, 0, 1},
+        .frozen_block_blob = {1, 2, 3, 4},
+        .miner_tx_hash = miner_tx_hash,
+        .expected_block_id = std::nullopt,
+        .max_attempts = 4,
+        .created_unix_us = 1'700'000'004'700'000,
+    });
+    require(candidate.inserted &&
+                database.accept_candidate(candidate.candidate_id,
+                                          1'700'000'004'800'000),
+            "API fixture round did not close");
+    const std::int64_t current_round_id = database.current_open_round_id();
+    require(current_round_id != accepted.round_id,
+            "API fixture did not open a successor round");
 
     monero_solo::ApiDataSource live;
     live.readiness = [] { return ready_snapshot(); };
@@ -434,8 +547,13 @@ void test_sqlite_backed_persisted_resources()
         }
         return std::nullopt;
     };
+    monero_solo::ApiConfig analytics_api;
+    analytics_api.top_shares_limit = 2;
+    analytics_api.recent_high_shares_limit = 1;
+    analytics_api.recent_high_share_min_difficulty = 20'000'000'000ULL;
     auto source = monero_solo::make_sqlite_api_data_source({
         {path, 5000, false},
+        analytics_api,
         monero_solo::HashrateSource::verified,
         std::move(live),
         [] { return std::int64_t{1'700'000'005'000'000}; },
@@ -447,7 +565,8 @@ void test_sqlite_backed_persisted_resources()
             };
         },
     });
-    auto service = make_service(std::move(source));
+    auto service = make_service(
+        std::move(source), "correct-token", analytics_api);
 
     const Json connections = body(service.handle(request("/v1/connections")));
     require(connections["data"].size() == 1U &&
@@ -461,7 +580,7 @@ void test_sqlite_backed_persisted_resources()
 
     const Json jobs = body(service.handle(request(
         "/v1/jobs", "include_blobs=true")));
-    require(jobs["data"].size() == 1U &&
+    require(jobs["data"].size() == 3U &&
                 jobs["data"][0]["id"] ==
                     "05000000000000000000000000000000" &&
                 jobs["data"][0]["private_entropy"] ==
@@ -470,10 +589,13 @@ void test_sqlite_backed_persisted_resources()
             "SQLite job/blob serialization is wrong");
 
     const Json shares = body(service.handle(request("/v1/shares")));
-    require(shares["data"].size() == 1U &&
+    require(shares["data"].size() == 3U &&
                 shares["data"][0]["id"] == std::to_string(share) &&
                 shares["data"][0]["status"] == "accepted" &&
                 shares["data"][0]["credited_difficulty"] == "1048576" &&
+                shares["data"][0]["actual_difficulty"] == "25000000000" &&
+                shares["data"][0]["round_id"] ==
+                    std::to_string(accepted.round_id) &&
                 shares["data"][0]["height"] == 3736190,
             "SQLite share serialization is wrong");
 
@@ -486,17 +608,94 @@ void test_sqlite_backed_persisted_resources()
     require(above_minimum["data"].empty(),
             "SQLite minimum-difficulty filter accepted a smaller value");
 
+    const Json hashes = body(service.handle(request("/v1/hashes")));
+    require(hashes["data"].size() == 1U &&
+                hashes["data"][0]["share_id"] == std::to_string(share) &&
+                hashes["data"][0]["role"] == "computed" &&
+                hashes["data"][0]["assigned_difficulty"] == "1048576" &&
+                hashes["data"][0]["actual_difficulty"] == "25000000000" &&
+                hashes["data"][0]["network_difficulty"] == "1000" &&
+                hashes["data"][0]["credited_difficulty"] == "1048576" &&
+                hashes["data"][0]["provenance"] == "verified" &&
+                hashes["data"][0]["round_id"] ==
+                    std::to_string(accepted.round_id),
+            "SQLite hash resource is not self-contained");
+
+    const Json top = body(service.handle(request("/v1/shares/top")));
+    require(top["data"].size() == 2U &&
+                top["data"][0]["id"] == std::to_string(share) &&
+                top["data"][1]["id"] == std::to_string(threshold_share) &&
+                top["selection"]["kind"] == "top_actual_difficulty" &&
+                top["selection"]["configured_limit"] == 2,
+            "global top-share ranking/order/cap is wrong");
+    const Json round_top = body(service.handle(request(
+        "/v1/shares/top", "round_id=" + std::to_string(accepted.round_id))));
+    require(round_top["data"].size() == 2U &&
+                round_top["selection"]["round_id"] ==
+                    std::to_string(accepted.round_id),
+            "per-round top-share ranking is wrong");
+    const Json empty_round_top = body(service.handle(request(
+        "/v1/shares/top", "round_id=999999")));
+    require(empty_round_top["data"].empty(),
+            "per-round top-share filter leaked another round");
+    require(service.handle(request("/v1/shares/top", "limit=3")).status == 400,
+            "top-share configured cap could be exceeded");
+    require(service.handle(request("/v1/shares/top", "cursor=x")).status == 400,
+            "top-share bounded snapshot accepted a cursor");
+
+    const Json recent_high = body(
+        service.handle(request("/v1/shares/recent-high")));
+    require(recent_high["data"].size() == 1U &&
+                recent_high["data"][0]["id"] ==
+                    std::to_string(threshold_share) &&
+                recent_high["data"][0]["actual_difficulty"] == "20000000000" &&
+                recent_high["selection"]["min_actual_difficulty"] ==
+                    "20000000000" &&
+                recent_high["selection"]["configured_limit"] == 1 &&
+                recent_high["data"][0]["id"] !=
+                    std::to_string(below_threshold_share),
+            "recent high-share threshold/order/cap is wrong");
+
     const Json share_detail = body(service.handle(
         request("/v1/shares/" + std::to_string(share))));
     require(share_detail["data"]["share"]["status"] == "accepted" &&
-                share_detail["data"]["submission_url"].is_null(),
+                share_detail["data"]["submission_url"] ==
+                    "/v1/submissions/" +
+                        std::to_string(candidate.candidate_id),
             "SQLite share detail is wrong");
 
-    const Json rounds = body(service.handle(request("/v1/rounds/current")));
-    require(rounds["data"]["state"] == "open" &&
-                rounds["data"]["accepted_share_count"] == "1" &&
-                rounds["data"]["credited_difficulty"] == "1048576",
-            "SQLite current-round serialization is wrong");
+    const Json round_history = body(service.handle(request("/v1/rounds")));
+    require(round_history["data"].size() == 2U &&
+                round_history["data"][0]["id"] ==
+                    std::to_string(accepted.round_id) &&
+                round_history["data"][0]["state"] == "closed" &&
+                round_history["data"][0]["accepted_share_count"] == "3" &&
+                round_history["data"][0]["credited_difficulty"] == "1048579" &&
+                round_history["data"][0]["estimated_hashes"] == "1048579" &&
+                round_history["data"][0]["effort_finalized_at"].is_string() &&
+                round_history["data"][0]["effort"]["value"] ==
+                    "104857.600001" &&
+                round_history["data"][0]["effort"]["finalized"] == true &&
+                round_history["data"][0]["effort"]["segments"].size() == 3U &&
+                round_history["data"][0]["effort"]["segments"][1]
+                             ["effort_percent"] ==
+                    "0.000000" &&
+                round_history["data"][0]["effort"]["segments"][2]
+                             ["effort_percent"] ==
+                    "0.000000",
+            "SQLite historical round effort/finalization is wrong");
+
+    const Json current_round = body(
+        service.handle(request("/v1/rounds/current")));
+    require(current_round["data"]["id"] == std::to_string(current_round_id) &&
+                current_round["data"]["state"] == "open" &&
+                current_round["data"]["accepted_share_count"] == "0" &&
+                current_round["data"]["estimated_hashes"] == "0" &&
+                current_round["data"]["effort_finalized_at"].is_null() &&
+                current_round["data"]["effort"]["value"] == "0.000000" &&
+                current_round["data"]["effort"]["finalized"] == false &&
+                current_round["data"]["effort"]["segments"].empty(),
+            "SQLite current-round statistics are wrong");
 
     const Json events = body(service.handle(request("/v1/events")));
     require(events["data"].size() >= 3U &&
@@ -512,18 +711,24 @@ void test_sqlite_backed_persisted_resources()
                 summary["data"]["connections"]["active"] == 1 &&
                 summary["data"]["connections"]["total"] == "1" &&
                 summary["data"]["workers"]["active"] == 1 &&
-                summary["data"]["shares"]["accepted"] == "1" &&
-                summary["data"]["shares"]["total"] == "1" &&
-                summary["data"]["candidates"]["total"] == "0" &&
+                summary["data"]["shares"]["accepted"] == "3" &&
+                summary["data"]["shares"]["total"] == "3" &&
+                summary["data"]["candidates"]["accepted"] == "1" &&
+                summary["data"]["candidates"]["total"] == "1" &&
                 summary["data"]["round"]["state"] == "open" &&
+                summary["data"]["round"]["estimated_hashes"] == "0" &&
+                summary["data"]["round"]["accepted_share_count"] == "0" &&
+                summary["data"]["round"]["effort"]["value"] ==
+                    "0.000000" &&
                 summary["data"]["daemon"]["rpc"] == "healthy" &&
-                summary["data"]["hashrate"]["source"] == "verified",
+                summary["data"]["hashrate"]["source"] == "verified" &&
+                summary["data"]["hashrate"]["1m"] == "17476",
             "SQLite summary aggregation/merge is wrong");
 
     const auto persistence_response = service.handle(request("/v1/persistence"));
     const Json persistence = body(persistence_response);
     require(persistence_response.status == 200 &&
-                persistence["data"]["schema_version"] == 1 &&
+                persistence["data"]["schema_version"] == 2 &&
                 persistence["data"]["journal_mode"] == "wal" &&
                 persistence["data"]["synchronous"] == "full" &&
                 persistence["data"]["foreign_keys"] == true &&

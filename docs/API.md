@@ -18,8 +18,9 @@ POST/PUT/PATCH/DELETE return JSON `405` with `Allow: GET`.
 - Binary IDs/hashes/targets/blobs are lowercase hex without `0x`.
 - Null is used for an unavailable nullable value. A missing detail is 404, not
   `data: null`.
-- Collection order is increasing database ID. Default `limit` is 100 and the
-  maximum is `api.max_page_size`.
+- Ordinary collection order is increasing database ID. Default `limit` is 100
+  and the maximum is `api.max_page_size`. Ranked share snapshots use their
+  configured limit and deliberately do not accept cursors.
 - Query names/values are percent decoded. Duplicate, empty, unknown, invalid,
   or oversized parameters return `400 invalid_query`.
 
@@ -89,8 +90,9 @@ address, never a CIDR. Comma enum lists contain unique values with no spaces.
 
 ## Endpoint matrix
 
-All collection routes accept `limit` and `cursor` in addition to the listed
-filters.
+All ordinary collection routes accept `limit` and `cursor` in addition to the
+listed filters. The two ranked share routes accept `limit` only, bounded by
+their respective configured cap.
 
 | Route | Filters | Result |
 | --- | --- | --- |
@@ -107,6 +109,8 @@ filters.
 | `GET /v1/templates` | `height`, times, `include_blobs` | Public templates |
 | `GET /v1/jobs` | `connection_id`, `template_id`, `height`, `active`, times, `include_blobs` | Private jobs |
 | `GET /v1/shares` | `status`, `connection_id`, `worker_id`, `job_id`, `candidate_id`, `height`, `min_difficulty`, times | Share resources |
+| `GET /v1/shares/top` | optional `round_id` | Accepted shares ranked by exact actual difficulty, globally or for one round; bounded snapshot |
+| `GET /v1/shares/recent-high` | none | Newest accepted shares whose actual difficulty meets the configured threshold, independent of round; bounded snapshot |
 | `GET /v1/shares/{decimal}` | none | `{share, submission_url}` |
 | `GET /v1/hashes` | `role`, `share_status`, `connection_id`, `worker_id`, `job_id`, times | Claimed/computed hash resources |
 | `GET /v1/submissions` | `state`, `connection_id`, `job_id`, `height`, `peer`, times | Candidate submissions |
@@ -134,12 +138,12 @@ blob fields.
 | worker | `id`, `login`, `rigid`, `first_seen_at`, `last_seen_at`, `active_connections`, `accepted_shares`, `rejected_shares`, `hashrate` |
 | template | `id`, `session_id`, `generation`, `height`, `prev_hash`, `seed_hash`, `next_seed_hash`, `difficulty`, `wide_difficulty_hex`, `reserved_offset`, `reserve_size`, `fetched_at`, `fetch_reason`; sensitive view adds `blocktemplate_blob`, `blockhashing_blob` |
 | job | `id` 32-hex, `connection_id` 32-hex, `template_id`, `height`, `seed_hash`, `verifier_seed_id`, `assigned_difficulty`, `target64_le`, `network_difficulty`, nonce/reserved offsets and sizes, `created_at`, `queued_at`, `expires_at`, `retired_at`; sensitive view adds `private_entropy`, `private_block_blob`, `hashing_blob` |
-| share | `id`, `connection_id`, `worker_id`, `job_id`, `request_sequence`, `miner_request_id_type`, `miner_request_id`, receive/complete times, `nonce`, `height`, assigned/actual/network difficulties, `height_is_older`, `claimed_candidate`, `candidate_admission`, `status`, error code/message, `provenance`, `credited_difficulty`, verifier ticket/seed/timings, claimed/computed hashes and target booleans, `candidate_id` |
-| hash | `share_id`, `role`, `hash`, share/network target booleans, `received_at`, `share_status`, `connection_id`, `worker_id`, `job_id` |
+| share | `id`, `connection_id`, `worker_id`, `job_id`, `request_sequence`, `miner_request_id_type`, `miner_request_id`, receive/complete times, `nonce`, `height`, assigned/actual/network difficulties, `height_is_older`, `claimed_candidate`, `candidate_admission`, `status`, error code/message, `provenance`, `credited_difficulty`, verifier ticket/seed/timings, claimed/computed hashes and target booleans, `candidate_id`, `round_id` |
+| hash | `share_id`, `role`, `hash`, share/network target booleans, `received_at`, `share_status`, `connection_id`, `worker_id`, `job_id`, assigned/actual/network/credited difficulties, `provenance`, `round_id` |
 | submission | `id`, `candidate_key`, `first_share_id`, `job_id`, `connection_id`, `height`, `peer`, `miner_tx_hash`, expected/canonical block IDs, `state`, attempt/max/indeterminate/reconciliation fields, create/update/accept times, `terminal_reason`; sensitive detail adds `frozen_block_blob` |
 | attempt | `id`, `candidate_id`, `attempt_number`, `rpc_request_id`, start/complete times, `classification`, HTTP/error/status/block-ID/excerpt nullable observations |
 | reconciliation | `id`, `candidate_id`, `cycle_number`, `lookup_kind`, `rpc_request_id`, requested/observed IDs, observed height/miner-tx/orphan, start/complete times, `classification`, excerpt |
-| round | `id`, open/close times, `state`, accepted candidate/height, miner transaction hash, block ID, `credited_difficulty`, `accepted_share_count` |
+| round | `id`, open/close times, `state`, accepted candidate/height, miner transaction hash, block ID, `credited_difficulty`, `estimated_hashes`, `accepted_share_count`, `effort_finalized_at`, `effort` |
 | ban | `id`, `peer`, create/expiry/evidence-window times, `reason`, `active`, ordered `abuse_event_ids` |
 | event | `id`, `session_id`, `created_at`, `type`, nullable linked connection/worker/template/job/share/candidate/round IDs, `payload` |
 
@@ -169,11 +173,29 @@ over `(now-window, now]`. Only accepted shares contribute. The nominal
 denominator is used even when uptime is shorter. Sources are never silently
 mixed.
 
+`estimated_hashes` is the exact sum of credited assigned difficulty, not a
+count of hashes observed directly. Round `effort.value` is
+`floor(100 * sum(segment_estimated_hashes / segment_network_difficulty), 6)`.
+The sum is performed as exact rational arithmetic and is floored only once,
+after all network-difficulty/source segments are combined. Each segment also
+reports its own `network_difficulty`, `estimated_hashes`, accepted share count,
+source, and individually floored percentage. Closed-round effort is immutable
+when `effort.finalized` is true; `effort_finalized_at` records that boundary.
+
+The top-share response includes a `selection` object identifying global versus
+per-round scope and its configured cap. The recent-high response identifies
+its configured actual-difficulty threshold and cap. Both operate only on
+accepted shares with persisted actual difficulty.
+
 The persistence response reports a live, exact snapshot of admitted writer
 queue items, their fixed 512-byte envelopes, and the subset in the priority
 FIFO. Commands blocked outside admission by the item/byte bounds are not queue
 items. `last_writer_error_*` are null; `last_commit_at` is the latest persistent
 event time.
+
+This release reads persistence schema 2 only. It intentionally performs no
+migration or statistical backfill; start it with a freshly initialized
+database when replacing a schema-1 test installation.
 
 ## Summary and readiness examples
 
@@ -214,7 +236,14 @@ event time.
     },
     "round": {
       "id": "1", "state": "open",
-      "opened_at": "2026-08-12T05:00:00.000000Z"
+      "opened_at": "2026-08-12T05:00:00.000000Z",
+      "estimated_hashes": "0", "accepted_share_count": "0",
+      "effort": {
+        "unit": "percent", "value": "0.000000",
+        "precision": "0.000001", "rounding": "down",
+        "basis": "credited_assigned_difficulty/network_difficulty",
+        "finalized": false, "segments": []
+      }
     },
     "hashrate": {
       "unit": "H/s", "source": "verified", "1m": "0", "5m": "0",

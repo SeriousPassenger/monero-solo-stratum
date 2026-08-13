@@ -308,6 +308,57 @@ std::uint64_t log_id(const std::int64_t value) noexcept {
     return value > 0 ? static_cast<std::uint64_t>(value) : 0U;
 }
 
+std::string log_public_text(std::string_view value)
+{
+    if (value.empty()) return "unknown";
+    std::string result;
+    result.reserve(std::min<std::size_t>(
+        value.size(), logging::Logger::max_public_string_bytes));
+    for (const char raw : value) {
+        if (result.size() == logging::Logger::max_public_string_bytes) break;
+        const auto byte = static_cast<unsigned char>(raw);
+        result.push_back(byte >= 0x20U && byte <= 0x7eU
+                             ? static_cast<char>(byte)
+                             : '?');
+    }
+    return result.empty() ? "unknown" : result;
+}
+
+std::string_view log_agent_profile(const std::string_view agent) noexcept
+{
+    constexpr std::string_view marker = "nicehash";
+    if (agent.size() < marker.size()) return "standard";
+    for (std::size_t offset = 0; offset + marker.size() <= agent.size(); ++offset) {
+        bool match = true;
+        for (std::size_t index = 0; index < marker.size(); ++index) {
+            const auto raw = static_cast<unsigned char>(agent[offset + index]);
+            const char lower = raw >= static_cast<unsigned char>('A') &&
+                                       raw <= static_cast<unsigned char>('Z')
+                                   ? static_cast<char>(raw - 'A' + 'a')
+                                   : static_cast<char>(raw);
+            if (lower != marker[index]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return "nicehash";
+    }
+    return "standard";
+}
+
+template <typename Function>
+void try_debug_log(logging::Logger &logger, Function &&write) noexcept
+{
+    if (!logger.enabled(logging::Severity::debug)) return;
+    try {
+        std::forward<Function>(write)();
+    }
+    catch (...) {
+        // Diagnostics are observational. Allocation/encoding failures must
+        // never alter a connection, share, or durability outcome.
+    }
+}
+
 class CandidateReconciliationGuard final {
 public:
     CandidateReconciliationGuard(
@@ -382,6 +433,7 @@ struct Runtime::TemplateContext {
     Hash32 seed_hash{};
     std::optional<Hash32> next_seed_hash;
     std::string network_difficulty;
+    std::string fetch_reason;
     std::optional<std::string> wide_difficulty_hex;
     mspv_seed_id seed_id{};
 };
@@ -655,7 +707,8 @@ private:
 Runtime::Runtime(Config config)
     : config_(resolve_runtime_workers(std::move(config))),
       logger_(logging::parse_severity(config_.logging.level),
-              config_.logging.file),
+              config_.logging.file,
+              config_.logging.include_private_job_entropy),
       database_({config_.database.path,
                  static_cast<std::uint32_t>(config_.database.busy_timeout_ms),
                  config_.blocknotify.has_value() && !config_.blocknotify->empty(),
@@ -759,6 +812,70 @@ void Runtime::validate_daemon_network() {
         throw ValidationError("daemon network is " + observed +
                               ", configured network requires " + expected);
     }
+}
+
+bool Runtime::candidate_height_allowed_unlocked(
+    const std::uint64_t height) const noexcept
+{
+    if (accepted_candidate_height_fence_.has_value() &&
+        height <= *accepted_candidate_height_fence_) {
+        return false;
+    }
+    return std::none_of(
+        unresolved_candidate_heights_.begin(),
+        unresolved_candidate_heights_.end(),
+        [height](const auto &candidate) { return height > candidate.second; });
+}
+
+void Runtime::register_candidate_boundary_unlocked(
+    const std::int64_t candidate_id, const std::uint64_t height)
+{
+    if (candidate_id <= 0 || height == 0U) {
+        throw ValidationError("candidate publication boundary is invalid");
+    }
+    unresolved_candidate_heights_.insert_or_assign(candidate_id, height);
+    if (current_height_.load(std::memory_order_acquire) > height) {
+        std::unique_lock issuance_lock(job_issuance_mutex_);
+        job_issuance_allowed_.store(false, std::memory_order_release);
+        update_readiness();
+    }
+}
+
+void Runtime::activate_accepted_candidate_fence_unlocked(
+    const std::uint64_t height)
+{
+    if (height == 0U) {
+        throw ValidationError("accepted candidate height is invalid");
+    }
+    if (current_height_.load(std::memory_order_acquire) > height) {
+        return;
+    }
+    if (!accepted_candidate_height_fence_.has_value() ||
+        height > *accepted_candidate_height_fence_) {
+        accepted_candidate_height_fence_ = height;
+    }
+    std::unique_lock issuance_lock(job_issuance_mutex_);
+    job_issuance_allowed_.store(false, std::memory_order_release);
+    update_readiness();
+}
+
+void Runtime::release_candidate_boundary_unlocked(
+    const std::int64_t candidate_id) noexcept
+{
+    unresolved_candidate_heights_.erase(candidate_id);
+}
+
+void Runtime::release_candidate_boundary(
+    const std::int64_t candidate_id) noexcept
+{
+    {
+        std::lock_guard lock(candidate_boundary_mutex_);
+        release_candidate_boundary_unlocked(candidate_id);
+    }
+    // A ZMQ notification may have been consumed while the daemon's newer
+    // template was deliberately withheld. Force an immediate authoritative
+    // refresh after every durable terminal candidate transition.
+    template_refresh_requested_.store(true, std::memory_order_release);
 }
 
 std::shared_ptr<Runtime::TemplateContext> Runtime::parse_template(
@@ -897,6 +1014,7 @@ std::shared_ptr<Runtime::TemplateContext> Runtime::parse_template(
     }
     const std::int64_t fetched = unix_time_us();
     std::int64_t template_id = 0;
+    const std::string persisted_reason = reason;
     try {
         template_id = database_.insert_public_template({
             .session_id = session_id_,
@@ -930,14 +1048,33 @@ std::shared_ptr<Runtime::TemplateContext> Runtime::parse_template(
     context->seed_hash = seed;
     context->next_seed_hash = next_seed;
     context->network_difficulty = std::move(difficulty);
+    context->fetch_reason = persisted_reason;
     context->wide_difficulty_hex = std::move(wide_hex);
     context->seed_id = seed_id;
     return context;
 }
 
-void Runtime::refresh_template(std::string reason) {
+bool Runtime::refresh_template(std::string reason) {
     const RpcObservation observation = daemon_.get_block_template(config_.wallet_address);
+    const std::uint64_t observed_height = positive_u64(
+        rpc_result(observation), "height");
+    std::unique_lock boundary_lock(candidate_boundary_mutex_);
+    if (!candidate_height_allowed_unlocked(observed_height)) {
+        logger_.log(logging::Severity::debug,
+                    "template.publication_held",
+                    {{logging::PublicStringKey::reason_code,
+                      "candidate_unresolved"},
+                     {logging::PublicStringKey::fetch_reason, reason}},
+                    {{logging::IntegerKey::height, observed_height},
+                     {logging::IntegerKey::count,
+                      static_cast<std::uint64_t>(
+                          unresolved_candidate_heights_.size())}});
+        return false;
+    }
     auto next = parse_template(observation, std::move(reason));
+    if (next->height != observed_height) {
+        throw ValidationError("template height changed while parsing");
+    }
     mspv_seed_id old_seed = 0;
     {
         std::lock_guard lock(state_mutex_);
@@ -946,6 +1083,13 @@ void Runtime::refresh_template(std::string reason) {
         current_template_ = next;
         current_height_.store(next->height, std::memory_order_release);
         last_error_.reset();
+    }
+    if (accepted_candidate_height_fence_.has_value()) {
+        if (next->height <= *accepted_candidate_height_fence_) {
+            throw ValidationError(
+                "accepted candidate fence admitted an obsolete template");
+        }
+        accepted_candidate_height_fence_.reset();
     }
     {
         std::unique_lock issuance_lock(job_issuance_mutex_);
@@ -957,7 +1101,13 @@ void Runtime::refresh_template(std::string reason) {
     if (stratum_) stratum_->refresh_jobs();
     emit("template_refresh", {{"height", next->height},
                                {"generation", std::to_string(next->generation)}});
-    logger_.log(logging::Severity::info, "template.refreshed", {},
+    logger_.log(logging::Severity::info, "template.refreshed",
+                {{logging::PublicStringKey::fetch_reason,
+                  next->fetch_reason},
+                 {logging::PublicStringKey::seed_hash,
+                  hex_encode(next->seed_hash)},
+                 {logging::PublicStringKey::network_difficulty,
+                  next->network_difficulty}},
                 {{logging::IntegerKey::template_id,
                   log_id(next->database_id)},
                  {logging::IntegerKey::height, next->height},
@@ -966,6 +1116,7 @@ void Runtime::refresh_template(std::string reason) {
                   static_cast<std::uint64_t>(next->seed_id)}});
     template_operational_.store(true, std::memory_order_release);
     update_readiness();
+    return true;
 }
 
 std::optional<StratumJob> Runtime::make_job(const MinerConnection &connection) {
@@ -1100,10 +1251,114 @@ std::optional<StratumJob> Runtime::make_job(const MinerConnection &connection) {
                 job.seed_hash = hex_encode(snapshot->seed_hash);
                 job.height = snapshot->height;
                 job.network_difficulty = context->network_difficulty;
-                job.on_queued = [this, database_id] {
+                bool debug_logging =
+                    logger_.enabled(logging::Severity::debug);
+                std::string connection_public_id;
+                std::string agent_profile;
+                std::string seed_hash;
+                std::string assigned_difficulty;
+                std::string network_difficulty;
+                std::string private_entropy;
+                if (debug_logging) {
+                    try {
+                        connection_public_id = connection.public_id;
+                        agent_profile = log_agent_profile(connection.agent);
+                        seed_hash = job.seed_hash;
+                        assigned_difficulty =
+                            std::to_string(connection.assigned_difficulty);
+                        network_difficulty = context->network_difficulty;
+                        if (config_.logging.include_private_job_entropy) {
+                            private_entropy = hex_encode(entropy);
+                        }
+                    }
+                    catch (...) {
+                        // Job delivery and its durable state must not depend on
+                        // allocating optional diagnostic copies.
+                        debug_logging = false;
+                        connection_public_id.clear();
+                        agent_profile.clear();
+                        seed_hash.clear();
+                        assigned_difficulty.clear();
+                        network_difficulty.clear();
+                        private_entropy.clear();
+                    }
+                }
+                const std::int64_t template_database_id =
+                    snapshot->database_id;
+                const std::uint64_t job_height = snapshot->height;
+                const std::uint64_t generation = snapshot->generation;
+                const std::uint64_t seed_id =
+                    static_cast<std::uint64_t>(snapshot->seed_id);
+                job.on_queued =
+                    [this, database_id, connection_id, template_database_id,
+                     job_height, generation, seed_id, connection_public_id,
+                     encoded_id, agent_profile, seed_hash, assigned_difficulty,
+                     network_difficulty, private_entropy, debug_logging](
+                        const std::string_view wire_target,
+                        const std::string_view target_encoding) {
                     try {
                         database_.mark_job_queued(database_id, unix_time_us());
                         emit("job_sent", {}, std::nullopt, database_id);
+                        if (!debug_logging) return;
+                        // Logger's closed typed API uses initializer_lists;
+                        // keep the two bounded forms explicit so entropy never
+                        // reaches the public-field path accidentally.
+                        if (config_.logging.include_private_job_entropy) {
+                            logger_.log(
+                                logging::Severity::debug, "job.queued",
+                                {{logging::PublicStringKey::connection_public_id,
+                                  connection_public_id},
+                                 {logging::PublicStringKey::job_public_id,
+                                  encoded_id},
+                                 {logging::PublicStringKey::agent_profile,
+                                  agent_profile},
+                                 {logging::PublicStringKey::seed_hash, seed_hash},
+                                 {logging::PublicStringKey::target, wire_target},
+                                 {logging::PublicStringKey::target_encoding,
+                                  target_encoding},
+                                 {logging::PublicStringKey::assigned_difficulty,
+                                  assigned_difficulty},
+                                 {logging::PublicStringKey::network_difficulty,
+                                  network_difficulty}},
+                                {{logging::IntegerKey::connection_id,
+                                  log_id(connection_id)},
+                                 {logging::IntegerKey::job_id,
+                                  log_id(database_id)},
+                                 {logging::IntegerKey::template_id,
+                                  log_id(template_database_id)},
+                                 {logging::IntegerKey::height, job_height},
+                                 {logging::IntegerKey::generation, generation},
+                                 {logging::IntegerKey::seed_id, seed_id}},
+                                {{logging::SensitiveHexKey::private_job_entropy,
+                                  private_entropy}});
+                        }
+                        else {
+                            logger_.log(
+                                logging::Severity::debug, "job.queued",
+                                {{logging::PublicStringKey::connection_public_id,
+                                  connection_public_id},
+                                 {logging::PublicStringKey::job_public_id,
+                                  encoded_id},
+                                 {logging::PublicStringKey::agent_profile,
+                                  agent_profile},
+                                 {logging::PublicStringKey::seed_hash, seed_hash},
+                                 {logging::PublicStringKey::target, wire_target},
+                                 {logging::PublicStringKey::target_encoding,
+                                  target_encoding},
+                                 {logging::PublicStringKey::assigned_difficulty,
+                                  assigned_difficulty},
+                                 {logging::PublicStringKey::network_difficulty,
+                                  network_difficulty}},
+                                {{logging::IntegerKey::connection_id,
+                                  log_id(connection_id)},
+                                 {logging::IntegerKey::job_id,
+                                  log_id(database_id)},
+                                 {logging::IntegerKey::template_id,
+                                  log_id(template_database_id)},
+                                 {logging::IntegerKey::height, job_height},
+                                 {logging::IntegerKey::generation, generation},
+                                 {logging::IntegerKey::seed_id, seed_id}});
+                        }
                     }
                     catch (...) { mark_database_unavailable(); throw; }
                 };
@@ -1349,10 +1604,24 @@ void Runtime::observe_connection(const MinerConnection &connection,
                 .agent = "",
                 .opened_unix_us = now,
             });
-            std::lock_guard lock(state_mutex_);
-            disconnected_connections_.erase(connection.public_id);
-            connection_ids_[connection.public_id] = id;
+            {
+                std::lock_guard lock(state_mutex_);
+                disconnected_connections_.erase(connection.public_id);
+                connection_ids_[connection.public_id] = id;
+            }
             emit("connection_opened", {}, id);
+            try_debug_log(logger_, [&] {
+                logger_.log(
+                    logging::Severity::debug, "connection.opened",
+                    {{logging::PublicStringKey::session_id,
+                      hex_encode(session_public_id_)},
+                     {logging::PublicStringKey::connection_public_id,
+                      connection.public_id},
+                     {logging::PublicStringKey::peer, connection.peer.text()},
+                     {logging::PublicStringKey::listener,
+                      log_public_text(connection.listen_address)}},
+                    {{logging::IntegerKey::connection_id, log_id(id)}});
+            });
             return;
         }
         if (event == "submit_queued") {
@@ -1414,20 +1683,49 @@ void Runtime::observe_connection(const MinerConnection &connection,
             database_.authenticate_connection(connection_id, worker_id,
                                                connection.agent, now);
             emit("login_succeeded", {}, connection_id);
-            std::lock_guard lock(state_mutex_);
-            worker_ids_[connection.public_id] = worker_id;
-            if (const auto history = connection_jobs_.find(connection.public_id);
-                history != connection_jobs_.end()) {
-                for (const auto &job_id : history->second) {
-                    if (const auto job = jobs_.find(job_id); job != jobs_.end()) {
-                        job->second->worker_database_id = worker_id;
+            {
+                std::lock_guard lock(state_mutex_);
+                worker_ids_[connection.public_id] = worker_id;
+                if (const auto history = connection_jobs_.find(connection.public_id);
+                    history != connection_jobs_.end()) {
+                    for (const auto &job_id : history->second) {
+                        if (const auto job = jobs_.find(job_id); job != jobs_.end()) {
+                            job->second->worker_database_id = worker_id;
+                        }
                     }
                 }
             }
+            try_debug_log(logger_, [&] {
+                logger_.log(
+                    logging::Severity::debug, "connection.authenticated",
+                    {{logging::PublicStringKey::session_id,
+                      hex_encode(session_public_id_)},
+                     {logging::PublicStringKey::connection_public_id,
+                      connection.public_id},
+                     {logging::PublicStringKey::agent_profile,
+                      log_agent_profile(connection.agent)},
+                     {logging::PublicStringKey::assigned_difficulty,
+                      std::to_string(connection.assigned_difficulty)}},
+                    {{logging::IntegerKey::connection_id,
+                      log_id(connection_id)},
+                     {logging::IntegerKey::worker_id, log_id(worker_id)}});
+            });
             return;
         }
         (void)database_.close_connection(connection_id, now, event);
         emit("connection_closed", {{"reason", event}}, connection_id);
+        try_debug_log(logger_, [&] {
+            logger_.log(
+                logging::Severity::debug, "connection.closed",
+                {{logging::PublicStringKey::session_id,
+                  hex_encode(session_public_id_)},
+                 {logging::PublicStringKey::connection_public_id,
+                  connection.public_id},
+                 {logging::PublicStringKey::reason_code,
+                  log_public_text(event)}},
+                {{logging::IntegerKey::connection_id,
+                  log_id(connection_id)}});
+        });
         std::deque<std::string> retired;
         {
             std::lock_guard lock(state_mutex_);
@@ -1472,8 +1770,22 @@ CandidateJournalResult Runtime::journal_candidate(
     bool claimed_path, bool bypass_admission,
     std::optional<bool> *admission_acquired) {
     const Hash32 key = make_candidate_key(frozen.blob);
+    std::unique_lock boundary_lock(candidate_boundary_mutex_);
     if (const auto existing = database_.find_candidate_by_key(key); existing.has_value()) {
         database_.attach_share_to_candidate(share_id, existing->candidate_id, "existing");
+        if (existing->state == CandidateState::journaled ||
+            existing->state == CandidateState::dispatching ||
+            existing->state == CandidateState::retry_wait ||
+            existing->state == CandidateState::ambiguous) {
+            try {
+                register_candidate_boundary_unlocked(existing->candidate_id,
+                                                     job->height);
+            }
+            catch (...) {
+                mark_database_unavailable();
+                throw;
+            }
+        }
         logger_.log(
             logging::Severity::debug, "candidate.journal_reused",
             {{logging::PublicStringKey::candidate_key, hex_encode(key)},
@@ -1533,6 +1845,19 @@ CandidateJournalResult Runtime::journal_candidate(
             .max_attempts = static_cast<std::uint32_t>(config_.daemon.submit_attempts),
             .created_unix_us = task.created_unix_us,
         });
+    if (result.state == CandidateState::journaled ||
+        result.state == CandidateState::dispatching ||
+        result.state == CandidateState::retry_wait ||
+        result.state == CandidateState::ambiguous) {
+        try {
+            register_candidate_boundary_unlocked(result.candidate_id,
+                                                 job->height);
+        }
+        catch (...) {
+            mark_database_unavailable();
+            throw;
+        }
+    }
     if (!result.inserted) acquired = false;
     logger_.log(
         result.inserted ? logging::Severity::info : logging::Severity::debug,
@@ -1611,9 +1936,29 @@ ShareResponse Runtime::process_share(const StratumSubmission &submission) {
                 .status = "received",
                 .provenance = "pending",
             });
+            try_debug_log(logger_, [&] {
+                logger_.log(
+                    logging::Severity::debug, "share.received",
+                    {{logging::PublicStringKey::session_id,
+                      hex_encode(session_public_id_)},
+                     {logging::PublicStringKey::connection_public_id,
+                      submission.connection.public_id},
+                     {logging::PublicStringKey::job_public_id,
+                      submission.job_id},
+                     {logging::PublicStringKey::nonce,
+                      hex_encode(submission.nonce)},
+                     {logging::PublicStringKey::claimed_hash,
+                      submission.claimed_hash_hex}},
+                    {{logging::IntegerKey::connection_id,
+                      log_id(connection_id)},
+                     {logging::IntegerKey::share_id, log_id(share_id)},
+                     {logging::IntegerKey::sequence,
+                      submission.request_sequence}});
+            });
+            const std::int64_t completed = unix_time_us();
             (void)database_.finalize_share(share_id, {
                 .status = "unknown_job", .provenance = "pending",
-                .completed_unix_us = unix_time_us(),
+                .completed_unix_us = completed,
                 .actual_difficulty_dec = std::nullopt,
                 .error_code = "unknown_job", .error_message = "Unknown job",
                 .verifier_ticket_dec = std::nullopt,
@@ -1621,6 +1966,31 @@ ShareResponse Runtime::process_share(const StratumSubmission &submission) {
                 .verifier_queue_ns = std::nullopt,
                 .verifier_hash_ns = std::nullopt,
                 .verifier_total_ns = std::nullopt});
+            try_debug_log(logger_, [&] {
+                logger_.log(
+                    logging::Severity::debug, "share.completed",
+                    {{logging::PublicStringKey::session_id,
+                      hex_encode(session_public_id_)},
+                     {logging::PublicStringKey::connection_public_id,
+                      submission.connection.public_id},
+                     {logging::PublicStringKey::job_public_id,
+                      submission.job_id},
+                     {logging::PublicStringKey::status, "unknown_job"},
+                     {logging::PublicStringKey::provenance, "pending"},
+                     {logging::PublicStringKey::reason_code, "unknown_job"},
+                     {logging::PublicStringKey::credited_difficulty, "0"},
+                     {logging::PublicStringKey::claimed_hash,
+                      submission.claimed_hash_hex}},
+                    {{logging::IntegerKey::connection_id,
+                      log_id(connection_id)},
+                     {logging::IntegerKey::share_id, log_id(share_id)},
+                     {logging::IntegerKey::duration_us,
+                      completed > received
+                          ? static_cast<std::uint64_t>(completed - received)
+                          : 0U},
+                     {logging::IntegerKey::sequence,
+                      submission.request_sequence}});
+            });
         }
         catch (...) { mark_database_unavailable(); }
         return {ShareDisposition::unknown_job, "unknown_job"};
@@ -1633,30 +2003,63 @@ ShareResponse Runtime::process_share(const StratumSubmission &submission) {
     const bool claimed_network_target = meets_network_target(
         submission.claimed_hash, job->network_difficulty);
 
-    const auto share_id = database_.insert_share({
-        .connection_id = connection_id,
-        .worker_id = worker_id,
-        .job_id = job->database_id,
-        .request_sequence = submission.request_sequence,
-        .miner_request_id_type = request_type,
-        .miner_request_id_text = request_text,
-        .received_unix_us = received,
-        .nonce = submission.nonce,
-        .assigned_difficulty_dec = std::to_string(job->assigned_difficulty),
-        .network_difficulty_dec = job->network_difficulty,
-        .height_is_older = height_is_older_at_admission,
-        .claimed_candidate = claimed_network_target,
-        .candidate_admission = "not_candidate",
-        .status = "received",
-        .provenance = verifier_ ? "pending" : "claimed",
+    std::int64_t share_id = 0;
+    {
+        std::lock_guard boundary_lock(candidate_boundary_mutex_);
+        if (!candidate_height_allowed_unlocked(job->height)) {
+            return {ShareDisposition::stale, "candidate_boundary"};
+        }
+        share_id = database_.insert_share({
+            .connection_id = connection_id,
+            .worker_id = worker_id,
+            .job_id = job->database_id,
+            .request_sequence = submission.request_sequence,
+            .miner_request_id_type = request_type,
+            .miner_request_id_text = request_text,
+            .received_unix_us = received,
+            .nonce = submission.nonce,
+            .assigned_difficulty_dec = std::to_string(job->assigned_difficulty),
+            .network_difficulty_dec = job->network_difficulty,
+            .height_is_older = height_is_older_at_admission,
+            .claimed_candidate = claimed_network_target,
+            .candidate_admission = "not_candidate",
+            .status = "received",
+            .provenance = verifier_ ? "pending" : "claimed",
+        });
+    }
+    try_debug_log(logger_, [&] {
+        logger_.log(
+            logging::Severity::debug, "share.received",
+            {{logging::PublicStringKey::session_id,
+              hex_encode(session_public_id_)},
+             {logging::PublicStringKey::connection_public_id,
+              submission.connection.public_id},
+             {logging::PublicStringKey::job_public_id,
+              submission.job_id},
+             {logging::PublicStringKey::nonce,
+              hex_encode(submission.nonce)},
+             {logging::PublicStringKey::claimed_hash,
+              submission.claimed_hash_hex},
+             {logging::PublicStringKey::assigned_difficulty,
+              std::to_string(job->assigned_difficulty)},
+             {logging::PublicStringKey::network_difficulty,
+              job->network_difficulty}},
+            {{logging::IntegerKey::connection_id, log_id(connection_id)},
+             {logging::IntegerKey::job_id, log_id(job->database_id)},
+             {logging::IntegerKey::template_id,
+              log_id(job->template_database_id)},
+             {logging::IntegerKey::share_id, log_id(share_id)},
+             {logging::IntegerKey::height, job->height},
+             {logging::IntegerKey::sequence,
+              submission.request_sequence}});
     });
     auto finalize = [&](std::string status, std::string provenance,
                         ShareDisposition disposition, std::string code,
                         std::optional<std::string> actual = std::nullopt,
                         const verifier::Completion *completion = nullptr) {
         ShareFinalization value;
-        value.status = std::move(status);
-        value.provenance = std::move(provenance);
+        value.status = status;
+        value.provenance = provenance;
         value.completed_unix_us = unix_time_us();
         value.actual_difficulty_dec = std::move(actual);
         value.error_code = code;
@@ -1669,6 +2072,104 @@ ShareResponse Runtime::process_share(const StratumSubmission &submission) {
             value.verifier_total_ns = completion->total_ns;
         }
         (void)database_.finalize_share(share_id, value);
+        const std::uint64_t duration = value.completed_unix_us > received
+            ? static_cast<std::uint64_t>(value.completed_unix_us - received)
+            : 0U;
+        try_debug_log(logger_, [&] {
+        if (completion != nullptr && value.actual_difficulty_dec.has_value()) {
+            logger_.log(
+                logging::Severity::debug, "share.completed",
+                {{logging::PublicStringKey::session_id,
+                  hex_encode(session_public_id_)},
+                 {logging::PublicStringKey::connection_public_id,
+                  submission.connection.public_id},
+                 {logging::PublicStringKey::job_public_id,
+                  submission.job_id},
+                 {logging::PublicStringKey::status, status},
+                 {logging::PublicStringKey::provenance, provenance},
+                 {logging::PublicStringKey::reason_code, code},
+                 {logging::PublicStringKey::assigned_difficulty,
+                  std::to_string(job->assigned_difficulty)},
+                 {logging::PublicStringKey::network_difficulty,
+                  job->network_difficulty},
+                 {logging::PublicStringKey::actual_difficulty,
+                  *value.actual_difficulty_dec},
+                 {logging::PublicStringKey::credited_difficulty, "0"},
+                 {logging::PublicStringKey::claimed_hash,
+                  submission.claimed_hash_hex},
+                 {logging::PublicStringKey::computed_hash,
+                  hex_encode(completion->hash)}},
+                {{logging::IntegerKey::connection_id, log_id(connection_id)},
+                 {logging::IntegerKey::job_id, log_id(job->database_id)},
+                 {logging::IntegerKey::template_id,
+                  log_id(job->template_database_id)},
+                 {logging::IntegerKey::share_id, log_id(share_id)},
+                 {logging::IntegerKey::height, job->height},
+                 {logging::IntegerKey::duration_us, duration},
+                 {logging::IntegerKey::verifier_queue_ns,
+                  completion->queue_ns},
+                 {logging::IntegerKey::verifier_hash_ns,
+                  completion->hash_ns},
+                 {logging::IntegerKey::verifier_total_ns,
+                  completion->total_ns}});
+        }
+        else if (value.actual_difficulty_dec.has_value()) {
+            logger_.log(
+                logging::Severity::debug, "share.completed",
+                {{logging::PublicStringKey::session_id,
+                  hex_encode(session_public_id_)},
+                 {logging::PublicStringKey::connection_public_id,
+                  submission.connection.public_id},
+                 {logging::PublicStringKey::job_public_id,
+                  submission.job_id},
+                 {logging::PublicStringKey::status, status},
+                 {logging::PublicStringKey::provenance, provenance},
+                 {logging::PublicStringKey::reason_code, code},
+                 {logging::PublicStringKey::assigned_difficulty,
+                  std::to_string(job->assigned_difficulty)},
+                 {logging::PublicStringKey::network_difficulty,
+                  job->network_difficulty},
+                 {logging::PublicStringKey::actual_difficulty,
+                  *value.actual_difficulty_dec},
+                 {logging::PublicStringKey::credited_difficulty, "0"},
+                 {logging::PublicStringKey::claimed_hash,
+                  submission.claimed_hash_hex}},
+                {{logging::IntegerKey::connection_id, log_id(connection_id)},
+                 {logging::IntegerKey::job_id, log_id(job->database_id)},
+                 {logging::IntegerKey::template_id,
+                  log_id(job->template_database_id)},
+                 {logging::IntegerKey::share_id, log_id(share_id)},
+                 {logging::IntegerKey::height, job->height},
+                 {logging::IntegerKey::duration_us, duration}});
+        }
+        else {
+            logger_.log(
+                logging::Severity::debug, "share.completed",
+                {{logging::PublicStringKey::session_id,
+                  hex_encode(session_public_id_)},
+                 {logging::PublicStringKey::connection_public_id,
+                  submission.connection.public_id},
+                 {logging::PublicStringKey::job_public_id,
+                  submission.job_id},
+                 {logging::PublicStringKey::status, status},
+                 {logging::PublicStringKey::provenance, provenance},
+                 {logging::PublicStringKey::reason_code, code},
+                 {logging::PublicStringKey::assigned_difficulty,
+                  std::to_string(job->assigned_difficulty)},
+                 {logging::PublicStringKey::network_difficulty,
+                  job->network_difficulty},
+                 {logging::PublicStringKey::credited_difficulty, "0"},
+                 {logging::PublicStringKey::claimed_hash,
+                  submission.claimed_hash_hex}},
+                {{logging::IntegerKey::connection_id, log_id(connection_id)},
+                 {logging::IntegerKey::job_id, log_id(job->database_id)},
+                 {logging::IntegerKey::template_id,
+                  log_id(job->template_database_id)},
+                 {logging::IntegerKey::share_id, log_id(share_id)},
+                 {logging::IntegerKey::height, job->height},
+                 {logging::IntegerKey::duration_us, duration}});
+        }
+        });
         return ShareResponse{disposition, std::move(code)};
     };
     const auto final_height_is_older = [&] {
@@ -1782,6 +2283,41 @@ ShareResponse Runtime::process_share(const StratumSubmission &submission) {
         if (!accepted.accepted) {
             return {ShareDisposition::server_busy, "share_already_final"};
         }
+        try_debug_log(logger_, [&] {
+            const std::int64_t completed = unix_time_us();
+            logger_.log(
+                logging::Severity::debug, "share.completed",
+                {{logging::PublicStringKey::session_id,
+                  hex_encode(session_public_id_)},
+                 {logging::PublicStringKey::connection_public_id,
+                  submission.connection.public_id},
+                 {logging::PublicStringKey::job_public_id,
+                  submission.job_id},
+                 {logging::PublicStringKey::status, "accepted"},
+                 {logging::PublicStringKey::provenance, "claimed"},
+                 {logging::PublicStringKey::reason_code, "accepted"},
+                 {logging::PublicStringKey::assigned_difficulty,
+                  std::to_string(job->assigned_difficulty)},
+                 {logging::PublicStringKey::network_difficulty,
+                  job->network_difficulty},
+                 {logging::PublicStringKey::actual_difficulty, actual},
+                 {logging::PublicStringKey::credited_difficulty,
+                  std::to_string(job->assigned_difficulty)},
+                 {logging::PublicStringKey::claimed_hash,
+                  submission.claimed_hash_hex}},
+                {{logging::IntegerKey::connection_id, log_id(connection_id)},
+                 {logging::IntegerKey::job_id, log_id(job->database_id)},
+                 {logging::IntegerKey::template_id,
+                  log_id(job->template_database_id)},
+                 {logging::IntegerKey::share_id, log_id(share_id)},
+                 {logging::IntegerKey::round_id,
+                  log_id(accepted.round_id)},
+                 {logging::IntegerKey::height, job->height},
+                 {logging::IntegerKey::duration_us,
+                  completed > received
+                      ? static_cast<std::uint64_t>(completed - received)
+                      : 0U}});
+        });
         return {ShareDisposition::accepted, "accepted"};
     }
 
@@ -1997,6 +2533,47 @@ ShareResponse Runtime::process_share(const StratumSubmission &submission) {
         .verifier_total_ns = completion->total_ns,
     });
     if (!accepted.accepted) return {ShareDisposition::server_busy, "share_already_final"};
+    try_debug_log(logger_, [&] {
+        const std::int64_t completed = unix_time_us();
+        logger_.log(
+            logging::Severity::debug, "share.completed",
+            {{logging::PublicStringKey::session_id,
+              hex_encode(session_public_id_)},
+             {logging::PublicStringKey::connection_public_id,
+              submission.connection.public_id},
+             {logging::PublicStringKey::job_public_id, submission.job_id},
+             {logging::PublicStringKey::status, "accepted"},
+             {logging::PublicStringKey::provenance, "verified"},
+             {logging::PublicStringKey::reason_code, "accepted"},
+             {logging::PublicStringKey::assigned_difficulty,
+              std::to_string(job->assigned_difficulty)},
+             {logging::PublicStringKey::network_difficulty,
+              job->network_difficulty},
+             {logging::PublicStringKey::actual_difficulty, actual},
+             {logging::PublicStringKey::credited_difficulty,
+              std::to_string(job->assigned_difficulty)},
+             {logging::PublicStringKey::claimed_hash,
+              submission.claimed_hash_hex},
+             {logging::PublicStringKey::computed_hash,
+              hex_encode(computed_hash)}},
+            {{logging::IntegerKey::connection_id, log_id(connection_id)},
+             {logging::IntegerKey::job_id, log_id(job->database_id)},
+             {logging::IntegerKey::template_id,
+              log_id(job->template_database_id)},
+             {logging::IntegerKey::share_id, log_id(share_id)},
+             {logging::IntegerKey::round_id,
+              log_id(accepted.round_id)},
+             {logging::IntegerKey::height, job->height},
+             {logging::IntegerKey::duration_us,
+              completed > received
+                  ? static_cast<std::uint64_t>(completed - received) : 0U},
+             {logging::IntegerKey::verifier_queue_ns,
+              completion->queue_ns},
+             {logging::IntegerKey::verifier_hash_ns,
+              completion->hash_ns},
+             {logging::IntegerKey::verifier_total_ns,
+              completion->total_ns}});
+    });
     return {ShareDisposition::accepted, "accepted"};
 }
 
@@ -2163,8 +2740,18 @@ bool Runtime::reconcile_candidate(const CandidateTask &task) {
         }
         completion.observed_orphan = evidence.orphan;
         completion.response_excerpt = evidence.response_excerpt;
-        const auto finished = database_.finish_candidate_reconciliation(
-            reconciliation_id, completion);
+        const auto finished = [&] {
+            std::unique_lock boundary_lock(candidate_boundary_mutex_);
+            auto result = database_.finish_candidate_reconciliation(
+                reconciliation_id, completion);
+            if (result.candidate_accepted) {
+                activate_accepted_candidate_fence_unlocked(task.height);
+                release_candidate_boundary_unlocked(task.candidate_id);
+                template_refresh_requested_.store(true,
+                                                  std::memory_order_release);
+            }
+            return result;
+        }();
         logger_.log(
             finished.candidate_accepted ? logging::Severity::info
                                         : logging::Severity::debug,
@@ -2261,6 +2848,21 @@ void Runtime::candidate_loop(std::stop_token token) noexcept {
                 durable->state == CandidateState::accepted ||
                 durable->state == CandidateState::accepted_by_reconciliation ||
                 durable->state == CandidateState::rejected) {
+                if (durable.has_value()) {
+                    if (durable->state == CandidateState::accepted ||
+                        durable->state ==
+                            CandidateState::accepted_by_reconciliation) {
+                        std::unique_lock boundary_lock(
+                            candidate_boundary_mutex_);
+                        activate_accepted_candidate_fence_unlocked(task.height);
+                        release_candidate_boundary_unlocked(task.candidate_id);
+                        template_refresh_requested_.store(
+                            true, std::memory_order_release);
+                    }
+                    else {
+                        release_candidate_boundary(task.candidate_id);
+                    }
+                }
                 release_candidate_inflight();
                 release_duplicate_bucket();
                 continue;
@@ -2427,8 +3029,24 @@ void Runtime::candidate_loop(std::stop_token token) noexcept {
             else {
                 completion.classification = CandidateAttemptClassification::indeterminate;
             }
-            const auto result = database_.finish_candidate_attempt(
-                task.candidate_id, attempt, completion);
+            const auto result = [&] {
+                std::unique_lock boundary_lock(candidate_boundary_mutex_);
+                auto value = database_.finish_candidate_attempt(
+                    task.candidate_id, attempt, completion);
+                if (value.state == CandidateState::accepted ||
+                    value.state == CandidateState::accepted_by_reconciliation) {
+                    activate_accepted_candidate_fence_unlocked(task.height);
+                    release_candidate_boundary_unlocked(task.candidate_id);
+                    template_refresh_requested_.store(
+                        true, std::memory_order_release);
+                }
+                else if (value.state == CandidateState::rejected) {
+                    release_candidate_boundary_unlocked(task.candidate_id);
+                    template_refresh_requested_.store(
+                        true, std::memory_order_release);
+                }
+                return value;
+            }();
             task.attempt_count = result.attempt_count;
             logger_.log(
                 result.terminal ? logging::Severity::info
@@ -2533,8 +3151,30 @@ void Runtime::candidate_loop(std::stop_token token) noexcept {
                     uncertain.trusted_mode = !config_.verifier.enabled;
                     uncertain.response_excerpt =
                         "candidate worker failed after durable dispatch intent";
-                    const auto recovered = database_.finish_candidate_attempt(
-                        task.candidate_id, *dispatch_intent_attempt, uncertain);
+                    const auto recovered = [&] {
+                        std::unique_lock boundary_lock(
+                            candidate_boundary_mutex_);
+                        auto value = database_.finish_candidate_attempt(
+                            task.candidate_id, *dispatch_intent_attempt,
+                            uncertain);
+                        if (value.state == CandidateState::accepted ||
+                            value.state ==
+                                CandidateState::accepted_by_reconciliation) {
+                            activate_accepted_candidate_fence_unlocked(
+                                task.height);
+                            release_candidate_boundary_unlocked(
+                                task.candidate_id);
+                            template_refresh_requested_.store(
+                                true, std::memory_order_release);
+                        }
+                        else if (value.state == CandidateState::rejected) {
+                            release_candidate_boundary_unlocked(
+                                task.candidate_id);
+                            template_refresh_requested_.store(
+                                true, std::memory_order_release);
+                        }
+                        return value;
+                    }();
                     task.attempt_count = recovered.attempt_count;
 
                     if (recovered.state == CandidateState::accepted ||
@@ -2665,11 +3305,13 @@ void Runtime::template_loop(std::stop_token token) noexcept {
                                 config_.daemon.refresh_retry_ms));
                 }
                 else {
-                    refresh_template(hinted ? "zmq" : "poll");
+                    const bool published = refresh_template(
+                        hinted ? "zmq" : "poll");
                     next_poll = std::chrono::steady_clock::now() +
-                                std::chrono::milliseconds(
-                                    config_.daemon.poll_interval_ms);
-                    update_readiness();
+                        std::chrono::milliseconds(
+                            published ? config_.daemon.poll_interval_ms
+                                      : config_.daemon.refresh_retry_ms);
+                    if (published) update_readiness();
                 }
             }
             catch (const std::exception &error) {
@@ -2950,6 +3592,7 @@ ApiDataSource Runtime::api_data_source() {
     };
     return make_sqlite_api_data_source({
         .database = database_.options(),
+        .api = config_.api,
         .active_hashrate_source = verifier_ ? HashrateSource::verified
                                              : HashrateSource::claimed,
         .live = std::move(live),
@@ -3164,6 +3807,19 @@ void Runtime::start() {
              {logging::PublicStringKey::state, "ready"}});
 
         const auto recoverable_candidates = database_.recoverable_candidates();
+        const auto durable_accepted_height = database_.latest_accepted_height();
+        {
+            std::unique_lock boundary_lock(candidate_boundary_mutex_);
+            if (durable_accepted_height.has_value()) {
+                accepted_candidate_height_fence_ = durable_accepted_height;
+                std::unique_lock issuance_lock(job_issuance_mutex_);
+                job_issuance_allowed_.store(false, std::memory_order_release);
+            }
+            for (const auto &recovery : recoverable_candidates) {
+                register_candidate_boundary_unlocked(
+                    recovery.candidate_id, recovery.height);
+            }
+        }
         std::vector<CandidateTask> recovered_tasks;
         recovered_tasks.reserve(recoverable_candidates.size());
         for (const auto &recovery : recoverable_candidates) {
@@ -3262,8 +3918,6 @@ void Runtime::start() {
             }
         }
 
-        refresh_template("startup");
-
         // Four workers may be occupied by the globally bounded reconciliation
         // class while two remain available for due candidate submissions.
         candidate_threads_.reserve(6U);
@@ -3271,6 +3925,7 @@ void Runtime::start() {
             candidate_threads_.emplace_back(
                 [this](std::stop_token token) { candidate_loop(token); });
         }
+        (void)refresh_template("startup");
         stratum_ = std::make_unique<StratumServer>(
             stratum_config(config_),
             [this](const MinerConnection &connection) { return make_job(connection); },

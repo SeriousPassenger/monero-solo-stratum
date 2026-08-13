@@ -5,6 +5,7 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <cctype>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -127,6 +128,55 @@ std::string normalize_hex(std::string value) {
         return static_cast<char>(std::tolower(byte));
     });
     return value;
+}
+
+bool is_nicehash_agent(std::string_view agent) noexcept {
+    static constexpr std::string_view marker = "nicehash";
+    return std::search(
+               agent.begin(), agent.end(), marker.begin(), marker.end(),
+               [](char byte, char expected) {
+                   return static_cast<char>(std::tolower(
+                              static_cast<unsigned char>(byte))) == expected;
+               }) != agent.end();
+}
+
+std::optional<std::uint32_t> compact_target(std::uint64_t difficulty) {
+    if (difficulty == 0U ||
+        difficulty > std::numeric_limits<std::uint32_t>::max()) {
+        return std::nullopt;
+    }
+    const auto target = static_cast<std::uint32_t>(
+        std::numeric_limits<std::uint32_t>::max() / difficulty);
+    if (target == 0U) return std::nullopt;
+    return target;
+}
+
+std::string compact_target_hex(std::uint32_t target) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string encoded(8U, '0');
+    for (std::size_t byte_index = 0; byte_index < 4U; ++byte_index) {
+        const auto byte = static_cast<std::uint8_t>(
+            target >> (byte_index * 8U));
+        encoded[byte_index * 2U] = digits[byte >> 4U];
+        encoded[byte_index * 2U + 1U] = digits[byte & 0x0fU];
+    }
+    return encoded;
+}
+
+struct WireTarget {
+    std::string value;
+    std::string_view encoding{"le64"};
+};
+
+WireTarget wire_target(const StratumJob &job,
+                       const MinerConnection &connection) {
+    if (is_nicehash_agent(connection.agent)) {
+        if (const auto target = compact_target(
+                connection.assigned_difficulty)) {
+            return {compact_target_hex(*target), "le32"};
+        }
+    }
+    return {job.target, "le64"};
 }
 
 bool strict_keys(const nlohmann::json &object,
@@ -723,11 +773,26 @@ void StratumServer::handle_login(const std::shared_ptr<Connection> &connection,
         }
     }
     connection->info.login = login; connection->info.rigid = rigid;
-    connection->info.agent = agent; connection->info.assigned_difficulty = difficulty;
+    connection->info.agent = agent;
+    if (is_nicehash_agent(agent)) {
+        // The legacy four-byte CryptoNote target is lossy. Verify and credit
+        // the exact work difficulty represented by the target sent on wire.
+        const auto target = compact_target(difficulty);
+        if (!target) {
+            queue_error(connection, request_id, -1,
+                        "NiceHash difficulty is not representable",
+                        request_key);
+            return;
+        }
+        difficulty = std::numeric_limits<std::uint32_t>::max() / *target;
+    }
+    connection->info.assigned_difficulty = difficulty;
     const auto job = jobs_(connection->info);
     if (!job.has_value()) { queue_error(connection, request_id, -1, "Server busy", request_key); return; }
+    const WireTarget target = wire_target(*job, connection->info);
     nlohmann::json encoded_job{{"blob", job->blob}, {"job_id", job->job_id},
-                              {"target", job->target}, {"algo", "rx/0"},
+                              {"target", target.value},
+                              {"algo", "rx/0"},
                               {"height", job->height}, {"seed_hash", job->seed_hash}};
     nlohmann::json response{{"id", id_json(request_id)}, {"jsonrpc", "2.0"}, {"error", nullptr},
                             {"result", {{"id", connection->info.public_id}, {"job", encoded_job},
@@ -735,7 +800,7 @@ void StratumServer::handle_login(const std::shared_ptr<Connection> &connection,
     if (!queue(connection, response.dump() + "\n", request_key, job->height)) return;
     remember_job(connection, *job);
     if (job->on_queued) {
-        try { job->on_queued(); } catch (...) {
+        try { job->on_queued(target.value, target.encoding); } catch (...) {
             close_connection(connection, "job persistence callback failed");
             return;
         }
@@ -976,15 +1041,17 @@ void StratumServer::refresh_jobs_now() {
         if (!connection->authenticated || connection->closing) continue;
         const auto job = jobs_(connection->info);
         if (!job) { close_connection(connection, "job unavailable"); continue; }
+        const WireTarget target = wire_target(*job, connection->info);
         nlohmann::json notification{{"jsonrpc", "2.0"}, {"method", "job"},
                                     {"params", {{"blob", job->blob}, {"job_id", job->job_id},
-                                                {"target", job->target}, {"algo", "rx/0"},
+                                                {"target", target.value},
+                                                {"algo", "rx/0"},
                                                 {"height", job->height}, {"seed_hash", job->seed_hash}}}};
         if (queue(connection, notification.dump() + "\n", std::nullopt,
                   job->height)) {
             remember_job(connection, *job);
             if (job->on_queued) {
-                try { job->on_queued(); }
+                try { job->on_queued(target.value, target.encoding); }
                 catch (...) {
                     close_connection(connection,
                                      "job persistence callback failed");
