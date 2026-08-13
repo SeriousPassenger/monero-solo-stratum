@@ -44,7 +44,7 @@ ctest --test-dir build -R 'config|database|protocol' --output-on-failure
 | `http_tests` | Real TCP HTTP framing, empty-body enforcement, transfer-encoding rejection, duplicate headers, and transport-error envelopes |
 | `runtime_tests` | In-process mock `monerod`, real Stratum/API sockets, private jobs, trusted share persistence, restart state, candidate/template round-boundary gating, fail-closed template validation, verbose post-commit job/share JSONL correlation, entropy opt-in/out, and configured-secret non-disclosure |
 | `rental_fanin_tests` | 200 simultaneous authenticated miners across three loopback source IPs, fixed event/worker thread count, refresh delivery to every miner, bounded concurrent submits, connection reaping, and timing/RSS diagnostics |
-| `watch_status_tests` | Stubbed API monitor run, human-readable daemon/hashrate/round/verifier output, configured-cap-safe share requests, and complete non-null NDJSON snapshots |
+| `watch_status_tests` | Stubbed API monitor runs, argument-only configuration, human-readable units/time, TTY color modes, luck/effort progress boundaries through 1000%, current-round timestamped top shares, configured-cap-safe share requests, and complete non-null NDJSON snapshots |
 
 Tests are standalone C++ executables with nonzero failure exit; no third-party
 unit-test framework is required. CTest applies a 180-second default per-test

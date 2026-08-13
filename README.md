@@ -156,14 +156,35 @@ event socket broadcasts committed records as NDJSON. For example:
 ```sh
 curl --fail --silent --show-error http://127.0.0.1:8787/v1/summary
 socat - UNIX-CONNECT:/tmp/monero-solo-stratum-events.sock
-./scripts/watch-status.sh
+./scripts/watch-status.sh --interval 5
 ```
 
-`watch-status.sh` renders the live 1-minute/5-minute/1-hour hashrate, current
-round effort, share/candidate counters, top shares, recent high-difficulty
-shares, and persistence pressure. Set `MSS_SNAPSHOT_FILE` to append the raw API
-responses as NDJSON during a long test. Installed builds provide the same tool
-as `mss-watch-status`. The monitor requires `curl` and `jq`.
+`watch-status.sh` is a lightweight terminal monitor rather than a full-screen
+TUI. It renders human-readable hashrate, uptime, round work, verifier/storage
+pressure, share/candidate counters, timestamped top shares from the current
+round, and recent high-difficulty shares. On a TTY it adds color automatically;
+redirected output stays plain ASCII.
+
+The `Luck` bar derives cumulative block probability from total round effort as
+`100 * (1 - exp(-effort / 100))`. The `Effort` bar shows the current 100%
+cycle, resets at each 100% boundary, and advances through ten green-to-red
+color tiers through 1000% total effort. Exact total effort remains visible next
+to the cycling bar.
+
+Configuration uses command-line arguments:
+
+```sh
+./scripts/watch-status.sh --once --color never
+./scripts/watch-status.sh --interval 2 --bar-width 32
+./scripts/watch-status.sh --snapshot-file ./status-snapshots.ndjson
+./scripts/watch-status.sh \
+  --api-url http://127.0.0.1:8787 \
+  --api-token 'optional-bearer-token'
+```
+
+Run `./scripts/watch-status.sh --help` for all options. Installed builds provide
+the same tool as `mss-watch-status`. The monitor requires only Bash, `curl`, and
+`jq`.
 
 ## Security and scope
 
