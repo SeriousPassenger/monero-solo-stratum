@@ -3,6 +3,9 @@
 set -euo pipefail
 
 readonly watcher="${1:?watch-status path is required}"
+readonly python3="${2:-}"
+readonly tui_test="${3:-}"
+readonly tui_program="${4:-}"
 readonly fixture_dir="$(mktemp -d)"
 trap 'rm -rf -- "$fixture_dir"' EXIT
 readonly snapshot="$fixture_dir/snapshots.jsonl"
@@ -163,4 +166,25 @@ done
 if "$watcher" --interval >"$output" 2>&1; then
     printf 'watch-status test: missing option value accepted\n' >&2
     exit 1
+fi
+
+if [[ -n "$python3" || -n "$tui_test" || -n "$tui_program" ]]; then
+    [[ -n "$python3" && -n "$tui_test" && -n "$tui_program" ]] || {
+        printf 'watch-status test: incomplete TUI test command\n' >&2
+        exit 1
+    }
+    "$python3" "$tui_test" "$tui_program"
+
+    dispatch_log="$fixture_dir/dispatch-events.jsonl"
+    printf '%s\n' \
+        '{"time":"2026-08-13T00:00:00Z","severity":"info","code":"runtime.ready","fields":{"height":7}}' \
+        >"$dispatch_log"
+    "$watcher" --view events --ui tty --theme black \
+        --event-log "$dispatch_log" --from-start --event-rate 20 --once \
+        >"$output"
+    grep -F 'RUNTIME.READY  height=7' "$output" >/dev/null
+    if LC_ALL=C grep -q $'\033' "$output"; then
+        printf 'watch-status test: dispatched TTY output emitted ANSI escapes\n' >&2
+        exit 1
+    fi
 fi

@@ -261,7 +261,8 @@ chmod 0755 \
     "$stage_root/scripts/make-source-archive.sh" \
     "$stage_root/scripts/test-source-archive.sh" \
     "$stage_root/scripts/verify-source-archive.py" \
-    "$stage_root/scripts/watch-status.sh"
+    "$stage_root/scripts/watch-status.sh" \
+    "$stage_root/scripts/watch-status-tui.py"
 
 # SHA256SUMS intentionally excludes itself. Paths are relative to the archive
 # root, byte-sorted, printable ASCII, and therefore unambiguous to the bundled

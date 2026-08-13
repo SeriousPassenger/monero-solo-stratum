@@ -3,7 +3,8 @@
 Release archives are produced from a frozen source tree with the checked-in
 tools under `scripts/`. They require Bash, GNU tar, gzip, GNU coreutils and
 findutils, and Python 3.10 or newer. The application build remains completely
-offline; Python is only a release-verification dependency.
+offline. Python verifies the archive and runs the optional installed
+split-screen monitor; it is not linked into the server process.
 
 ## Freeze and create
 
@@ -110,3 +111,20 @@ paths to match the configured prefix before publishing the package. With the
 `package-root/etc/monero-solo-stratum/`; copy and edit it as `config.json`
 before enabling the service, whose unit refers to
 `/etc/monero-solo-stratum/config.json`.
+
+The staged command set must also contain both executable monitor entry points:
+
+```sh
+test -x package-root/usr/bin/mss-watch-status
+test -x package-root/usr/bin/mss-watch-status-tui
+python3 -c 'import ast,pathlib; ast.parse(pathlib.Path("package-root/usr/bin/mss-watch-status-tui").read_text())'
+package-root/usr/bin/mss-watch-status --help >/dev/null
+package-root/usr/bin/mss-watch-status-tui --help >/dev/null
+```
+
+The flattened source archive treats `scripts/watch-status.sh`,
+`scripts/watch-status-tui.py`, `scripts/make-source-archive.sh`,
+`scripts/test-source-archive.sh`, and `scripts/verify-source-archive.py` as its
+only executable script members. The archive verifier requires both TUI source
+and its integration test, so an older release allowlist cannot silently emit a
+server archive without the installed monitor it documents.

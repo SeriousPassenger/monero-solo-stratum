@@ -166,6 +166,9 @@ install(TARGETS monero-solo-stratum RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(PROGRAMS scripts/watch-status.sh
         DESTINATION ${CMAKE_INSTALL_BINDIR}
         RENAME mss-watch-status)
+install(PROGRAMS scripts/watch-status-tui.py
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        RENAME mss-watch-status-tui)
 # The generated service uses CMAKE_INSTALL_FULL_SYSCONFDIR. Install the
 # example into that same configure-time location so the GNUInstallDirs `/usr`
 # special case (`/etc`, not `/usr/etc`) cannot make the unit and package tree
@@ -192,6 +195,7 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/packaging/monero-solo-stratum.service
 if(BUILD_TESTING AND MSS_BUILD_TESTS)
     find_program(MSS_BASH_EXECUTABLE bash REQUIRED)
     find_program(MSS_JQ_EXECUTABLE jq REQUIRED)
+    find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
     file(GLOB MSS_TEST_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/*_tests.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/*_tests.cpp"
@@ -216,6 +220,11 @@ if(BUILD_TESTING AND MSS_BUILD_TESTS)
     add_test(NAME watch_status_tests
              COMMAND "${MSS_BASH_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/watch_status_tests.sh"
-                     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/watch-status.sh")
-    set_tests_properties(watch_status_tests PROPERTIES TIMEOUT 30)
+                     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/watch-status.sh"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/watch_status_tui_tests.py"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/watch-status-tui.py")
+    set_tests_properties(watch_status_tests PROPERTIES
+        TIMEOUT 60
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 endif()

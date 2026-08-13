@@ -18,7 +18,7 @@ usage() {
     printf '%s\n' \
         "Usage: $program_name [OPTIONS]" \
         "" \
-        "Lightweight human-readable monitor for monero-solo-stratum." \
+        "Split-screen and lightweight monitors for monero-solo-stratum." \
         "" \
         "Options:" \
         "  --api-url URL          API base URL (default http://127.0.0.1:8787)" \
@@ -27,8 +27,25 @@ usage() {
         "  --snapshot-file PATH   Append raw API snapshots as NDJSON" \
         "  --color MODE           auto, always, or never (default auto)" \
         "  --bar-width COLUMNS    ASCII progress-bar width, 10-60 (default 28)" \
+        "  --plain                Use the lightweight line-oriented monitor" \
         "  --once                 Print one snapshot and exit" \
         "  --no-clear             Do not clear the terminal between updates" \
+        "" \
+        "Interactive split-screen options (TTY default):" \
+        "  --monero-rpc-url URL   monerod JSON-RPC base (default http://127.0.0.1:18081)" \
+        "  --event-log PATH       JSONL event log to follow" \
+        "  --event-rate ROWS      Target sampled event rows per second" \
+        "  --min-share-difficulty N  Base accepted-share display floor" \
+        "  --stream-filter LIST   Comma-separated stream categories" \
+        "  --view MODE            both, status, or events (default both)" \
+        "  --layout MODE          auto, vertical, or horizontal" \
+        "  --ui MODE              auto, curses, tty, or plain" \
+        "  --reverse              Put the event pane before the status pane" \
+        "  --theme NAME           auto, nerv-asuka, tokyo-neon, windows-classic," \
+        "                         black, or windows-classic-tty" \
+        "  --from-start           Read the event log from its beginning" \
+        "  --disk-path PATH       Filesystem path used for disk capacity/I/O" \
+        "  --history-size ROWS    Maximum event rows retained in memory" \
         "  -h, --help             Show this help"
 }
 
@@ -37,6 +54,123 @@ missing_value() {
     usage >&2
     exit 2
 }
+
+# An attached terminal gets the interactive split-screen implementation by
+# default. Explicit legacy-output controls and redirected output retain the
+# original Bash/jq monitor, making existing scripts and service captures
+# stable. The installed names differ, so accept both the source-tree and
+# installed sibling spellings.
+plain_requested=false
+legacy_requested=false
+tui_requested=false
+once_requested=false
+help_requested=false
+legacy_args=()
+scan_args=("$@")
+for ((scan_index = 0; scan_index < ${#scan_args[@]}; ++scan_index)); do
+    scan_arg="${scan_args[$scan_index]}"
+    case "$scan_arg" in
+        --plain)
+            plain_requested=true
+            ;;
+        --once)
+            once_requested=true
+            legacy_args+=("$scan_arg")
+            ;;
+        --snapshot-file|--color|--bar-width)
+            legacy_requested=true
+            legacy_args+=("$scan_arg")
+            if ((scan_index + 1 < ${#scan_args[@]})); then
+                ((++scan_index))
+                legacy_args+=("${scan_args[$scan_index]}")
+            fi
+            ;;
+        --no-clear|--snapshot-file=*|--color=*|--bar-width=*)
+            legacy_requested=true
+            legacy_args+=("$scan_arg")
+            ;;
+        --api-url|--api-token|--interval)
+            legacy_args+=("$scan_arg")
+            if ((scan_index + 1 < ${#scan_args[@]})); then
+                ((++scan_index))
+                legacy_args+=("${scan_args[$scan_index]}")
+            fi
+            ;;
+        --monero-rpc-url|--monerod-url|--event-log|--event-file|--event-rate|\
+        --min-share-difficulty|--stream-filter|--view|--layout|--ui|--theme|\
+        --disk-path|--history-size)
+            tui_requested=true
+            legacy_args+=("$scan_arg")
+            if ((scan_index + 1 < ${#scan_args[@]})); then
+                ((++scan_index))
+                legacy_args+=("${scan_args[$scan_index]}")
+            fi
+            ;;
+        --monero-rpc-url=*|--monerod-url=*|--event-log=*|--event-file=*|\
+        --event-rate=*|--min-share-difficulty=*|--stream-filter=*|--view=*|\
+        --layout=*|--ui=*|--theme=*|--disk-path=*|--history-size=*|\
+        --reverse|--from-start)
+            tui_requested=true
+            legacy_args+=("$scan_arg")
+            ;;
+        -h|--help)
+            help_requested=true
+            legacy_args+=("$scan_arg")
+            ;;
+        *)
+            legacy_args+=("$scan_arg")
+            ;;
+    esac
+done
+set -- "${legacy_args[@]}"
+
+if $help_requested; then
+    usage
+    exit 0
+fi
+if $plain_requested && $tui_requested; then
+    printf '%s: --plain cannot be combined with split-screen-only options\n' \
+        "$program_name" >&2
+    exit 2
+fi
+if $legacy_requested && $tui_requested; then
+    printf '%s: legacy output controls cannot be combined with split-screen-only options\n' \
+        "$program_name" >&2
+    exit 2
+fi
+
+use_tui=false
+if ! $plain_requested && ! $legacy_requested && $tui_requested; then
+    use_tui=true
+elif ! $plain_requested && ! $legacy_requested && ! $once_requested &&
+     [[ -t 0 && -t 1 ]] && [[ "${TERM:-dumb}" != dumb ]]; then
+    use_tui=true
+fi
+
+if $use_tui; then
+    readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    tui_program=""
+    for tui_candidate in \
+        "$script_dir/watch-status-tui.py" \
+        "$script_dir/mss-watch-status-tui"
+    do
+        if [[ -x "$tui_candidate" && ! -d "$tui_candidate" ]]; then
+            tui_program="$tui_candidate"
+            break
+        fi
+    done
+    if [[ -z "$tui_program" ]]; then
+        tui_program="$(command -v mss-watch-status-tui 2>/dev/null || true)"
+    fi
+    if [[ -n "$tui_program" ]]; then
+        exec "$tui_program" "$@"
+    fi
+    if $tui_requested; then
+        printf '%s: mss-watch-status-tui is not installed\n' \
+            "$program_name" >&2
+        exit 1
+    fi
+fi
 
 while (($#)); do
     case "$1" in
