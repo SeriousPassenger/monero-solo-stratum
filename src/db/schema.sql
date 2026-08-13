@@ -4,7 +4,7 @@ CREATE TABLE schema_meta (
     value TEXT NOT NULL
 ) STRICT;
 
-INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1');
+INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2');
 
 CREATE TABLE server_sessions (
     id INTEGER PRIMARY KEY,
@@ -102,6 +102,7 @@ CREATE INDEX private_jobs_height
 
 CREATE TABLE shares (
     id INTEGER PRIMARY KEY,
+    round_id INTEGER NOT NULL REFERENCES rounds(id),
     connection_id INTEGER NOT NULL REFERENCES connections(id),
     worker_id INTEGER REFERENCES workers(id),
     job_id INTEGER REFERENCES private_jobs(id),
@@ -149,6 +150,17 @@ CREATE TABLE shares (
 CREATE INDEX shares_time ON shares(received_unix_us, id);
 CREATE INDEX shares_worker_time ON shares(worker_id, received_unix_us, id);
 CREATE INDEX shares_status_time ON shares(status, received_unix_us, id);
+CREATE INDEX shares_round_status ON shares(round_id, status, id);
+CREATE INDEX shares_accepted_actual_difficulty_rank
+    ON shares(length(actual_difficulty_dec) DESC, actual_difficulty_dec DESC, id)
+    WHERE status = 'accepted' AND actual_difficulty_dec IS NOT NULL;
+
+CREATE TRIGGER share_round_is_immutable
+BEFORE UPDATE OF round_id ON shares
+WHEN NEW.round_id != OLD.round_id
+BEGIN
+    SELECT RAISE(ABORT, 'share round is immutable');
+END;
 
 CREATE TABLE share_hashes (
     share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
@@ -267,11 +279,113 @@ CREATE TABLE rounds (
     miner_tx_hash BLOB CHECK(miner_tx_hash IS NULL OR length(miner_tx_hash) = 32),
     block_id BLOB CHECK(block_id IS NULL OR length(block_id) = 32),
     credited_difficulty_dec TEXT NOT NULL DEFAULT '0',
-    accepted_share_count INTEGER NOT NULL DEFAULT 0
+    accepted_share_count INTEGER NOT NULL DEFAULT 0 CHECK(accepted_share_count >= 0),
+    effort_finalized_unix_us INTEGER,
+    finalized_effort_segment_count INTEGER CHECK(
+        finalized_effort_segment_count IS NULL OR
+        finalized_effort_segment_count >= 0
+    ),
+    CHECK(
+        (state = 'open' AND closed_unix_us IS NULL AND
+         accepted_candidate_id IS NULL AND accepted_height IS NULL AND
+         miner_tx_hash IS NULL AND block_id IS NULL AND
+         effort_finalized_unix_us IS NULL AND
+         finalized_effort_segment_count IS NULL) OR
+        (state = 'closed' AND closed_unix_us IS NOT NULL AND
+         closed_unix_us >= opened_unix_us AND
+         accepted_candidate_id IS NOT NULL AND accepted_height IS NOT NULL AND
+         miner_tx_hash IS NOT NULL AND
+         ((effort_finalized_unix_us IS NULL AND
+           finalized_effort_segment_count IS NULL) OR
+          (effort_finalized_unix_us >= closed_unix_us AND
+           finalized_effort_segment_count IS NOT NULL)))
+    )
 ) STRICT;
 
 CREATE UNIQUE INDEX exactly_one_open_round
     ON rounds(state) WHERE state = 'open';
+
+CREATE TABLE round_work_segments (
+    round_id INTEGER NOT NULL REFERENCES rounds(id),
+    source TEXT NOT NULL CHECK(source IN ('verified', 'claimed')),
+    network_difficulty_dec TEXT NOT NULL CHECK(network_difficulty_dec != '0'),
+    credited_difficulty_dec TEXT NOT NULL CHECK(credited_difficulty_dec != '0'),
+    accepted_share_count INTEGER NOT NULL CHECK(accepted_share_count > 0),
+    PRIMARY KEY(round_id, source, network_difficulty_dec),
+    CHECK(length(network_difficulty_dec) > 0),
+    CHECK(length(credited_difficulty_dec) > 0),
+    CHECK(network_difficulty_dec NOT GLOB '*[^0-9]*'),
+    CHECK(credited_difficulty_dec NOT GLOB '*[^0-9]*'),
+    CHECK(length(network_difficulty_dec) = 1 OR
+          substr(network_difficulty_dec, 1, 1) != '0'),
+    CHECK(length(credited_difficulty_dec) = 1 OR
+          substr(credited_difficulty_dec, 1, 1) != '0')
+) WITHOUT ROWID, STRICT;
+
+CREATE TRIGGER round_work_segment_insert_before_finalization
+BEFORE INSERT ON round_work_segments
+WHEN (SELECT effort_finalized_unix_us FROM rounds WHERE id = NEW.round_id)
+     IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'finalized round effort is immutable');
+END;
+
+CREATE TRIGGER round_work_segment_update_before_finalization
+BEFORE UPDATE ON round_work_segments
+WHEN (SELECT effort_finalized_unix_us FROM rounds WHERE id = OLD.round_id)
+         IS NOT NULL OR
+     (SELECT effort_finalized_unix_us FROM rounds WHERE id = NEW.round_id)
+         IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'finalized round effort is immutable');
+END;
+
+CREATE TRIGGER round_work_segment_delete_before_finalization
+BEFORE DELETE ON round_work_segments
+WHEN (SELECT effort_finalized_unix_us FROM rounds WHERE id = OLD.round_id)
+     IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'finalized round effort is immutable');
+END;
+
+CREATE TRIGGER round_effort_finalization_is_consistent
+BEFORE UPDATE OF effort_finalized_unix_us, finalized_effort_segment_count ON rounds
+WHEN OLD.effort_finalized_unix_us IS NULL AND
+     NEW.effort_finalized_unix_us IS NOT NULL AND
+     (NEW.state != 'closed' OR
+      EXISTS (
+          SELECT 1 FROM shares
+          WHERE round_id = NEW.id AND status IN ('received', 'verifying')
+      ) OR
+      NEW.finalized_effort_segment_count != (
+          SELECT count(*) FROM round_work_segments WHERE round_id = NEW.id
+      ) OR
+      NEW.accepted_share_count != coalesce((
+          SELECT sum(accepted_share_count)
+          FROM round_work_segments WHERE round_id = NEW.id
+      ), 0))
+BEGIN
+    SELECT RAISE(ABORT, 'round effort cannot be finalized');
+END;
+
+CREATE TRIGGER finalized_round_is_immutable
+BEFORE UPDATE ON rounds
+WHEN OLD.effort_finalized_unix_us IS NOT NULL AND
+     (NEW.opened_unix_us IS NOT OLD.opened_unix_us OR
+      NEW.closed_unix_us IS NOT OLD.closed_unix_us OR
+      NEW.state IS NOT OLD.state OR
+      NEW.accepted_candidate_id IS NOT OLD.accepted_candidate_id OR
+      NEW.accepted_height IS NOT OLD.accepted_height OR
+      NEW.miner_tx_hash IS NOT OLD.miner_tx_hash OR
+      NEW.block_id IS NOT OLD.block_id OR
+      NEW.credited_difficulty_dec IS NOT OLD.credited_difficulty_dec OR
+      NEW.accepted_share_count IS NOT OLD.accepted_share_count OR
+      NEW.effort_finalized_unix_us IS NOT OLD.effort_finalized_unix_us OR
+      NEW.finalized_effort_segment_count IS NOT
+          OLD.finalized_effort_segment_count)
+BEGIN
+    SELECT RAISE(ABORT, 'finalized round is immutable');
+END;
 
 CREATE TABLE hashrate_buckets (
     scope_type TEXT NOT NULL CHECK(scope_type IN ('global', 'connection', 'worker')),
@@ -401,6 +515,10 @@ CREATE TABLE events (
 
 CREATE INDEX events_time ON events(created_unix_us, id);
 CREATE INDEX events_type_id ON events(type, id);
+CREATE INDEX events_share_result_share ON events(share_id, id)
+    WHERE type = 'share_result' AND share_id IS NOT NULL;
+CREATE INDEX events_share_result_round_share ON events(round_id, share_id, id)
+    WHERE type = 'share_result' AND round_id IS NOT NULL AND share_id IS NOT NULL;
 
 CREATE TABLE blocknotify_deliveries (
     id INTEGER PRIMARY KEY,

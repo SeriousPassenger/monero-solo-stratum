@@ -163,6 +163,9 @@ add_executable(monero-solo-stratum src/main.cpp)
 target_link_libraries(monero-solo-stratum PRIVATE monero_solo::core)
 
 install(TARGETS monero-solo-stratum RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS scripts/watch-status.sh
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        RENAME mss-watch-status)
 # The generated service uses CMAKE_INSTALL_FULL_SYSCONFDIR. Install the
 # example into that same configure-time location so the GNUInstallDirs `/usr`
 # special case (`/etc`, not `/usr/etc`) cannot make the unit and package tree
@@ -187,6 +190,8 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/packaging/monero-solo-stratum.service
         DESTINATION ${MSS_SYSTEMD_UNIT_DIR})
 
 if(BUILD_TESTING AND MSS_BUILD_TESTS)
+    find_program(MSS_BASH_EXECUTABLE bash REQUIRED)
+    find_program(MSS_JQ_EXECUTABLE jq REQUIRED)
     file(GLOB MSS_TEST_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/*_tests.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/*_tests.cpp"
@@ -208,4 +213,9 @@ if(BUILD_TESTING AND MSS_BUILD_TESTS)
         LABELS "integration;stratum;fan-in"
         TIMEOUT 120
     )
+    add_test(NAME watch_status_tests
+             COMMAND "${MSS_BASH_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/watch_status_tests.sh"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/watch-status.sh")
+    set_tests_properties(watch_status_tests PROPERTIES TIMEOUT 30)
 endif()

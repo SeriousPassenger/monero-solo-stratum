@@ -18,11 +18,12 @@ PRAGMA busy_timeout = <configured milliseconds>;
 ```
 
 Failure to establish WAL, FULL synchronous mode, foreign keys, or the exact
-busy timeout aborts startup. A new empty database receives schema version 1 in
-one transaction and `PRAGMA user_version=1`. An existing database must contain
-`schema_meta('schema_version','1')` and pass `foreign_key_check`. This release
-contains only the initial forward schema; an unknown version or a nonempty
-foreign database without schema metadata fails rather than being guessed or
+busy timeout aborts startup. A new empty database receives schema version 2 in
+one transaction and `PRAGMA user_version=2`. An existing database must contain
+`schema_meta('schema_version','2')` and pass `foreign_key_check`. This test
+release deliberately has no v1 backfill/migration path: purge the old test
+database before installing it. An unknown version or a nonempty foreign
+database without schema metadata fails rather than being guessed or
 downgraded.
 
 The schema source is `src/db/schema.sql`, embedded into the binary at compile
@@ -44,7 +45,7 @@ bounded queries.
 | Identity/lifecycle | `server_sessions`, `workers`, `connections` |
 | Work | `public_templates`, `private_jobs`, `shares`, `share_hashes`, `duplicate_keys` |
 | Blocks | `candidates`, `candidate_attempts`, `candidate_reconciliations`, `candidate_verdicts` |
-| Accounting | `rounds`, `hashrate_buckets` |
+| Accounting | `rounds`, `round_work_segments`, `hashrate_buckets` |
 | Defense/audit | `abuse_events`, `bans`, `ban_abuse_events`, `events` |
 | Hooks | `blocknotify_deliveries` |
 
@@ -54,7 +55,7 @@ SQLite's signed integer domain—RandomX seed IDs/tickets and difficulty/work
 values—are canonical unsigned decimal TEXT. Conversion to hex, decimal JSON,
 and RFC 3339 happens at an interface boundary.
 
-`database.retention_days` must be zero in v1. There is no automatic deletion;
+`database.retention_days` must be zero in this release. There is no automatic deletion;
 historical candidates, attempts, bans, sessions, rounds, and events remain
 until an operator performs an offline archival/migration procedure. Back up
 the database and its WAL consistently while the process is stopped, or use
@@ -190,15 +191,22 @@ originating records.
 
 A round closes only when one local candidate receives daemon `OK` or later
 positive reconciliation. A height change, remote block, candidate claim,
-rejection, or ambiguity does not close it. Closed rounds are not reopened for
-later orphan/reorg correction in v1.
+rejection, or ambiguity does not close it. Each share stores its round at
+admission, so a verification completing across the close boundary is credited
+to its original round. A closed round is finalized only after those admitted
+shares leave `received`/`verifying`; triggers then freeze its work segments.
+Closed rounds are not reopened for later orphan/reorg correction in v2.
 
 Only final `accepted` shares add assigned difficulty to one-second buckets for
 global scope (`scope_id=0`), connection, and logical `(login,rigid)` worker.
 Verified and claimed sources have separate conflict keys. API windows cover
 exactly 60, 300, 600, 3,600, 21,600, and 86,400 seconds and divide by the
 nominal window length; stale/low/duplicate/mismatch/infrastructure shares add
-zero.
+zero. The same credited work is accumulated exactly by round, source, and
+network difficulty. `estimated_hashes` is this unbiased share-based work
+estimate; a Stratum server cannot observe the miner's exact attempted nonce
+count. Round effort is `100 * sum(credited_work / network_difficulty)` and may
+legitimately exceed 100 percent.
 
 ## Durable `blocknotify`
 

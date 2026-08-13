@@ -93,6 +93,39 @@ Successful response:
 The result `id` is a private 16-byte connection RPC ID. It is required in
 later submits/keepalives and is unrelated to the request ID.
 
+### NiceHash compact-target compatibility
+
+An `agent` containing `NiceHash` (case-insensitive) enables the compact target
+accepted by the NiceHash RandomXMonero verifier. Login and notification jobs
+encode their share target as the legacy 32-bit CryptoNote target:
+
+```text
+target32 = floor((2^32 - 1) / D)
+```
+
+It is serialized as exactly four little-endian bytes (eight lowercase hex
+characters). Because that representation is lossy, the server derives the
+exact effective assigned difficulty:
+
+```text
+D_effective = floor((2^32 - 1) / target32)
+```
+
+Verification, share credit, and subsequent jobs use `D_effective`, so
+accounting describes the work actually issued. For example, requested
+`D = 262144` produces target `ff3f0000` and effective difficulty `262160`.
+The compact representation is available through `D <= 4294967295`. A
+NiceHash-agent login whose effective requested/fixed difficulty is higher is
+rejected explicitly instead of sending a 16-hex job known to be invalid for
+that verifier. Ordinary non-NiceHash clients continue to support the 64-bit
+form at those difficulties.
+
+This remains CryptoNote simple mode. The login job stays embedded in the login
+response and extensions remain exactly `["algo", "keepalive"]`. The server
+does not advertise the `nicehash` extension, reserve a nonce byte, or split the
+miner nonce space. Per-connection template entropy provides private jobs while
+all four submitted nonce bytes remain miner-controlled.
+
 ## New jobs
 
 Each installed valid daemon template derives a new private job for every
@@ -130,6 +163,8 @@ The job `target` is that unsigned value serialized as exactly eight
 little-endian bytes and then 16 lowercase hex characters. A raw RandomX hash
 passes the share target only when the little-endian `uint64` in raw
 `hash[24..31]` is strictly less than `target64`; equality is low difficulty.
+NiceHash-agent connections use the compact encoding and effective difficulty
+described above.
 
 Network-candidate detection is independent and uses the complete 256-bit raw
 little-endian hash with daemon unsigned 128-bit difficulty `D`:

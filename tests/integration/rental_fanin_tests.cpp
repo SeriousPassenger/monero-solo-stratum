@@ -455,7 +455,9 @@ Diagnostics test_rental_fanin()
                 .target = "ffffffffffffff7f",
                 .seed_hash = std::string(64U, 'c'),
                 .height = height,
-                .on_queued = [&] { ++queued_jobs; },
+                .on_queued = [&](std::string_view, std::string_view) {
+                    ++queued_jobs;
+                },
                 .network_difficulty = "1000000000",
             };
         },

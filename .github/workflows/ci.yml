@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends binutils build-essential clang cmake libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
+          sudo apt-get install --yes --no-install-recommends binutils build-essential clang cmake jq libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
           "$CC" --version
           "$CXX" --version
 
@@ -89,16 +89,18 @@ jobs:
       - name: Require and run the exact server test inventory
         run: |
           set -euo pipefail
-          ctest --test-dir build-release --show-only=json-v1 | python3 -c 'import json,sys; got={t["name"] for t in json.load(sys.stdin)["tests"]}; want={"monero_template_tests","rental_fanin_tests","runtime_tests","api_tests","config_tests","database_tests","entropy_tests","http_tests","logger_tests","monero_tests","protocol_tests","verifier_tests"}; assert got == want, {"missing":sorted(want-got),"extra":sorted(got-want)}'
+          ctest --test-dir build-release --show-only=json-v1 | python3 -c 'import json,sys; got={t["name"] for t in json.load(sys.stdin)["tests"]}; want={"monero_template_tests","rental_fanin_tests","runtime_tests","api_tests","config_tests","database_tests","entropy_tests","http_tests","logger_tests","monero_tests","protocol_tests","verifier_tests","watch_status_tests"}; assert got == want, {"missing":sorted(want-got),"extra":sorted(got-want)}'
           ctest --test-dir build-release --output-on-failure --no-tests=error --parallel 1
 
       - name: Validate CLI and staged install
         run: |
           set -euo pipefail
+          bash -n scripts/watch-status.sh
           ./build-release/monero-solo-stratum --version | grep -Fx 'monero-solo-stratum 0.1.0'
           ./build-release/monero-solo-stratum --check-config --config "$PWD/config.example.json" | grep -Fx 'configuration valid'
           DESTDIR="$PWD/stage" cmake --install build-release
           test -x stage/usr/bin/monero-solo-stratum
+          test -x stage/usr/bin/mss-watch-status
           test -f stage/etc/monero-solo-stratum/config.example.json
           test -f stage/usr/lib/systemd/system/monero-solo-stratum.service
           grep -Fx 'ExecStartPre=/usr/bin/monero-solo-stratum --check-config --config /etc/monero-solo-stratum/config.json' stage/usr/lib/systemd/system/monero-solo-stratum.service
@@ -149,7 +151,7 @@ jobs:
           persist-credentials: false
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential clang cmake libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential clang cmake jq libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
 
       - name: Configure and build
         run: |
@@ -174,7 +176,7 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           set -euo pipefail
-          ctest --test-dir build-asan --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 12, [t["name"] for t in tests]'
+          ctest --test-dir build-asan --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 13, [t["name"] for t in tests]'
           ctest --test-dir build-asan --output-on-failure --no-tests=error --parallel 1
 
   tsan:
@@ -190,7 +192,7 @@ jobs:
           persist-credentials: false
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential cmake libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential cmake jq libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3
 
       - name: Configure, build, and test
         env:
@@ -209,7 +211,7 @@ jobs:
             -DMSS_ENABLE_TSAN=ON \
             -DMSPV_ENABLE_SANITIZERS=OFF
           cmake --build build-tsan --parallel 2
-          ctest --test-dir build-tsan --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 12, [t["name"] for t in tests]'
+          ctest --test-dir build-tsan --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 13, [t["name"] for t in tests]'
           ctest --test-dir build-tsan --output-on-failure --no-tests=error --parallel 1
 
   source-archive:
@@ -225,7 +227,7 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential cmake coreutils findutils gzip libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3 tar
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential cmake coreutils findutils gzip jq libcurl4-openssl-dev libssl-dev libzmq5 ninja-build python3 tar
 
       - name: Prove archive reproducibility and build its Git-free extraction
         run: |
@@ -248,5 +250,5 @@ jobs:
             -DBUILD_TESTING=ON \
             -DMSS_BUILD_TESTS=ON
           cmake --build "$build_root" --parallel 2
-          ctest --test-dir "$build_root" --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 12, [t["name"] for t in tests]'
+          ctest --test-dir "$build_root" --show-only=json-v1 | python3 -c 'import json,sys; tests=json.load(sys.stdin)["tests"]; assert len(tests) == 13, [t["name"] for t in tests]'
           ctest --test-dir "$build_root" --output-on-failure --no-tests=error --parallel 1

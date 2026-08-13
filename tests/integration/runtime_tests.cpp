@@ -1,5 +1,6 @@
 #include "monero_solo/config.hpp"
 #include "monero_solo/runtime.hpp"
+#include "monero_solo/util.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -217,6 +218,11 @@ public:
         reject_template_.store(reject, std::memory_order_release);
     }
 
+    void publish_successor() noexcept
+    {
+        successor_published_.store(true, std::memory_order_release);
+    }
+
     void omit_status_for(const std::string_view method)
     {
         int fault = 0;
@@ -308,11 +314,27 @@ private:
                 params.value("reserve_size", 0) != 16) {
                 throw std::runtime_error("runtime sent wrong template parameters");
             }
+            std::string template_blob(kTemplateBlob);
+            std::string hashing_blob(kHashingBlob);
+            std::uint64_t height = kHeight;
+            if (successor_published_.load(std::memory_order_acquire)) {
+                const auto encoded_height = template_blob.find("ba85e401");
+                if (encoded_height == std::string::npos) {
+                    throw std::runtime_error(
+                        "mock successor coinbase height was not found");
+                }
+                template_blob.replace(encoded_height, 8U, "bb85e401");
+                hashing_blob = monero_solo::hex_encode(
+                    monero_solo::block_hashing_blob(
+                        monero_solo::parse_block(
+                            monero_solo::hex_decode(template_blob))));
+                height = kHeight + 1U;
+            }
             result = {
                 {"status", "OK"},
-                {"blocktemplate_blob", kTemplateBlob},
-                {"blockhashing_blob", kHashingBlob},
-                {"height", kHeight},
+                {"blocktemplate_blob", template_blob},
+                {"blockhashing_blob", hashing_blob},
+                {"height", height},
                 {"prev_hash", reject_template_.load(std::memory_order_acquire)
                                   ? std::string(64, 'f')
                                   : std::string(kPreviousHash)},
@@ -377,7 +399,45 @@ private:
             }
             const Json request = Json::parse(
                 std::string_view(wire).substr(header_end, *length));
-            const std::string body = response_for(request).dump();
+            const auto first_space = wire.find(' ');
+            const auto second_space = first_space == std::string::npos
+                                          ? std::string::npos
+                                          : wire.find(' ', first_space + 1U);
+            if (first_space == std::string::npos ||
+                second_space == std::string::npos) {
+                throw std::runtime_error("mock daemon received malformed HTTP target");
+            }
+            const std::string_view target(wire.data() + first_space + 1U,
+                                          second_space - first_space - 1U);
+            Json response_document;
+            if (target == "/getheight") {
+                if (!request.is_object() || !request.empty()) {
+                    throw std::runtime_error("getheight parameters were not empty");
+                }
+                {
+                    std::lock_guard lock(mutex_);
+                    ++calls_["getheight"];
+                }
+                response_document = {
+                    {"status", "OK"},
+                    {"height", successor_published_.load(
+                                   std::memory_order_acquire)
+                                   ? kHeight + 1U
+                                   : kHeight},
+                    {"hash", successor_published_.load(
+                                 std::memory_order_acquire)
+                                 ? std::string(64, 'e')
+                                 : std::string(kPreviousHash)},
+                };
+            }
+            else if (target == "/json_rpc") {
+                response_document = response_for(request);
+            }
+            else {
+                throw std::runtime_error(
+                    "runtime called unexpected daemon endpoint");
+            }
+            const std::string body = response_document.dump();
             const std::string response =
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                 "Connection: close\r\nContent-Length: " +
@@ -417,6 +477,7 @@ private:
     FileDescriptor listener_;
     std::uint16_t port_{};
     std::atomic<bool> reject_template_{false};
+    std::atomic<bool> successor_published_{false};
     std::atomic<int> status_fault_{0};
     mutable std::mutex mutex_;
     std::map<std::string, unsigned> calls_;
@@ -463,7 +524,8 @@ struct LoggedInClient {
 };
 
 LoggedInClient login_client(const std::uint16_t port,
-                            const std::string_view password = {})
+                            const std::string_view password = {},
+                            const std::string_view agent = "runtime-e2e/1")
 {
     FileDescriptor client = connect_tcp(port);
     const Json request = {
@@ -471,7 +533,7 @@ LoggedInClient login_client(const std::uint16_t port,
         {"jsonrpc", "2.0"},
         {"method", "login"},
         {"params", {{"login", "runtime-test"}, {"pass", password},
-                    {"agent", "runtime-e2e/1"}, {"rigid", "loopback"},
+                    {"agent", agent}, {"rigid", "loopback"},
                     {"algo", Json::array({"rx/0"})}}},
     };
     send_all(client.get(), request.dump() + "\n");
@@ -625,6 +687,143 @@ void test_post_commit_job_rollback()
             "post-commit job fault was incorrectly recorded as a clean session");
 }
 
+void test_verified_share_debug_jsonl()
+{
+    MockDaemon daemon;
+    TemporaryDatabase database("verified-debug");
+    const std::uint16_t stratum_port = unused_tcp_port();
+    std::uint16_t api_port = unused_tcp_port();
+    while (api_port == stratum_port) api_port = unused_tcp_port();
+    monero_solo::Config config = config_for(
+        daemon, stratum_port, api_port, database.path());
+    const std::string log_path = database.path().string() + ".jsonl";
+    config.logging.level = "debug";
+    config.logging.file = log_path;
+    config.verifier.enabled = true;
+    config.verifier.memory_mode = "light";
+    config.verifier.workers = 1;
+    config.verifier.seed_init_threads = 1;
+    config.verifier.max_seeds = 2;
+    config.verifier.pending_capacity = 8;
+    config.verifier.max_outstanding = 8;
+    config.verifier.large_pages = "disabled";
+    config.verifier.log_level = "error";
+    config.daemon.request_timeout_ms = 30'000;
+
+    const std::string claimed_hash(64, 'f');
+    std::string job_id;
+    {
+        monero_solo::Runtime runtime(config);
+        runtime.start();
+        require(runtime.running() && runtime.ready(),
+                "verified runtime did not become ready");
+
+        LoggedInClient miner = login_client(
+            stratum_port, {}, "runtime-verified-test/1");
+        const Json &login_result = miner.response.at("result");
+        const std::string connection_id =
+            login_result.at("id").get<std::string>();
+        job_id = login_result.at("job").at("job_id").get<std::string>();
+        const Json submit = {
+            {"id", "verified-mismatch"},
+            {"jsonrpc", "2.0"},
+            {"method", "submit"},
+            {"params", {{"id", connection_id}, {"job_id", job_id},
+                        {"nonce", "0a0b0c0d"}, {"result", claimed_hash},
+                        {"algo", "rx/0"}}},
+        };
+        send_all(miner.socket.get(), submit.dump() + "\n");
+        const Json rejected = Json::parse(read_line(miner.socket.get()));
+        require(rejected.at("result").is_null() &&
+                    rejected.at("error").at("message") == "Invalid result",
+                "verified hash mismatch was not rejected explicitly");
+        miner.socket.reset();
+        runtime.stop();
+    }
+
+    std::size_t matching_completions = 0;
+    {
+        std::ifstream input(log_path);
+        require(static_cast<bool>(input),
+                "verified runtime JSONL log was not created");
+        std::string encoded;
+        while (std::getline(input, encoded)) {
+            const Json record = Json::parse(encoded);
+            if (record.at("code") != "share.completed") continue;
+            const Json &fields = record.at("fields");
+            if (fields.value("job_public_id", std::string{}) != job_id ||
+                fields.value("claimed_hash", std::string{}) != claimed_hash ||
+                fields.value("status", std::string{}) != "invalid_result") {
+                continue;
+            }
+            ++matching_completions;
+            require(fields.at("provenance") == "verified" &&
+                        fields.at("reason_code") == "hash_mismatch" &&
+                        fields.at("credited_difficulty") == "0",
+                    "verified completion classification fields are wrong");
+
+            const std::string actual =
+                fields.at("actual_difficulty").get<std::string>();
+            require(!actual.empty() && actual != "0" &&
+                        (actual.size() == 1U || actual.front() != '0') &&
+                        std::all_of(actual.begin(), actual.end(),
+                                    [](const char byte) {
+                                        return byte >= '0' && byte <= '9';
+                                    }),
+                    "verified completion actual difficulty is not canonical");
+            const std::string computed =
+                fields.at("computed_hash").get<std::string>();
+            require(computed.size() == 64U && computed != claimed_hash &&
+                        std::all_of(computed.begin(), computed.end(),
+                                    [](const char byte) {
+                                        return (byte >= '0' && byte <= '9') ||
+                                               (byte >= 'a' && byte <= 'f');
+                                    }),
+                    "verified completion computed hash is malformed");
+
+            for (const std::string_view name : {
+                     "connection_id", "job_id", "template_id", "share_id",
+                     "height", "duration_us", "verifier_queue_ns",
+                     "verifier_hash_ns", "verifier_total_ns"}) {
+                require(fields.at(name).is_number_unsigned(),
+                        "verified completion integer field is not unsigned");
+            }
+            require(fields.at("connection_id").get<std::uint64_t>() != 0U &&
+                        fields.at("job_id").get<std::uint64_t>() != 0U &&
+                        fields.at("template_id").get<std::uint64_t>() != 0U &&
+                        fields.at("share_id").get<std::uint64_t>() != 0U &&
+                        fields.at("height") == kHeight,
+                    "verified completion durable correlation IDs are wrong");
+            const auto queue_ns =
+                fields.at("verifier_queue_ns").get<std::uint64_t>();
+            const auto hash_ns =
+                fields.at("verifier_hash_ns").get<std::uint64_t>();
+            const auto total_ns =
+                fields.at("verifier_total_ns").get<std::uint64_t>();
+            require(hash_ns != 0U && total_ns >= hash_ns &&
+                        total_ns >= queue_ns,
+                    "verified completion timing fields are inconsistent");
+            require(!fields.contains("private_job_entropy"),
+                    "verified share completion leaked private job entropy");
+        }
+    }
+    require(matching_completions == 1U,
+            "verified mismatch completion JSONL record was not unique");
+    require(sqlite_scalar(database.path(),
+                          "SELECT count(*) FROM shares "
+                          "WHERE status='invalid_result' "
+                          "AND provenance='verified'") == 1,
+            "verified mismatch was not persisted exactly once");
+    require(sqlite_scalar(database.path(),
+                          "SELECT count(*) FROM candidates") == 0,
+            "verified noncandidate mismatch created a candidate");
+    require(daemon.calls("submitblock") == 0U,
+            "verified noncandidate mismatch reached submitblock");
+    if (const auto failure = daemon.failure(); failure.has_value()) {
+        throw std::runtime_error("mock daemon failure: " + *failure);
+    }
+}
+
 void test_runtime_end_to_end()
 {
     MockDaemon daemon;
@@ -635,15 +834,22 @@ void test_runtime_end_to_end()
     monero_solo::Config config = config_for(
         daemon, stratum_port, api_port, database.path());
     const std::string log_path = database.path().string() + ".jsonl";
-    const std::string configured_secret = "runtime-stratum-secret-1";
+    // Use the access secret itself as the miner-controlled agent. This both
+    // exercises NiceHash compact work and proves verbose logging records only
+    // a fixed compatibility profile, never the raw agent text.
+    const std::string configured_secret = "NiceHash/runtime-stratum-secret-1";
     {
         std::error_code ignored;
         (void)std::filesystem::remove(log_path, ignored);
     }
     config.logging.file = log_path;
+    config.logging.level = "debug";
     config.stratum.access_password = configured_secret;
 
     std::string first_job_id;
+    std::string second_job_id;
+    const std::string ordinary_claimed_hash =
+        std::string(48, 'f') + "feffffffffffffff";
     {
         monero_solo::Runtime runtime(config);
         runtime.start();
@@ -655,25 +861,25 @@ void test_runtime_end_to_end()
                     ready.document.at("data").at("height") == kHeight,
                 "runtime readiness API was not healthy");
 
-        LoggedInClient miner = login_client(stratum_port, configured_secret);
+        LoggedInClient miner = login_client(
+            stratum_port, configured_secret, configured_secret);
         const Json &login_result = miner.response.at("result");
         const Json &job = login_result.at("job");
         const std::string connection_id = login_result.at("id").get<std::string>();
         first_job_id = job.at("job_id").get<std::string>();
         require(connection_id.size() == 32U && first_job_id.size() == 32U &&
                     job.at("height") == kHeight && job.at("seed_hash") == kSeedHash &&
-                    job.at("target") == "ffffffffffffffff" &&
+                    job.at("target") == "ffffffff" &&
                     job.at("blob").get<std::string>() != kHashingBlob,
                 "runtime did not issue the expected private Stratum job");
 
-        const std::string claimed_hash =
-            std::string(48, 'f') + "feffffffffffffff";
         const Json submit = {
             {"id", "share-1"},
             {"jsonrpc", "2.0"},
             {"method", "submit"},
             {"params", {{"id", connection_id}, {"job_id", first_job_id},
-                        {"nonce", "01020304"}, {"result", claimed_hash},
+                        {"nonce", "01020304"},
+                        {"result", ordinary_claimed_hash},
                         {"algo", "rx/0"}}},
         };
         send_all(miner.socket.get(), submit.dump() + "\n");
@@ -689,7 +895,7 @@ void test_runtime_end_to_end()
         const Json &share = shares.document.at("data").at(0);
         require(share.at("status") == "accepted" &&
                     share.at("provenance") == "claimed" &&
-                    share.at("claimed_hash") == claimed_hash &&
+                    share.at("claimed_hash") == ordinary_claimed_hash &&
                     share.at("claimed_meets_share_target") == true &&
                     share.at("claimed_meets_network_target") == false &&
                     share.at("credited_difficulty") == "1",
@@ -725,6 +931,47 @@ void test_runtime_end_to_end()
         }
         require(daemon.calls("submitblock") == 1U,
                 "frozen-candidate replay created another daemon sequence");
+        for (unsigned attempt = 0; attempt < 200U &&
+                                   (runtime.ready() ||
+                                    sqlite_scalar(
+                                        database.path(),
+                                        "SELECT count(*) FROM rounds "
+                                        "WHERE state='closed'") != 1);
+             ++attempt) {
+            std::this_thread::sleep_for(5ms);
+        }
+        require(!runtime.ready() &&
+                    sqlite_scalar(database.path(),
+                                  "SELECT count(*) FROM rounds "
+                                  "WHERE state='closed'") == 1,
+                "accepted candidate did not activate the successor fence");
+
+        const Json fenced_submit = {
+            {"id", "post-acceptance-old-job"},
+            {"jsonrpc", "2.0"},
+            {"method", "submit"},
+            {"params", {{"id", connection_id}, {"job_id", first_job_id},
+                        {"nonce", "090a0b0c"},
+                        {"result", ordinary_claimed_hash},
+                        {"algo", "rx/0"}}},
+        };
+        send_all(miner.socket.get(), fenced_submit.dump() + "\n");
+        const Json fenced = Json::parse(read_line(miner.socket.get()));
+        require(fenced.at("result").is_null() &&
+                    fenced.at("error").at("message") == "Stale share",
+                "accepted-height fence admitted a prior-round job");
+        require(sqlite_scalar(
+                    database.path(),
+                    "SELECT count(*) FROM shares WHERE round_id=("
+                    "SELECT id FROM rounds WHERE state='open')") == 0,
+                "prior-round share contaminated the successor round");
+
+        daemon.publish_successor();
+        for (unsigned attempt = 0; attempt < 400U && !runtime.ready(); ++attempt) {
+            std::this_thread::sleep_for(5ms);
+        }
+        require(runtime.ready(),
+                "authoritative successor template did not release the fence");
         miner.socket.reset();
         runtime.stop();
         require(!runtime.running() && !runtime.ready(),
@@ -742,6 +989,7 @@ void test_runtime_end_to_end()
                           "WHERE closed_unix_us IS NULL") == 0,
             "clean shutdown left a connection active");
 
+    config.logging.include_private_job_entropy = true;
     {
         monero_solo::Runtime runtime(config);
         runtime.start();
@@ -752,14 +1000,20 @@ void test_runtime_end_to_end()
         require(recovered.status == 200 && recovered.document.at("data").size() == 2U &&
                     recovered.document.at("data").at(0).at("job_id") == first_job_id,
                 "persisted accepted share was not recovered after restart");
-        LoggedInClient miner = login_client(stratum_port, configured_secret);
-        require(miner.response.at("result").at("job").at("job_id") != first_job_id,
+        LoggedInClient miner = login_client(
+            stratum_port, configured_secret, configured_secret);
+        second_job_id = miner.response.at("result").at("job").at("job_id");
+        require(second_job_id != first_job_id,
                 "restart reused a private job identity");
         miner.socket.reset();
         runtime.stop();
     }
 
     std::set<std::string> log_codes;
+    bool saw_first_job = false;
+    bool saw_second_job = false;
+    bool saw_share_received = false;
+    bool saw_share_completed = false;
     {
         std::ifstream input(log_path);
         require(static_cast<bool>(input), "runtime JSONL log was not created");
@@ -775,15 +1029,63 @@ void test_runtime_end_to_end()
                         record.at("fields").is_object(),
                     "runtime JSONL log record has an invalid envelope");
             log_codes.insert(record.at("code").get<std::string>());
+            const std::string code = record.at("code").get<std::string>();
+            const Json &fields = record.at("fields");
+            if (code == "job.queued" &&
+                fields.value("job_public_id", std::string{}) == first_job_id) {
+                require(fields.at("target") == "ffffffff" &&
+                            fields.at("target_encoding") == "le32" &&
+                            fields.at("assigned_difficulty") == "1" &&
+                            fields.at("agent_profile") == "nicehash" &&
+                            !fields.contains("private_job_entropy"),
+                        "default debug job record did not match queued wire work");
+                saw_first_job = true;
+            }
+            if (code == "job.queued" &&
+                fields.value("job_public_id", std::string{}) == second_job_id) {
+                const std::string entropy =
+                    fields.at("private_job_entropy").get<std::string>();
+                require(entropy.size() == 32U &&
+                            std::all_of(entropy.begin(), entropy.end(),
+                                [](const char byte) {
+                                    return (byte >= '0' && byte <= '9') ||
+                                           (byte >= 'a' && byte <= 'f');
+                                }),
+                        "opt-in private job entropy record is malformed");
+                saw_second_job = true;
+            }
+            if (code == "share.received" &&
+                fields.value("claimed_hash", std::string{}) == ordinary_claimed_hash) {
+                require(fields.at("nonce") == "01020304" &&
+                            fields.at("job_public_id") == first_job_id &&
+                            fields.at("assigned_difficulty") == "1",
+                        "share admission debug record is not correlated");
+                saw_share_received = true;
+            }
+            if (code == "share.completed" &&
+                fields.value("claimed_hash", std::string{}) == ordinary_claimed_hash &&
+                fields.value("status", std::string{}) == "accepted") {
+                require(fields.at("provenance") == "claimed" &&
+                            fields.at("credited_difficulty") == "1" &&
+                            fields.at("job_public_id") == first_job_id,
+                        "share completion debug record is not correlated");
+                saw_share_completed = true;
+            }
         }
         require(complete_log.find(configured_secret) == std::string::npos,
                 "runtime JSONL log leaked a configured secret");
     }
+    require(saw_first_job && saw_second_job && saw_share_received &&
+                saw_share_completed,
+            "runtime JSONL omitted detailed job/share diagnostic records");
     for (const std::string_view code : {
              "runtime.starting", "verifier.disabled", "daemon.ready",
              "template.refreshed", "runtime.ready", "candidate.journaled",
              "candidate.attempt_started", "candidate.attempt_completed",
-             "candidate.terminal", "runtime.stopping", "runtime.stopped"}) {
+             "candidate.terminal", "connection.opened",
+             "connection.authenticated", "connection.closed", "job.queued",
+             "share.received", "share.completed", "runtime.stopping",
+             "runtime.stopped"}) {
         require(log_codes.contains(std::string(code)),
                 "runtime JSONL log omitted a required lifecycle code");
     }
@@ -800,8 +1102,8 @@ void test_runtime_end_to_end()
                           "WHERE clean_shutdown=1 AND stopped_unix_us IS NOT NULL") == 2,
             "clean shutdown was not persisted for both sessions");
     require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM public_templates") == 2,
-            "startup template was not durably persisted per session");
+                          "SELECT count(*) FROM public_templates") == 3,
+            "startup/successor templates were not durably persisted");
     require(sqlite_scalar(database.path(),
                           "SELECT count(*) FROM shares WHERE status='accepted' "
                           "AND provenance='claimed'") == 2,
@@ -867,7 +1169,7 @@ void test_runtime_end_to_end()
     require_missing_status_rejected("getblocktemplate", "missing-template-status");
 
     require(daemon.calls("get_info") == 5U &&
-                daemon.calls("getblocktemplate") == 4U,
+                daemon.calls("getblocktemplate") == 5U,
             "runtime startup did not use the expected daemon RPC sequence");
     if (const auto failure = daemon.failure(); failure.has_value()) {
         throw std::runtime_error("mock daemon failure: " + *failure);
@@ -880,6 +1182,7 @@ int main()
 {
     try {
         test_post_commit_job_rollback();
+        test_verified_share_debug_jsonl();
         test_runtime_end_to_end();
         std::cout << "runtime integration tests passed\n";
         return 0;

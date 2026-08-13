@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -78,6 +79,41 @@ std::int64_t scalar(const std::filesystem::path &path, const char *sql)
     sqlite3_finalize(statement);
     sqlite3_close(db);
     return result;
+}
+
+std::string scalar_text(const std::filesystem::path &path, const char *sql)
+{
+    sqlite3 *db = nullptr;
+    require(sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) ==
+                SQLITE_OK,
+            "could not open test database for text inspection");
+    sqlite3_stmt *statement = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &statement, nullptr) != SQLITE_OK) {
+        sqlite3_close(db);
+        throw std::runtime_error("could not prepare text inspection query");
+    }
+    require(sqlite3_step(statement) == SQLITE_ROW &&
+                sqlite3_column_type(statement, 0) == SQLITE_TEXT,
+            "text inspection query returned no text row");
+    const auto *value = reinterpret_cast<const char *>(
+        sqlite3_column_text(statement, 0));
+    const std::string result(value == nullptr ? "" : value);
+    sqlite3_finalize(statement);
+    sqlite3_close(db);
+    return result;
+}
+
+bool statement_rejected(const std::filesystem::path &path, const char *sql)
+{
+    sqlite3 *db = nullptr;
+    require(sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK,
+            "could not open test database for rejected-statement inspection");
+    char *message = nullptr;
+    const int result = sqlite3_exec(db, sql, nullptr, nullptr, &message);
+    sqlite3_free(message);
+    sqlite3_close(db);
+    return result != SQLITE_OK;
 }
 
 struct Fixture {
@@ -162,9 +198,36 @@ Fixture create_fixture(Database &database, std::int64_t now)
     };
 }
 
+std::int64_t create_job(Database &database, const Fixture &fixture,
+                        std::uint8_t tag, std::uint64_t height,
+                        std::string assigned_difficulty,
+                        std::string network_difficulty,
+                        std::int64_t now)
+{
+    PrivateJobInsert job;
+    job.public_job_id = bytes<16>(tag);
+    job.connection_id = fixture.connection_id;
+    job.template_id = fixture.template_id;
+    job.height = height;
+    job.entropy = bytes<16>(static_cast<std::uint8_t>(tag + 32U));
+    job.seed_hash = bytes<32>(80);
+    job.assigned_difficulty_dec = std::move(assigned_difficulty);
+    job.target64_le = bytes<8>(static_cast<std::uint8_t>(tag + 64U));
+    job.network_difficulty_dec = std::move(network_difficulty);
+    job.nonce_offset = 2;
+    job.reserved_offset = 8;
+    job.private_block_blob = {tag, 10, 11, 12};
+    job.hashing_blob = {tag, 13, 14, 15};
+    job.created_unix_us = now;
+    job.expires_unix_us = now + 120'000'000;
+    return database.insert_private_job(job);
+}
+
 std::int64_t create_share(Database &database, const Fixture &fixture,
                           std::uint64_t sequence, std::uint8_t nonce_last,
-                          bool claimed_candidate)
+                          bool claimed_candidate,
+                          std::string assigned_difficulty = "120",
+                          std::string network_difficulty = "1000000")
 {
     ShareInsert share;
     share.connection_id = fixture.connection_id;
@@ -176,8 +239,8 @@ std::int64_t create_share(Database &database, const Fixture &fixture,
     share.received_unix_us = 1'700'000'000'000'000 +
                              static_cast<std::int64_t>(sequence);
     share.nonce = std::array<std::uint8_t, 4>{0, 0, 0, nonce_last};
-    share.assigned_difficulty_dec = "120";
-    share.network_difficulty_dec = "1000000";
+    share.assigned_difficulty_dec = std::move(assigned_difficulty);
+    share.network_difficulty_dec = std::move(network_difficulty);
     share.claimed_candidate = claimed_candidate;
     share.status = "verifying";
     share.provenance = "pending";
@@ -219,7 +282,16 @@ void run_tests()
             .busy_timeout_ms = 2345,
             .blocknotify_enabled = true,
         });
-        require(database.schema_version() == 1, "schema version mismatch");
+        require(database.schema_version() == 2, "schema version mismatch");
+        require(scalar(path, "PRAGMA user_version") == 2,
+                "SQLite user_version was not bumped to 2");
+        require(scalar(path,
+                       "SELECT count(*) FROM sqlite_schema WHERE type='index' "
+                       "AND name IN ('shares_round_status',"
+                       "'shares_accepted_actual_difficulty_rank',"
+                       "'events_share_result_share',"
+                       "'events_share_result_round_share')") == 4,
+                "schema-v2 read indexes are incomplete");
         const DatabasePragmas pragmas = database.pragmas();
         require(pragmas.journal_mode == "wal", "WAL mode not active");
         require(pragmas.synchronous == "full", "FULL sync not active");
@@ -322,6 +394,32 @@ void run_tests()
         require(rates.five_minutes == "0",
                 "nominal five-minute denominator was not used");
 
+        const std::int64_t claimed_share =
+            create_share(database, fixture, 40, 40, false);
+        require(database.accept_share(claimed_share, now + 10'000'001, "120",
+                                      HashrateSource::claimed)
+                    .accepted,
+                "claimed-mode share was not accepted");
+        Fixture low_network_fixture = fixture;
+        low_network_fixture.job_id = create_job(
+            database, fixture, 10, 42, "120", "100", now + 3);
+        const std::int64_t over_effort_share =
+            create_share(database, low_network_fixture, 41, 41, false,
+                         "120", "100");
+        require(database.accept_share(over_effort_share, now + 10'000'002,
+                                      "120", HashrateSource::verified)
+                    .accepted,
+                "mixed-network-difficulty share was not accepted");
+        require(scalar(path,
+                       "SELECT count(*) FROM round_work_segments WHERE round_id=1") == 3,
+                "round work was not split by source and network difficulty");
+        require(scalar_text(
+                    path,
+                    "SELECT credited_difficulty_dec FROM round_work_segments "
+                    "WHERE round_id=1 AND source='verified' "
+                    "AND network_difficulty_dec='100'") == "120",
+                "greater-than-100-percent effort segment was not exact");
+
         DuplicateKey duplicate = bytes<48>(11);
         const auto reservation = database.reserve_duplicate(
             duplicate, 42, ordinary_share, DuplicateRole::claimed,
@@ -383,6 +481,41 @@ void run_tests()
                 "daemon OK did not accept candidate");
         require(database.current_open_round_id() != original_round,
                 "candidate acceptance did not advance the round");
+        require(scalar(path,
+                       "SELECT count(*) FROM rounds WHERE id=1 AND state='closed' "
+                       "AND effort_finalized_unix_us IS NULL") == 1,
+                "round effort finalized before its pending shares drained");
+        require(database.accept_share(block_share, now + 41, "120",
+                                      HashrateSource::verified)
+                    .round_id == original_round,
+                "late candidate share leaked into the successor round");
+        require(database.finalize_share(attached_share, ShareFinalization{
+                    .status = "invalid_result",
+                    .provenance = "verified",
+                    .completed_unix_us = now + 42,
+                    .error_code = "test_terminal",
+                    .error_message = "test pending-share drain",
+                }),
+                "pending attached share did not finalize");
+        require(scalar(path,
+                       "SELECT count(*) FROM rounds WHERE id=1 "
+                       "AND effort_finalized_unix_us IS NOT NULL "
+                       "AND finalized_effort_segment_count=3") == 1,
+                "closed round effort did not freeze after pending shares drained");
+        require(scalar_text(
+                    path,
+                    "SELECT credited_difficulty_dec FROM rounds WHERE id=1") == "480",
+                "late accepted work was not retained in the origin round");
+        require(statement_rejected(
+                    path,
+                    "UPDATE round_work_segments SET credited_difficulty_dec='481' "
+                    "WHERE round_id=1 AND source='verified' "
+                    "AND network_difficulty_dec='1000000'"),
+                "finalized round work segment was mutable");
+        require(statement_rejected(
+                    path,
+                    "UPDATE shares SET round_id=2 WHERE id=1"),
+                "persisted share round attribution was mutable");
         require(!database.accept_candidate(accepted_candidate_id, now + 50,
                                            bytes<32>(240), false),
                 "candidate acceptance was not idempotent");
@@ -957,7 +1090,7 @@ void run_sibling_lock_test()
     }
     {
         Database successor(DatabaseOptions{.path = path.string()});
-        require(successor.schema_version() == 1,
+        require(successor.schema_version() == 2,
                 "database lock was not released with its owning instance");
     }
     remove_database(path);
@@ -1006,6 +1139,219 @@ void run_reconciliation_attempt_race_test()
                        "WHERE classification='explicit_rejection'") == 1,
                 "late attempt evidence was not closed durably");
     }
+    remove_database(path);
+}
+
+void run_candidate_round_boundary_test()
+{
+    constexpr std::int64_t now = 1'700'250'000'000'000;
+    const auto contamination_path = std::filesystem::path(
+        test_database_path().string() + "-height-contamination");
+    remove_database(contamination_path);
+    {
+        Database database(DatabaseOptions{.path = contamination_path.string()});
+        const Fixture fixture = create_fixture(database, now);
+        const std::int64_t candidate_share =
+            create_share(database, fixture, 1, 1, true);
+        const auto candidate = database.journal_candidate(
+            make_candidate(fixture, candidate_share, 22, 1, now + 1));
+        require(database.start_candidate_attempt(candidate.candidate_id, 1, 800,
+                                                 now + 2) > 0,
+                "contamination candidate attempt did not start");
+
+        Fixture higher = fixture;
+        higher.job_id = create_job(
+            database, fixture, 12, 43, "120", "1000000", now + 3);
+        (void)create_share(database, higher, 2, 2, false);
+
+        CandidateAttemptCompletion accepted;
+        accepted.classification = CandidateAttemptClassification::accepted;
+        accepted.completed_unix_us = now + 4;
+        accepted.http_status = 200;
+        accepted.daemon_status = "OK";
+        bool rejected = false;
+        try {
+            (void)database.finish_candidate_attempt(
+                candidate.candidate_id, 1, accepted);
+        }
+        catch (const DatabaseError &error) {
+            rejected = std::string_view(error.what()).find("higher-height") !=
+                       std::string_view::npos;
+        }
+        require(rejected,
+                "candidate acceptance ignored higher-height round contamination");
+        require(scalar(contamination_path,
+                       "SELECT count(*) FROM rounds WHERE state='open'") == 1 &&
+                    scalar(contamination_path,
+                       "SELECT count(*) FROM rounds WHERE state='closed'") == 0 &&
+                    scalar(contamination_path,
+                       "SELECT count(*) FROM candidate_attempts "
+                       "WHERE classification='dispatching'") == 1,
+                "failed-closed contamination check did not roll back atomically");
+    }
+    remove_database(contamination_path);
+
+    const auto origin_path = std::filesystem::path(
+        test_database_path().string() + "-origin-round");
+    remove_database(origin_path);
+    {
+        Database database(DatabaseOptions{.path = origin_path.string()});
+        const Fixture fixture = create_fixture(database, now);
+        const auto winner = database.journal_candidate(make_candidate(
+            fixture, create_share(database, fixture, 1, 1, true),
+            32, 1, now + 1));
+        const auto late = database.journal_candidate(make_candidate(
+            fixture, create_share(database, fixture, 2, 2, true),
+            52, 1, now + 1));
+        require(database.start_candidate_attempt(winner.candidate_id, 1, 810,
+                                                 now + 2) > 0 &&
+                    database.start_candidate_attempt(late.candidate_id, 1, 811,
+                                                     now + 2) > 0,
+                "parallel origin-round attempts did not start");
+
+        CandidateAttemptCompletion accepted;
+        accepted.classification = CandidateAttemptClassification::accepted;
+        accepted.completed_unix_us = now + 3;
+        accepted.http_status = 200;
+        accepted.daemon_status = "OK";
+        require(database.finish_candidate_attempt(winner.candidate_id, 1, accepted)
+                    .state == CandidateState::accepted,
+                "origin-round winner was not accepted");
+        require(database.latest_accepted_height() == 42U,
+                "latest durable accepted height was not recoverable");
+        bool rejected = false;
+        accepted.completed_unix_us = now + 4;
+        try {
+            (void)database.finish_candidate_attempt(late.candidate_id, 1,
+                                                    accepted);
+        }
+        catch (const DatabaseError &error) {
+            rejected = std::string_view(error.what()).find("origin round") !=
+                       std::string_view::npos;
+        }
+        require(rejected,
+                "late candidate from a closed round closed its successor");
+        require(scalar(origin_path,
+                       "SELECT count(*) FROM rounds WHERE state='closed'") == 1 &&
+                    scalar(origin_path,
+                       "SELECT count(*) FROM rounds WHERE state='open'") == 1 &&
+                    scalar(origin_path,
+                       "SELECT count(*) FROM candidate_attempts "
+                       "WHERE candidate_id=2 AND classification='dispatching'") == 1,
+                "late origin-round acceptance was not rolled back atomically");
+    }
+    remove_database(origin_path);
+
+    const auto recovery_path = std::filesystem::path(
+        test_database_path().string() + "-round-finalization-recovery");
+    remove_database(recovery_path);
+    {
+        Database database(DatabaseOptions{.path = recovery_path.string()});
+        const Fixture fixture = create_fixture(database, now);
+        const std::int64_t share =
+            create_share(database, fixture, 1, 1, true);
+        const auto candidate = database.journal_candidate(
+            make_candidate(fixture, share, 72, 1, now + 1));
+        require(database.accept_candidate(candidate.candidate_id, now + 2,
+                                          bytes<32>(73), true),
+                "recovery round fixture did not close its origin round");
+        require(scalar(recovery_path,
+                       "SELECT count(*) FROM rounds WHERE state='closed' "
+                       "AND effort_finalized_unix_us IS NULL") == 1,
+                "recovery fixture did not retain its pending round effort");
+    }
+    {
+        Database database(DatabaseOptions{.path = recovery_path.string()});
+        require(database.latest_accepted_height() == 42U,
+                "restart lost the durable accepted-height fence");
+        (void)database.recover_interrupted_runtime(now + 1'000'000);
+        require(scalar(recovery_path,
+                       "SELECT count(*) FROM rounds WHERE state='closed' "
+                       "AND effort_finalized_unix_us IS NOT NULL "
+                       "AND finalized_effort_segment_count=0") == 1,
+                "startup recovery did not finalize a drained closed round");
+    }
+    remove_database(recovery_path);
+
+    const auto exhaustion_path = std::filesystem::path(
+        test_database_path().string() + "-candidate-exhaustion-recovery");
+    remove_database(exhaustion_path);
+    {
+        Database database(DatabaseOptions{.path = exhaustion_path.string()});
+        const Fixture fixture = create_fixture(database, now);
+        const std::int64_t share =
+            create_share(database, fixture, 1, 1, true);
+        const CandidateJournal journal =
+            make_candidate(fixture, share, 92, 1, now + 1);
+        const auto candidate = database.journal_candidate(journal);
+        require(database.start_candidate_attempt(candidate.candidate_id, 1, 900,
+                                                 now + 2) > 0,
+                "exhaustion recovery candidate attempt did not start");
+        CandidateAttemptCompletion indeterminate;
+        indeterminate.classification =
+            CandidateAttemptClassification::indeterminate;
+        indeterminate.completed_unix_us = now + 3;
+        require(database.finish_candidate_attempt(candidate.candidate_id, 1,
+                                                  indeterminate)
+                    .state == CandidateState::ambiguous,
+                "exhaustion recovery fixture did not become ambiguous");
+        require(database.exhaust_candidate_reconciliation(candidate.candidate_id,
+                                                          now + 4),
+                "ambiguous candidate was not marked reconciliation-exhausted");
+
+        const auto recoverable = database.recoverable_candidates();
+        require(std::any_of(recoverable.begin(), recoverable.end(),
+                            [&](const CandidateRecovery &row) {
+                                return row.candidate_id == candidate.candidate_id;
+                            }),
+                "reconciliation-exhausted candidate lost its startup boundary");
+        database.schedule_candidate_reconciliation(candidate.candidate_id,
+                                                   now + 5);
+        const auto restarted = database.start_candidate_reconciliation({
+            .candidate_id = candidate.candidate_id,
+            .cycle_number = 1,
+            .lookup_kind = ReconciliationLookupKind::expected_hash,
+            .rpc_request_id = 901,
+            .requested_block_id = journal.expected_block_id,
+            .started_unix_us = now + 5,
+        });
+        require(restarted.inserted && restarted.reconciliation_id > 0,
+                "startup could not resume authority checks for an exhausted candidate");
+        require(scalar(exhaustion_path,
+                       "SELECT count(*) FROM candidates "
+                       "WHERE reconciliation_exhausted_unix_us IS NOT NULL "
+                       "AND reconciliation_cycle_count=1") == 1,
+                "resumed exhausted candidate lost its durable safety evidence");
+    }
+    remove_database(exhaustion_path);
+}
+
+void run_schema_v1_rejection_test()
+{
+    const auto path = std::filesystem::path(test_database_path().string() +
+                                            "-schema-v1");
+    remove_database(path);
+    sqlite3 *raw = nullptr;
+    require(sqlite3_open_v2(path.c_str(), &raw,
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                            nullptr) == SQLITE_OK,
+            "could not create schema-v1 rejection fixture");
+    require(sqlite3_exec(
+                raw,
+                "CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
+                "INSERT INTO schema_meta VALUES('schema_version','1');",
+                nullptr, nullptr, nullptr) == SQLITE_OK,
+            "could not initialize schema-v1 rejection fixture");
+    sqlite3_close(raw);
+    bool rejected = false;
+    try {
+        Database database(DatabaseOptions{.path = path.string()});
+    }
+    catch (const DatabaseError &error) {
+        rejected = std::string_view(error.what()).find("clean schema v2") !=
+                   std::string_view::npos;
+    }
+    require(rejected, "schema v1 was not rejected with a clear clean-v2 error");
     remove_database(path);
 }
 
@@ -1177,6 +1523,8 @@ int main()
         run_symlink_rejection_test();
         run_sibling_lock_test();
         run_reconciliation_attempt_race_test();
+        run_candidate_round_boundary_test();
+        run_schema_v1_rejection_test();
         run_writer_scheduler_test();
         std::cout << "database tests passed\n";
         return 0;

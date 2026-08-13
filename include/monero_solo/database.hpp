@@ -468,6 +468,7 @@ public:
                         bool clean_shutdown);
     [[nodiscard]] std::int64_t ensure_open_round(std::int64_t opened_unix_us);
     [[nodiscard]] std::int64_t current_open_round_id() const;
+    [[nodiscard]] std::optional<std::uint64_t> latest_accepted_height() const;
 
     [[nodiscard]] std::int64_t insert_event(const EventInsert &event);
     [[nodiscard]] std::int64_t event_high_water_mark() const;

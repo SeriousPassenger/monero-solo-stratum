@@ -133,7 +133,7 @@ slower. At least two seeds are required for transitions. See `VERIFIER.md`.
 | `database.busy_timeout_ms` | 5,000 | 1..60,000 |
 | `database.max_writer_queue_items` | 100,000 | 1,024..10,000,000 |
 | `database.max_writer_queue_bytes` | 67,108,864 | 1,048,576..1,073,741,824 |
-| `database.retention_days` | 0 | Exactly 0 (unlimited) in v1 |
+| `database.retention_days` | 0 | Exactly 0 (unlimited) in this release |
 | `database.store_rejected_shares` | true | Boolean |
 
 Writer capacity must additionally cover
@@ -159,6 +159,9 @@ combinations fail static validation.
 | `api.request_rate_per_second` | 20 | 1..1,000,000 per peer IP |
 | `api.request_burst` | 40 | 1..1,000,000 per peer IP |
 | `api.max_pending_bytes_per_connection` | 2,097,152 | 4,096..67,108,864 |
+| `api.top_shares_limit` | 100 | 1..100; maximum/default rows in global and per-round actual-difficulty rankings |
+| `api.recent_high_shares_limit` | 100 | 1..100; maximum/default rows in the round-independent recent-high view |
+| `api.recent_high_share_min_difficulty` | 20,000,000,000 | 1..18,446,744,073,709,551,615; inclusive actual-difficulty threshold |
 
 The API token and Stratum password are unrelated. An unauthenticated API cannot
 request sensitive blob views even when it is loopback-only.
@@ -200,8 +203,9 @@ Absolute database/HTTP bounds remain.
 | --- | ---: | --- |
 | `level` | `info` | `error`, `warning`, `info`, `debug`, or `trace` |
 | `file` | null | Null/empty for stderr or an absolute nonsymlink path up to 4,096 bytes with a safe existing parent |
+| `include_private_job_entropy` | false | Boolean; true requires `level=debug|trace` and a nonempty absolute `file` |
 
-Both settings are startup-only. Every accepted record is one complete JSONL
+All three settings are startup-only. Every accepted record is one complete JSONL
 object with exactly `time`, `severity`, `code`, and `fields`. `time` is UTC
 RFC 3339 with six fractional digits; `code` is a stable internal token; and
 `fields` contains only closed, typed public-correlation keys. Severity
@@ -220,6 +224,15 @@ Passwords, API token, daemon password, entropy/DRBG state, RandomX seed key
 material, private blobs, and arbitrary exception text are never valid log
 fields. Operational records may contain the public payout address, redacted
 daemon endpoint, listener/ZMQ endpoint, fixed reason tokens, and bounded IDs.
+At debug/trace the runtime records committed connection, job, and share
+lifecycle correlation, target/difficulty/hash fields, verifier timings, and a
+fixed `standard`/`nicehash` agent compatibility profile. It never copies raw,
+miner-controlled agent text into JSONL.
+`include_private_job_entropy=true` additionally writes the exact 16-byte job
+entropy as 32 lowercase hex in `job.queued`; this is useful for a bounded test
+capture but creates another durable copy of reconstruction material. The
+dedicated typed field is rejected on stderr, below debug severity, or without
+the explicit setting.
 
 ## `blocknotify` command grammar
 

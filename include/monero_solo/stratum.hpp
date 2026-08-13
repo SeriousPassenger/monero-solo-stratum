@@ -33,7 +33,8 @@ struct StratumJob {
     std::string seed_hash;
     std::uint64_t height{};
     /* Called synchronously only after the complete job frame is queued. */
-    std::function<void()> on_queued;
+    std::function<void(std::string_view wire_target,
+                       std::string_view target_encoding)> on_queued;
     // Internal admission metadata; never emitted on the wire.
     std::string network_difficulty;
 };
@@ -46,6 +47,8 @@ struct MinerConnection {
     std::string login;
     std::string rigid;
     std::string agent;
+    // Effective work difficulty. Compact-target clients may require this to
+    // be quantized to the exact difficulty representable by their wire target.
     std::uint64_t assigned_difficulty{};
     std::uint64_t last_sent_height{};
     std::uint64_t request_sequence{};

@@ -25,6 +25,8 @@ using monero_solo::logging::Logger;
 using monero_solo::logging::PublicStringField;
 using monero_solo::logging::PublicStringKey;
 using monero_solo::logging::Severity;
+using monero_solo::logging::SensitiveHexField;
+using monero_solo::logging::SensitiveHexKey;
 using Json = nlohmann::json;
 
 void require(const bool condition, const char *message)
@@ -260,7 +262,11 @@ void test_bounded_rejection()
                 {IntegerKey::duration_us, 11}, {IntegerKey::count, 12},
                 {IntegerKey::bytes, 13}, {IntegerKey::queue_items, 14},
                 {IntegerKey::queue_bytes, 15}, {IntegerKey::error_number, 16},
-                {IntegerKey::exit_code, 17}});
+                {IntegerKey::exit_code, 17}, {IntegerKey::signal_number, 18},
+                {IntegerKey::difficulty, 19}, {IntegerKey::generation, 20},
+                {IntegerKey::seed_id, 21}, {IntegerKey::thread_index, 22},
+                {IntegerKey::sequence, 23}, {IntegerKey::listener_count, 24},
+                {IntegerKey::reconciliation_id, 25}});
     logger.log(static_cast<Severity>(255), "invalid.severity");
     logger.log(Severity::trace, "valid.record", {},
                {{IntegerKey::count, std::numeric_limits<std::uint64_t>::max()}});
@@ -368,6 +374,56 @@ void test_concurrent_records()
     require(identities.size() == expected, "concurrent record identity was duplicated");
 }
 
+void test_sensitive_file_gate_and_distinct_job_ids()
+{
+    TemporaryDirectory directory;
+    const std::string path = directory.file("sensitive.jsonl");
+
+    rejects_construction(
+        [] { Logger logger(Severity::debug, std::nullopt, true); },
+        "sensitive stderr logger was accepted");
+    rejects_construction(
+        [&] { Logger logger(Severity::info, path, true); },
+        "sensitive info logger was accepted");
+
+    Logger denied(Severity::debug, path);
+    denied.log(Severity::debug, "job.denied", {}, {},
+               {{SensitiveHexKey::private_job_entropy,
+                 "0123456789abcdef0123456789abcdef"}});
+    require(denied.rejected_records() == 1,
+            "sensitive field was accepted without the construction gate");
+
+    Logger allowed(Severity::debug, path, true);
+    allowed.log(Severity::info, "job.info", {}, {},
+                {{SensitiveHexKey::private_job_entropy,
+                  "abcdef0123456789abcdef0123456789"}});
+    allowed.log(
+        Severity::debug, "job.queued",
+        {{PublicStringKey::job_public_id,
+          "0123456789abcdef0123456789abcdef"}},
+        {{IntegerKey::job_id, 42}},
+        {{SensitiveHexKey::private_job_entropy,
+          "abcdef0123456789abcdef0123456789"}});
+    allowed.log(Severity::debug, "job.uppercase", {}, {},
+                {{SensitiveHexKey::private_job_entropy,
+                  "ABCDEF0123456789abcdef0123456789"}});
+    allowed.log(Severity::debug, "job.short", {}, {},
+                {{SensitiveHexKey::private_job_entropy, "00"}});
+    require(allowed.written_records() == 1 &&
+                allowed.rejected_records() == 3,
+            "sensitive hex validation counts are wrong");
+
+    const auto lines = read_lines(path);
+    require(lines.size() == 1, "unexpected sensitive log record count");
+    const Json fields = Json::parse(lines.front()).at("fields");
+    require(fields.at("job_public_id") ==
+                "0123456789abcdef0123456789abcdef" &&
+                fields.at("job_id") == 42 &&
+                fields.at("private_job_entropy") ==
+                    "abcdef0123456789abcdef0123456789",
+            "sensitive or distinct job fields did not round-trip");
+}
+
 } // namespace
 
 int main()
@@ -378,6 +434,7 @@ int main()
         test_path_safety();
         test_stderr_and_failure_accounting();
         test_concurrent_records();
+        test_sensitive_file_gate_and_distinct_job_ids();
         std::cout << "logger tests passed\n";
         return 0;
     } catch (const std::exception &error) {

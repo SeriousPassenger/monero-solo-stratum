@@ -573,6 +573,7 @@ void test_stratum() {
     const std::string connection_id = logged_in["result"]["id"];
     const std::string job_id = logged_in["result"]["job"]["job_id"];
     require(connection_id.size() == 32 && logged_in["result"]["job"]["height"] == 42 &&
+                logged_in["result"]["job"]["target"] == "ffffffffffffff7f" &&
                 logged_in["result"]["extensions"] == Json::array({"algo", "keepalive"}),
             "simple-mode login response schema was wrong");
     require(Json::parse(read_line(client))["error"]["message"] == "Already authenticated",
@@ -600,6 +601,113 @@ void test_stratum() {
     server.stop();
     require(opened == 2 && authenticated == 1 && stopped == 1,
             "Stratum shutdown did not close and report the live connection");
+    close(client);
+}
+
+void test_nicehash_compact_target_simple_mode() {
+    const std::uint16_t port = unused_tcp_port();
+    monero_solo::StratumServerConfig config;
+    config.listen = {"127.0.0.1:" + std::to_string(port)};
+    config.difficulty_floor = 262144;
+    config.login_timeout_ms = 3000;
+    config.idle_timeout_ms = 5000;
+    monero_solo::StratumServer server(
+        config,
+        [](const monero_solo::MinerConnection &connection)
+            -> std::optional<monero_solo::StratumJob> {
+            require(connection.agent == "rental-client nIcEhAsH/1.0.0",
+                    "NiceHash agent was not preserved for job negotiation");
+            require(connection.assigned_difficulty == 262160,
+                    "NiceHash difficulty was not aligned with compact target");
+            return monero_solo::StratumJob{
+                std::string(152, 'a'), std::string(32, 'b'),
+                "f0ff0300ff3f0000", std::string(64, 'c'), 42, {},
+                "1000000000"};
+        },
+        [](const monero_solo::StratumSubmission &submission) {
+            require(submission.connection.assigned_difficulty == 262160,
+                    "NiceHash submit lost effective assigned difficulty");
+            require(std::all_of(submission.nonce.begin(),
+                                submission.nonce.end(),
+                                [](std::uint8_t byte) {
+                                    return byte == 0xffU;
+                                }),
+                    "NiceHash simple mode reserved or rewrote a nonce byte");
+            return monero_solo::ShareResponse{
+                monero_solo::ShareDisposition::accepted, "ok"};
+        });
+    server.start();
+
+    const int client = connect_tcp(port);
+    send_all(client,
+             "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"login\","
+             "\"params\":{\"login\":\"rental\",\"pass\":\"x\","
+             "\"agent\":\"rental-client nIcEhAsH/1.0.0\"}}\n");
+    const Json login = Json::parse(read_line(client));
+    require(login["result"]["job"]["blob"] == std::string(152, 'a') &&
+                login["result"]["job"]["target"] == "ff3f0000" &&
+                login["result"]["extensions"] ==
+                    Json::array({"algo", "keepalive"}),
+            "NiceHash login job did not use compact-target simple mode");
+
+    const std::string connection_id = login["result"]["id"];
+    const std::string job_id = login["result"]["job"]["job_id"];
+    const std::string submit =
+        "{\"id\":2,\"jsonrpc\":\"2.0\",\"method\":\"submit\","
+        "\"params\":{\"id\":\"" + connection_id +
+        "\",\"job_id\":\"" + job_id +
+        "\",\"nonce\":\"ffffffff\",\"result\":\"" +
+        std::string(64, 'd') + "\",\"algo\":\"rx/0\"}}\n";
+    send_all(client, submit);
+    require(Json::parse(read_line(client))["result"]["status"] == "OK",
+            "NiceHash simple-mode nonce was not accepted intact");
+
+    server.refresh_jobs();
+    const Json refreshed = Json::parse(read_line(client));
+    require(refreshed["method"] == "job" &&
+                refreshed["params"]["target"] == "ff3f0000",
+            "NiceHash refresh did not retain compact target encoding");
+
+    server.stop();
+    close(client);
+}
+
+void test_nicehash_unrepresentable_difficulty_is_explicit()
+{
+    const std::uint16_t port = unused_tcp_port();
+    monero_solo::StratumServerConfig config;
+    config.listen = {"127.0.0.1:" + std::to_string(port)};
+    config.difficulty_floor =
+        static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) +
+        1U;
+    config.login_timeout_ms = 3000;
+    config.idle_timeout_ms = 5000;
+    std::atomic<unsigned> provider_calls{};
+    monero_solo::StratumServer server(
+        config,
+        [&](const monero_solo::MinerConnection &)
+            -> std::optional<monero_solo::StratumJob> {
+            ++provider_calls;
+            return std::nullopt;
+        },
+        [](const monero_solo::StratumSubmission &) {
+            return monero_solo::ShareResponse{
+                monero_solo::ShareDisposition::server_busy, "unexpected"};
+        });
+    server.start();
+
+    const int client = connect_tcp(port);
+    send_all(client,
+             "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"login\","
+             "\"params\":{\"login\":\"rental\",\"pass\":\"x\","
+             "\"agent\":\"NiceHash/1.0.0\"}}\n");
+    const Json login = Json::parse(read_line(client));
+    require(login["result"].is_null() &&
+                login["error"]["message"] ==
+                    "NiceHash difficulty is not representable" &&
+                provider_calls.load() == 0U,
+            "unrepresentable NiceHash difficulty queued invalid work");
+    server.stop();
     close(client);
 }
 
@@ -1077,6 +1185,8 @@ int main(int argc, char **argv) {
         test_duplicate_registry();
         test_defense();
         test_stratum();
+        test_nicehash_compact_target_simple_mode();
+        test_nicehash_unrepresentable_difficulty_is_explicit();
         test_stratum_fatal_event_supervision();
         test_stratum_submit_admission();
         test_event_stream();

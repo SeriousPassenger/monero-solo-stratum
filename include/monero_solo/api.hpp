@@ -28,6 +28,8 @@ enum class ApiCollection {
     templates,
     jobs,
     shares,
+    top_shares,
+    recent_high_shares,
     hashes,
     submissions,
     rounds,
@@ -90,7 +92,7 @@ struct ApiDetailRequest {
 
 /*
  * Runtime/database readers implement this interface. It deliberately carries
- * already-shaped JSON records because Database v1 exposes mutation primitives
+ * already-shaped JSON records because Database exposes mutation primitives
  * and a few aggregates, but no general read-only row API. ApiService still
  * owns routing, authentication, strict query validation, exact envelopes,
  * cursor binding, limits, sensitive-view admission, and HTTP errors.
@@ -98,7 +100,8 @@ struct ApiDetailRequest {
  * Each callback may execute concurrently on HttpServer worker threads and
  * must therefore provide its own snapshot/thread-safety guarantees. Returned
  * singleton/detail values must be JSON objects. Collection rows must be an
- * array of at most request.limit records, ordered by increasing database ID.
+ * array of at most request.limit records, ordered by increasing database ID
+ * except for the explicitly bounded top/recent-high share rankings.
  */
 struct ApiDataSource {
     std::function<ApiReadinessSnapshot()> readiness;
@@ -109,6 +112,7 @@ struct ApiDataSource {
 
 struct SqliteApiDataSourceOptions {
     DatabaseOptions database;
+    ApiConfig api;
     HashrateSource active_hashrate_source{HashrateSource::verified};
     /*
      * Live callbacks supply readiness, daemon/verifier snapshots, and the

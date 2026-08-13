@@ -253,14 +253,15 @@ cp -a -- third_party/nlohmann-json/CMakeLists.txt \
 cp -a -- third_party/nlohmann-json/LICENSES/Apache-2.0.txt \
     "$stage_root/third_party/nlohmann-json/LICENSES/"
 
-# Normalize modes independently of the checkout's umask. Only the release
-# tooling itself needs an executable bit in the source distribution.
+# Normalize modes independently of the checkout's umask. Only the release and
+# operator command-line tools need an executable bit in the source distribution.
 find "$stage_root" -type d -exec chmod 0755 {} +
 find "$stage_root" -type f -exec chmod 0644 {} +
 chmod 0755 \
     "$stage_root/scripts/make-source-archive.sh" \
     "$stage_root/scripts/test-source-archive.sh" \
-    "$stage_root/scripts/verify-source-archive.py"
+    "$stage_root/scripts/verify-source-archive.py" \
+    "$stage_root/scripts/watch-status.sh"
 
 # SHA256SUMS intentionally excludes itself. Paths are relative to the archive
 # root, byte-sorted, printable ASCII, and therefore unambiguous to the bundled

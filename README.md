@@ -156,7 +156,14 @@ event socket broadcasts committed records as NDJSON. For example:
 ```sh
 curl --fail --silent --show-error http://127.0.0.1:8787/v1/summary
 socat - UNIX-CONNECT:/tmp/monero-solo-stratum-events.sock
+./scripts/watch-status.sh
 ```
+
+`watch-status.sh` renders the live 1-minute/5-minute/1-hour hashrate, current
+round effort, share/candidate counters, top shares, recent high-difficulty
+shares, and persistence pressure. Set `MSS_SNAPSHOT_FILE` to append the raw API
+responses as NDJSON during a long test. Installed builds provide the same tool
+as `mss-watch-status`. The monitor requires `curl` and `jq`.
 
 ## Security and scope
 
@@ -168,10 +175,13 @@ consensus authority. Trusted mode is intended only for an operator-controlled
 network.
 
 The server intentionally has no TLS listener, dashboard, wallet accounting,
-pool failover, vardiff, self-select mining, NiceHash mode, hot reload, or
-administrative HTTP mutations. Put a carefully configured TCP/TLS proxy in
-front if transport encryption is required; proxy-address trust is not built
-in. Review [docs/SECURITY.md](docs/SECURITY.md) before exposing a listener.
+pool failover, vardiff, self-select mining, NiceHash nonce-splitting mode, hot
+reload, or administrative HTTP mutations. It does provide the narrow legacy
+four-byte target encoding required by a NiceHash RandomXMonero client while
+preserving ordinary CryptoNote simple mode and all four nonce bytes. Put a
+carefully configured TCP/TLS proxy in front if transport encryption is
+required; proxy-address trust is not built in. Review
+[docs/SECURITY.md](docs/SECURITY.md) before exposing a listener.
 
 ## Documentation
 

@@ -508,7 +508,9 @@ void validate_rpc_url(std::string_view url)
 
     const Json &api = root.at("api");
     keys(api, "api", {"enabled", "listen", "access_token", "max_page_size", "max_connections",
-                       "request_rate_per_second", "request_burst", "max_pending_bytes_per_connection"},
+                       "request_rate_per_second", "request_burst", "max_pending_bytes_per_connection",
+                       "top_shares_limit", "recent_high_shares_limit",
+                       "recent_high_share_min_difficulty"},
          {"enabled"});
     result.api.enabled = boolean(api, "enabled", true, "api");
     result.api.listen = string(api, "listen", result.api.listen, 4096, "api");
@@ -520,6 +522,11 @@ void validate_rpc_url(std::string_view url)
     result.api.request_rate_per_second = integer(api, "request_rate_per_second", 20, 1, 1000000, "api");
     result.api.request_burst = integer(api, "request_burst", 40, 1, 1000000, "api");
     result.api.max_pending_bytes_per_connection = integer(api, "max_pending_bytes_per_connection", 2097152, 4096, 67108864, "api");
+    result.api.top_shares_limit = integer(api, "top_shares_limit", 100, 1, 100, "api");
+    result.api.recent_high_shares_limit = integer(api, "recent_high_shares_limit", 100, 1, 100, "api");
+    result.api.recent_high_share_min_difficulty = integer(
+        api, "recent_high_share_min_difficulty", 20000000000ULL, 1,
+        std::numeric_limits<std::uint64_t>::max(), "api");
 
     const Json &defense = root.at("defense");
     keys(defense, "defense",
@@ -589,13 +596,25 @@ void validate_rpc_url(std::string_view url)
     }
 
     const Json &logging = root.at("logging");
-    keys(logging, "logging", {"level", "file"});
+    keys(logging, "logging", {"level", "file", "include_private_job_entropy"});
     result.logging.level = string(logging, "level", "info", 16, "logging");
     one_of(result.logging.level, "logging.level", {"error", "warning", "info", "debug", "trace"});
     result.logging.file = nullable_string(logging, "file", {}, 4096, "logging");
     if (result.logging.file && !result.logging.file->empty()) {
         if (options.validate_paths) validate_log_path(*result.logging.file);
         else if (result.logging.file->front() != '/') throw ValidationError("logging.file must be absolute");
+    }
+    result.logging.include_private_job_entropy = boolean(
+        logging, "include_private_job_entropy", false, "logging");
+    if (result.logging.include_private_job_entropy &&
+        (result.logging.level != "debug" && result.logging.level != "trace")) {
+        throw ValidationError(
+            "logging.include_private_job_entropy requires debug or trace level");
+    }
+    if (result.logging.include_private_job_entropy &&
+        (!result.logging.file || result.logging.file->empty())) {
+        throw ValidationError(
+            "logging.include_private_job_entropy requires a log file");
     }
 
     {
