@@ -265,13 +265,37 @@ case "$color_mode" in
         ;;
 esac
 
-curl_args=(--fail --silent --show-error --max-time 10)
+curl_common_args=(--silent --show-error --max-time 10)
 if [[ -n "$api_token" ]]; then
-    curl_args+=(-H "Authorization: Bearer $api_token")
+    curl_common_args+=(-H "Authorization: Bearer $api_token")
 fi
+curl_args=(--fail "${curl_common_args[@]}")
 
 fetch() {
     curl "${curl_args[@]}" "$api_url$1"
+}
+
+fetch_readiness() {
+    local response status body
+
+    # /v1/health/ready deliberately returns the normal success envelope with
+    # HTTP 503 while one or more components are not ready.  Do not use
+    # curl --fail for this endpoint; accept only the two documented statuses
+    # and require the readiness boolean before returning the body.
+    if ! response="$(curl "${curl_common_args[@]}" \
+        --write-out $'\n%{http_code}' "$api_url/v1/health/ready")"
+    then
+        return 1
+    fi
+    status="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+    [[ "$status" == 200 || "$status" == 503 ]] || return 1
+    jq -e '
+        (type == "object") and
+        (.data | type == "object") and
+        (.data.ready | type == "boolean")
+    ' <<<"$body" >/dev/null || return 1
+    printf '%s\n' "$body"
 }
 
 while :; do
@@ -297,7 +321,7 @@ while :; do
         top_path="/v1/shares/top?round_id=$round_id"
     fi
 
-    if ! ready="$(fetch /v1/health/ready)" ||
+    if ! ready="$(fetch_readiness)" ||
        ! verifier="$(fetch /v1/verifier)" ||
        ! persistence="$(fetch /v1/persistence)" ||
        { [[ -n "$top_path" ]] && ! top="$(fetch "$top_path")"; } ||

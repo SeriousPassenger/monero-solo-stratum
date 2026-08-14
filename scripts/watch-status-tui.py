@@ -1158,6 +1158,18 @@ class StatusCollector:
         ready = self._api_get("/v1/health/ready", errors)
         verifier = self._api_get("/v1/verifier", errors)
         persistence = self._api_get("/v1/persistence", errors)
+        cache = getattr(self, "last_api", None)
+        if cache is None:
+            cache = {}
+            self.last_api = cache
+        previous_top_path = getattr(self, "last_top_path", None)
+        if previous_top_path is not None and previous_top_path != top_path:
+            # The round ID is part of this endpoint's identity.  Retain at
+            # most the current round so a long-running monitor cannot grow
+            # one cached response per round, and never show the prior round's
+            # top shares when the first request for a new round fails.
+            cache.pop(previous_top_path, None)
+        self.last_top_path = top_path
         top = self._api_get(top_path, errors)
         high = self._api_get("/v1/shares/recent-high", errors)
         try:
