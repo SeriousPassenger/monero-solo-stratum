@@ -15,7 +15,19 @@ readonly curl_log="$fixture_dir/curl.log"
 
 curl() {
     local url="${!#}"
-    printf '%s\n' "$*" >>"$WATCH_CURL_LOG"
+    local request="$*"
+    local fail_on_http=false
+    local write_http_status=false
+    local status=200
+    local body=""
+    printf '%s\n' "${request//$'\n'/\\n}" >>"$WATCH_CURL_LOG"
+
+    for argument in "$@"; do
+        case "$argument" in
+            --fail) fail_on_http=true ;;
+            *'%{http_code}'*) write_http_status=true ;;
+        esac
+    done
 
     [[ "$url" == http://fixture.invalid/* ]] || return 98
     [[ "$url" != *'limit=5'* ]] || return 99
@@ -27,28 +39,35 @@ curl() {
 
     case "$url" in
         */v1/summary)
-            printf '%s\n' "{\"data\":{\"server\":{\"network\":\"regtest\",\"uptime_seconds\":90061},\"daemon\":{\"height\":2,\"rpc\":\"healthy\",\"zmq\":\"healthy\",\"template_id\":\"9\",\"template_generation\":\"4\"},\"connections\":{\"active\":3},\"workers\":{\"active\":3},\"hashrate\":{\"1m\":\"10800\",\"5m\":\"9000\",\"1h\":\"6000\",\"source\":\"verified\"},\"shares\":{\"accepted\":\"4\",\"total\":\"5\",\"stale\":\"1\",\"duplicate\":\"0\",\"low_difficulty\":\"0\",\"invalid_result\":\"0\"},\"round\":{\"id\":\"2\",\"state\":\"open\",\"accepted_share_count\":\"4\",\"estimated_hashes\":\"1048640\",\"effort\":{\"value\":\"${WATCH_EFFORT:-12.345678}\"}},\"candidates\":{\"accepted\":\"1\",\"total\":\"1\",\"active\":\"0\",\"ambiguous\":\"0\"}}}"
+            body="{\"data\":{\"server\":{\"network\":\"regtest\",\"uptime_seconds\":90061},\"daemon\":{\"height\":2,\"rpc\":\"healthy\",\"zmq\":\"healthy\",\"template_id\":\"9\",\"template_generation\":\"4\"},\"connections\":{\"active\":3},\"workers\":{\"active\":3},\"hashrate\":{\"1m\":\"10800\",\"5m\":\"9000\",\"1h\":\"6000\",\"source\":\"verified\"},\"shares\":{\"accepted\":\"4\",\"total\":\"5\",\"stale\":\"1\",\"duplicate\":\"0\",\"low_difficulty\":\"0\",\"invalid_result\":\"0\"},\"round\":{\"id\":\"2\",\"state\":\"open\",\"accepted_share_count\":\"4\",\"estimated_hashes\":\"1048640\",\"effort\":{\"value\":\"${WATCH_EFFORT:-12.345678}\"}},\"candidates\":{\"accepted\":\"1\",\"total\":\"1\",\"active\":\"0\",\"ambiguous\":\"0\"}}}"
             ;;
         */v1/health/ready)
-            printf '%s\n' '{"data":{"ready":true}}'
+            status="${WATCH_READY_HTTP_STATUS:-200}"
+            body="{\"data\":{\"ready\":${WATCH_READY_VALUE:-true}}}"
             ;;
         */v1/verifier)
-            printf '%s\n' '{"data":{"enabled":true,"provenance":"verified","configuration":{"memory_mode":"fast"},"stats":{"outstanding":"0","pending":0,"failed":"0"}}}'
+            body='{"data":{"enabled":true,"provenance":"verified","configuration":{"memory_mode":"fast"},"stats":{"outstanding":"0","pending":0,"failed":"0"}}}'
             ;;
         */v1/persistence)
-            printf '%s\n' '{"data":{"database_bytes":4096,"wal_bytes":512,"writer_queue_items":0,"unresolved_candidates":"0"}}'
+            body='{"data":{"database_bytes":4096,"wal_bytes":512,"writer_queue_items":0,"unresolved_candidates":"0"}}'
             ;;
         *'/v1/shares/top?round_id=2')
-            printf '%s\n' '{"data":[{"id":"5","actual_difficulty":"90000000000","worker_id":"2","round_id":"2","completed_at":"2026-08-13T09:23:40.123456Z"}]}'
+            body='{"data":[{"id":"5","actual_difficulty":"90000000000","worker_id":"2","round_id":"2","completed_at":"2026-08-13T09:23:40.123456Z"}]}'
             ;;
         */v1/shares/top*)
             return 96
             ;;
         */v1/shares/recent-high)
-            printf '%s\n' '{"data":[{"id":"4","actual_difficulty":"20000000000","worker_id":"1","round_id":"1","completed_at":"2026-08-13T08:01:02.000000Z"}]}'
+            body='{"data":[{"id":"4","actual_difficulty":"20000000000","worker_id":"1","round_id":"1","completed_at":"2026-08-13T08:01:02.000000Z"}]}'
             ;;
         *) return 95 ;;
     esac
+
+    printf '%s\n' "$body"
+    $write_http_status && printf '%s\n' "$status"
+    if $fail_on_http && ((status >= 400)); then
+        return 22
+    fi
 }
 export -f curl
 export WATCH_CURL_LOG="$curl_log"
@@ -101,6 +120,19 @@ jq -e '
     .top_shares.data[0].completed_at == "2026-08-13T09:23:40.123456Z" and
     (.recent_high_shares.data | type) == "array"
 ' "$snapshot" >/dev/null
+
+: >"$curl_log"
+WATCH_READY_HTTP_STATUS=503 WATCH_READY_VALUE=false WATCH_EXPECT_TOKEN=false \
+    "$watcher" \
+        --api-url http://fixture.invalid \
+        --color never \
+        --once \
+        --no-clear \
+        >"$output"
+grep -F 'NOT READY' "$output" >/dev/null
+ready_request="$(grep -F '/v1/health/ready' "$curl_log")"
+[[ "$ready_request" == *'--write-out'* ]]
+[[ "$ready_request" != *'--fail'* ]]
 
 : >"$curl_log"
 WATCH_EXPECT_TOKEN=false \

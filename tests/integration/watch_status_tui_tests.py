@@ -826,6 +826,75 @@ class StatusFormattingTests(unittest.TestCase):
         self.assertEqual(collector.host.calls, 1)
         self.assertIn("summary endpoint unavailable", snapshot.error or "")
 
+    def test_top_share_cache_stays_bounded_across_rounds(self) -> None:
+        class Api:
+            def __init__(self) -> None:
+                self.round_id = 0
+
+            def get(self, path: str) -> Dict[str, Any]:
+                if path == "/v1/summary":
+                    self.round_id += 1
+                    return {"data": {"round": {"id": str(self.round_id)}}}
+                if path.startswith("/v1/shares/top?"):
+                    return {"data": [{"round_id": str(self.round_id)}]}
+                return {"data": [] if "shares/" in path else {}}
+
+        class Monero:
+            def post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+                return {"result": {}}
+
+        class Host:
+            def collect(self) -> Dict[str, Any]:
+                return {}
+
+        collector = object.__new__(tui.StatusCollector)
+        collector.api = Api()
+        collector.monero = Monero()
+        collector.host = Host()
+        for _ in range(1_000):
+            collector.collect()
+
+        self.assertLessEqual(len(collector.last_api), 6)
+        top_paths = [path for path in collector.last_api
+                     if path.startswith("/v1/shares/top")]
+        self.assertEqual(top_paths,
+                         ["/v1/shares/top?round_id=1000"])
+
+    def test_new_round_top_failure_does_not_reuse_prior_round(self) -> None:
+        class Api:
+            def __init__(self) -> None:
+                self.round_id = 0
+
+            def get(self, path: str) -> Dict[str, Any]:
+                if path == "/v1/summary":
+                    self.round_id += 1
+                    return {"data": {"round": {"id": str(self.round_id)}}}
+                if path == "/v1/shares/top?round_id=1":
+                    return {"data": [{"round_id": "1"}]}
+                if path == "/v1/shares/top?round_id=2":
+                    raise OSError("new-round top unavailable")
+                return {"data": [] if "shares/" in path else {}}
+
+        class Monero:
+            def post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+                return {"result": {}}
+
+        class Host:
+            def collect(self) -> Dict[str, Any]:
+                return {}
+
+        collector = object.__new__(tui.StatusCollector)
+        collector.api = Api()
+        collector.monero = Monero()
+        collector.host = Host()
+        first = collector.collect()
+        second = collector.collect()
+
+        self.assertEqual(first.top["data"][0]["round_id"], "1")
+        self.assertEqual(second.top, {})
+        self.assertNotIn("/v1/shares/top?round_id=1", collector.last_api)
+        self.assertIn("new-round top unavailable", second.error or "")
+
     def test_api_failure_keeps_previous_snapshot_marked_stale(self) -> None:
         first = self.snapshot()
 
