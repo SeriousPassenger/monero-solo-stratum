@@ -409,8 +409,8 @@ This is the complete v1 example. It contains no dashboard setting by design.
     "log_level": "info"
   },
   "entropy": {
-    "reseed_interval_seconds": 1800,
-    "max_reseed_age_seconds": 1860,
+    "reseed_interval_seconds": 1200,
+    "max_reseed_age_seconds": 1260,
     "max_generate_calls": 1048576
   },
   "database": {
@@ -468,7 +468,8 @@ This is the complete v1 example. It contains no dashboard setting by design.
   },
   "logging": {
     "level": "info",
-    "file": null
+    "file": null,
+    "include_private_job_entropy": false
   }
 }
 ```
@@ -568,8 +569,8 @@ presented. Global/per-IP socket ceilings and subsequent defense checks remain.
 
 | Entropy/database key | Type and allowed value |
 | --- | --- |
-| `entropy.reseed_interval_seconds` | 1..86,400; default 1,800. |
-| `entropy.max_reseed_age_seconds` | `reseed_interval_seconds`..604,800; default 1,860. |
+| `entropy.reseed_interval_seconds` | 1..86,400; default 1,200. |
+| `entropy.max_reseed_age_seconds` | `reseed_interval_seconds`..604,800; default 1,260. |
 | `entropy.max_generate_calls` | 1..4,294,967,295; default 1,048,576. |
 | `database.path` | Required nonempty absolute path up to 4,096 bytes; parent must already exist, be a directory, and not be world-writable unless sticky and owned as securely as `/tmp`; database must not be a symlink. |
 | `database.busy_timeout_ms` | 1..60,000; default 5,000. |
@@ -614,6 +615,7 @@ presented. Global/per-IP socket ceilings and subsequent defense checks remain.
 | `verification_mismatch_window_seconds` | 1..86,400; default 600. |
 | `logging.level` | `error`, `warning`, `info`, `debug`, or `trace`; default `info`. |
 | `logging.file` | Null/empty for stderr or an absolute path up to 4,096 bytes; refuse symlinks and unsafe parent ownership. |
+| `logging.include_private_job_entropy` | Default false. At debug, true adds the 16-byte per-job template entropy to `job.queued`; trace includes it automatically. Either path requires a nonempty file. |
 
 All fields are validated even when their subsystem is disabled, preventing a
 misspelled/invalid setting from becoming active unnoticed later. Disabled
@@ -654,6 +656,11 @@ reseed material, and any future wallet secret MUST NOT appear in:
 Startup logs report only `stratum authentication: enabled/disabled`,
 `API authentication: enabled/disabled`, and `daemon authentication:
 enabled/disabled`.
+
+The 16-byte per-job template entropy is not OS seed or DRBG state. It is the
+single logging exception: trace automatically includes its 32-lowercase-hex
+encoding in a mode-0600 file, and debug may include it through
+`logging.include_private_job_entropy=true`. It is never valid on stderr.
 
 ### 6.4 Exact network and address mapping
 
@@ -772,7 +779,7 @@ operating-system facility such as Linux `getrandom(2)`, not
    `monero-solo-stratum/HMAC-DRBG-SHA256/v1`. The string adds separation, not
    claimed entropy.
 4. Serialize access to the state and never copy it into logs or persistence.
-5. Every 1,800 seconds, read a fresh independent 32-byte OS value and reseed.
+5. Every 1,200 seconds, read a fresh independent 32-byte OS value and reseed.
 6. Reseed earlier after `entropy.max_generate_calls` generate calls.
 7. Store the process ID; if it changes, treat this as a fork and require a
    fresh 32-byte OS reseed before returning any output in the child.
@@ -4208,6 +4215,12 @@ per-share IDs but not raw secrets, seed key bytes, full private blobs, or
 passwords. Full public block/share material is available through authenticated
 API detail endpoints and SQLite, not routine logs.
 
+Every verbose `job.queued` record carries `connection_public_id` and the
+independent `job_public_id`. Trace additionally carries
+`private_job_entropy`; debug carries it only when
+`logging.include_private_job_entropy=true`. This exception is file-only and
+never exposes OS entropy, reseed bytes, or DRBG state.
+
 ## 25. Required repository documentation and operator usage
 
 The implementation is incomplete until these files describe the behavior that
@@ -4337,7 +4350,7 @@ Use an injectable fake OS source for deterministic tests:
 - exactly 32 bytes requested at startup and each reseed;
 - startup failure is fatal;
 - known vectors for this exact HMAC-DRBG-derived construction;
-- reseed at exactly 1,800 configured seconds;
+- reseed at exactly 1,200 configured seconds;
 - count-triggered reseed before exceeding max calls;
 - PID change forces reseed before output;
 - timed failure permits old-state generation only before max age; count/fork
@@ -4785,7 +4798,7 @@ These are settled and MUST NOT be casually re-opened by the next agent:
   daemon outcome, intentionally superseding the reference branch's coupling;
 - global duplicate key is private entropy plus PoW hash;
 - frozen candidate fingerprint is a separate durable identity;
-- OS 256-bit startup entropy plus fresh 256-bit reseed every 30 minutes;
+- OS 256-bit startup entropy plus fresh 256-bit reseed every 20 minutes;
 - `access_password` null/empty means public Stratum; missing key is error;
 - raw H/s windows are 1m, 5m, 10m, 1h, 6h, and 24h;
 - SQLite persistence and rounds survive restart;

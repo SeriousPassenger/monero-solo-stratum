@@ -15,8 +15,8 @@
 namespace monero_solo {
 
 struct EntropyConfig {
-    std::uint32_t reseed_interval_seconds{1800};
-    std::uint32_t max_reseed_age_seconds{1860};
+    std::uint32_t reseed_interval_seconds{1200};
+    std::uint32_t max_reseed_age_seconds{1260};
     std::uint32_t max_generate_calls{1048576};
 };
 

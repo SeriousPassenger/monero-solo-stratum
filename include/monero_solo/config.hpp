@@ -64,8 +64,8 @@ struct VerifierConfig {
 };
 
 struct EntropySettings {
-    std::uint64_t reseed_interval_seconds{1800};
-    std::uint64_t max_reseed_age_seconds{1860};
+    std::uint64_t reseed_interval_seconds{1200};
+    std::uint64_t max_reseed_age_seconds{1260};
     std::uint64_t max_generate_calls{1048576};
 };
 

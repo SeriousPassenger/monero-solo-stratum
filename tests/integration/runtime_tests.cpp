@@ -629,6 +629,179 @@ void throw_after_job_commit()
     throw std::runtime_error("injected post-commit job handoff failure");
 }
 
+void test_same_height_poll_refresh()
+{
+    MockDaemon daemon;
+    TemporaryDatabase database("same-height-refresh");
+    const std::uint16_t stratum_port = unused_tcp_port();
+    std::uint16_t api_port = unused_tcp_port();
+    while (api_port == stratum_port) api_port = unused_tcp_port();
+    monero_solo::Config config = config_for(
+        daemon, stratum_port, api_port, database.path());
+    const std::string log_path = database.path().string() + ".jsonl";
+    config.daemon.poll_interval_ms = 1000;
+    config.logging.level = "trace";
+    config.logging.file = log_path;
+    config.logging.include_private_job_entropy = false;
+
+    std::string first_connection_id;
+    std::string second_connection_id;
+    std::string first_initial_job_id;
+    std::string second_initial_job_id;
+    std::string first_refreshed_job_id;
+    std::string second_refreshed_job_id;
+    std::string first_initial_blob;
+    std::string second_initial_blob;
+    std::string first_refreshed_blob;
+    std::string second_refreshed_blob;
+    {
+        monero_solo::Runtime runtime(config);
+        runtime.start();
+        require(runtime.running() && runtime.ready(),
+                "same-height runtime did not become ready");
+
+        LoggedInClient first = login_client(
+            stratum_port, {}, "same-height-first/1");
+        LoggedInClient second = login_client(
+            stratum_port, {}, "same-height-second/1");
+        const Json &first_result = first.response.at("result");
+        const Json &second_result = second.response.at("result");
+        first_connection_id = first_result.at("id").get<std::string>();
+        second_connection_id = second_result.at("id").get<std::string>();
+        first_initial_job_id =
+            first_result.at("job").at("job_id").get<std::string>();
+        second_initial_job_id =
+            second_result.at("job").at("job_id").get<std::string>();
+        first_initial_blob =
+            first_result.at("job").at("blob").get<std::string>();
+        second_initial_blob =
+            second_result.at("job").at("blob").get<std::string>();
+        require(first_connection_id != second_connection_id &&
+                    first_initial_job_id != second_initial_job_id &&
+                    first_initial_blob != second_initial_blob,
+                "initial per-connection work was not unique");
+
+        const auto read_job = [](const int descriptor) {
+            const Json notification = Json::parse(read_line(descriptor));
+            require(notification.value("method", std::string{}) == "job" &&
+                        notification.contains("params") &&
+                        notification.at("params").is_object(),
+                    "same-height poll did not send a job notification");
+            return notification.at("params");
+        };
+        const Json first_refreshed = read_job(first.socket.get());
+        const Json second_refreshed = read_job(second.socket.get());
+        first_refreshed_job_id =
+            first_refreshed.at("job_id").get<std::string>();
+        second_refreshed_job_id =
+            second_refreshed.at("job_id").get<std::string>();
+        first_refreshed_blob = first_refreshed.at("blob").get<std::string>();
+        second_refreshed_blob = second_refreshed.at("blob").get<std::string>();
+        require(first_refreshed.at("height") == kHeight &&
+                    second_refreshed.at("height") == kHeight &&
+                    first_refreshed_job_id != first_initial_job_id &&
+                    second_refreshed_job_id != second_initial_job_id &&
+                    first_refreshed_job_id != second_refreshed_job_id &&
+                    first_refreshed_blob != first_initial_blob &&
+                    second_refreshed_blob != second_initial_blob &&
+                    first_refreshed_blob != second_refreshed_blob,
+                "byte-identical same-height poll did not derive fresh work");
+
+        const std::string ordinary_claimed_hash =
+            std::string(48, 'f') + "feffffffffffffff";
+        const Json submit = {
+            {"id", "same-height-prior-job"},
+            {"jsonrpc", "2.0"},
+            {"method", "submit"},
+            {"params", {{"id", first_connection_id},
+                        {"job_id", first_initial_job_id},
+                        {"nonce", "01020304"},
+                        {"result", ordinary_claimed_hash},
+                        {"algo", "rx/0"}}},
+        };
+        send_all(first.socket.get(), submit.dump() + "\n");
+        Json accepted;
+        for (unsigned attempt = 0; attempt < 16U; ++attempt) {
+            Json message = Json::parse(read_line(first.socket.get()));
+            if (message.contains("id") && message.at("id").is_string() &&
+                message.at("id") == "same-height-prior-job") {
+                accepted = std::move(message);
+                break;
+            }
+            require(message.value("method", std::string{}) == "job",
+                    "unexpected Stratum frame before same-height response");
+        }
+        require(!accepted.is_null() && accepted.at("error").is_null() &&
+                    accepted.at("result").at("status") == "OK",
+                "prior same-height job was not retained as valid work");
+
+        first.socket.reset();
+        second.socket.reset();
+        runtime.stop();
+    }
+
+    require(daemon.calls("getblocktemplate") >= 2U,
+            "same-height fixture did not execute a polling refresh");
+    require(sqlite_scalar(
+                database.path(),
+                "SELECT count(*) FROM public_templates") >= 2,
+            "same-height polling did not persist another generation");
+    require(sqlite_scalar(
+                database.path(),
+                "SELECT count(DISTINCT height) FROM public_templates") == 1 &&
+                sqlite_scalar(
+                    database.path(),
+                    "SELECT count(DISTINCT blocktemplate_blob) "
+                    "FROM public_templates") == 1,
+            "same-height fixture did not remain byte-identical");
+    require(sqlite_scalar(
+                database.path(),
+                "SELECT count(*) FROM shares WHERE status='accepted' "
+                "AND height_is_older=0") == 1,
+            "prior same-height share was persisted as stale");
+
+    const std::map<std::string, std::string> expected_jobs{
+        {first_initial_job_id, first_connection_id},
+        {second_initial_job_id, second_connection_id},
+        {first_refreshed_job_id, first_connection_id},
+        {second_refreshed_job_id, second_connection_id},
+    };
+    require(expected_jobs.size() == 4U,
+            "same-height jobs reused a public identity");
+    std::set<std::string> seen_jobs;
+    std::set<std::string> seen_entropies;
+    std::ifstream input(log_path);
+    require(static_cast<bool>(input),
+            "same-height trace JSONL log was not created");
+    std::string encoded;
+    while (std::getline(input, encoded)) {
+        const Json record = Json::parse(encoded);
+        if (record.at("code") != "job.queued") continue;
+        const Json &fields = record.at("fields");
+        const std::string job_id = fields.at("job_public_id");
+        const auto expected = expected_jobs.find(job_id);
+        if (expected == expected_jobs.end()) continue;
+        const std::string entropy = fields.at("private_job_entropy");
+        require(fields.at("connection_public_id") == expected->second &&
+                    entropy.size() == 32U &&
+                    std::all_of(entropy.begin(), entropy.end(),
+                        [](const char byte) {
+                            return (byte >= '0' && byte <= '9') ||
+                                   (byte >= 'a' && byte <= 'f');
+                        }),
+                "trace job correlation fields were malformed");
+        require(seen_jobs.insert(job_id).second,
+                "trace logged one queued job more than once");
+        require(seen_entropies.insert(entropy).second,
+                "trace reused private entropy across queued jobs");
+    }
+    require(seen_jobs.size() == expected_jobs.size(),
+            "trace omitted same-height per-connection job correlation");
+    if (const auto failure = daemon.failure(); failure.has_value()) {
+        throw std::runtime_error("mock daemon failure: " + *failure);
+    }
+}
+
 void test_post_commit_job_rollback()
 {
     MockDaemon daemon;
@@ -848,6 +1021,8 @@ void test_runtime_end_to_end()
 
     std::string first_job_id;
     std::string second_job_id;
+    std::string first_connection_public_id;
+    std::string second_connection_public_id;
     const std::string ordinary_claimed_hash =
         std::string(48, 'f') + "feffffffffffffff";
     {
@@ -866,6 +1041,7 @@ void test_runtime_end_to_end()
         const Json &login_result = miner.response.at("result");
         const Json &job = login_result.at("job");
         const std::string connection_id = login_result.at("id").get<std::string>();
+        first_connection_public_id = connection_id;
         first_job_id = job.at("job_id").get<std::string>();
         require(connection_id.size() == 32U && first_job_id.size() == 32U &&
                     job.at("height") == kHeight && job.at("seed_hash") == kSeedHash &&
@@ -989,7 +1165,8 @@ void test_runtime_end_to_end()
                           "WHERE closed_unix_us IS NULL") == 0,
             "clean shutdown left a connection active");
 
-    config.logging.include_private_job_entropy = true;
+    config.logging.level = "trace";
+    config.logging.include_private_job_entropy = false;
     {
         monero_solo::Runtime runtime(config);
         runtime.start();
@@ -1002,9 +1179,12 @@ void test_runtime_end_to_end()
                 "persisted accepted share was not recovered after restart");
         LoggedInClient miner = login_client(
             stratum_port, configured_secret, configured_secret);
+        second_connection_public_id =
+            miner.response.at("result").at("id").get<std::string>();
         second_job_id = miner.response.at("result").at("job").at("job_id");
-        require(second_job_id != first_job_id,
-                "restart reused a private job identity");
+        require(second_job_id != first_job_id &&
+                    second_connection_public_id != first_connection_public_id,
+                "restart reused a private job or connection identity");
         miner.socket.reset();
         runtime.stop();
     }
@@ -1037,6 +1217,8 @@ void test_runtime_end_to_end()
                             fields.at("target_encoding") == "le32" &&
                             fields.at("assigned_difficulty") == "1" &&
                             fields.at("agent_profile") == "nicehash" &&
+                            fields.at("connection_public_id") ==
+                                first_connection_public_id &&
                             !fields.contains("private_job_entropy"),
                         "default debug job record did not match queued wire work");
                 saw_first_job = true;
@@ -1045,13 +1227,16 @@ void test_runtime_end_to_end()
                 fields.value("job_public_id", std::string{}) == second_job_id) {
                 const std::string entropy =
                     fields.at("private_job_entropy").get<std::string>();
-                require(entropy.size() == 32U &&
+                require(fields.at("connection_public_id") ==
+                            second_connection_public_id &&
+                            fields.at("job_public_id") == second_job_id &&
+                            entropy.size() == 32U &&
                             std::all_of(entropy.begin(), entropy.end(),
                                 [](const char byte) {
                                     return (byte >= '0' && byte <= '9') ||
                                            (byte >= 'a' && byte <= 'f');
                                 }),
-                        "opt-in private job entropy record is malformed");
+                        "trace private job entropy record is malformed");
                 saw_second_job = true;
             }
             if (code == "share.received" &&
@@ -1181,6 +1366,7 @@ void test_runtime_end_to_end()
 int main()
 {
     try {
+        test_same_height_poll_refresh();
         test_post_commit_job_rollback();
         test_verified_share_debug_jsonl();
         test_runtime_end_to_end();

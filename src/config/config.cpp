@@ -463,8 +463,8 @@ void validate_rpc_url(std::string_view url)
 
     const Json &e = root.at("entropy");
     keys(e, "entropy", {"reseed_interval_seconds", "max_reseed_age_seconds", "max_generate_calls"});
-    result.entropy.reseed_interval_seconds = integer(e, "reseed_interval_seconds", 1800, 1, 86400, "entropy");
-    result.entropy.max_reseed_age_seconds = integer(e, "max_reseed_age_seconds", 1860,
+    result.entropy.reseed_interval_seconds = integer(e, "reseed_interval_seconds", 1200, 1, 86400, "entropy");
+    result.entropy.max_reseed_age_seconds = integer(e, "max_reseed_age_seconds", 1260,
                                                     result.entropy.reseed_interval_seconds, 604800, "entropy");
     result.entropy.max_generate_calls = integer(e, "max_generate_calls", 1048576, 1, 4294967295ULL, "entropy");
 
@@ -611,10 +611,13 @@ void validate_rpc_url(std::string_view url)
         throw ValidationError(
             "logging.include_private_job_entropy requires debug or trace level");
     }
-    if (result.logging.include_private_job_entropy &&
+    const bool writes_private_job_entropy =
+        result.logging.include_private_job_entropy ||
+        result.logging.level == "trace";
+    if (writes_private_job_entropy &&
         (!result.logging.file || result.logging.file->empty())) {
         throw ValidationError(
-            "logging.include_private_job_entropy requires a log file");
+            "trace/private job entropy logging requires a log file");
     }
 
     {

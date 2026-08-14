@@ -126,8 +126,8 @@ slower. At least two seeds are required for transitions. See `VERIFIER.md`.
 
 | Key | Default | Allowed value |
 | --- | ---: | --- |
-| `entropy.reseed_interval_seconds` | 1,800 | 1..86,400 |
-| `entropy.max_reseed_age_seconds` | 1,860 | interval..604,800 |
+| `entropy.reseed_interval_seconds` | 1,200 | 1..86,400 |
+| `entropy.max_reseed_age_seconds` | 1,260 | interval..604,800 |
 | `entropy.max_generate_calls` | 1,048,576 | 1..4,294,967,295 |
 | `database.path` | required | Nonempty absolute path up to 4,096 bytes. Parent must exist and be a directory; database must not be a symlink. A world-writable parent is accepted only when sticky and securely owned, as `/tmp` is. |
 | `database.busy_timeout_ms` | 5,000 | 1..60,000 |
@@ -203,7 +203,7 @@ Absolute database/HTTP bounds remain.
 | --- | ---: | --- |
 | `level` | `info` | `error`, `warning`, `info`, `debug`, or `trace` |
 | `file` | null | Null/empty for stderr or an absolute nonsymlink path up to 4,096 bytes with a safe existing parent |
-| `include_private_job_entropy` | false | Boolean; true requires `level=debug|trace` and a nonempty absolute `file` |
+| `include_private_job_entropy` | false | Boolean; enables private job entropy at `debug`; `trace` includes it automatically. Either path requires a nonempty absolute `file` |
 
 All three settings are startup-only. Every accepted record is one complete JSONL
 object with exactly `time`, `severity`, `code`, and `fields`. `time` is UTC
@@ -228,11 +228,14 @@ At debug/trace the runtime records committed connection, job, and share
 lifecycle correlation, target/difficulty/hash fields, verifier timings, and a
 fixed `standard`/`nicehash` agent compatibility profile. It never copies raw,
 miner-controlled agent text into JSONL.
-`include_private_job_entropy=true` additionally writes the exact 16-byte job
-entropy as 32 lowercase hex in `job.queued`; this is useful for a bounded test
-capture but creates another durable copy of reconstruction material. The
-dedicated typed field is rejected on stderr, below debug severity, or without
-the explicit setting.
+Each `job.queued` record contains the 32-lowercase-hex `connection_public_id`
+and independent `job_public_id`. At `trace`, it also contains the exact 16-byte
+per-job template entropy as 32 lowercase hex in `private_job_entropy`.
+`include_private_job_entropy=true` enables the same field at `debug`. Either
+mode creates another durable copy of reconstruction material and therefore
+requires a configured file; private job entropy is never accepted on stderr or
+below debug severity. The OS seed, reseed material, and DRBG state are never
+logged.
 
 ## `blocknotify` command grammar
 

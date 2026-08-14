@@ -19,6 +19,13 @@
 namespace monero_solo {
 namespace {
 
+[[nodiscard]] bool private_job_entropy_logging_enabled(
+    const Config &config) noexcept
+{
+    return config.logging.include_private_job_entropy ||
+           config.logging.level == "trace";
+}
+
 std::string decimal_from_hex(std::string_view encoded) {
     if (encoded.empty()) throw ValidationError("empty hexadecimal difficulty");
     if (encoded.size() > 32U) throw ValidationError("hexadecimal difficulty exceeds uint128");
@@ -708,7 +715,7 @@ Runtime::Runtime(Config config)
     : config_(resolve_runtime_workers(std::move(config))),
       logger_(logging::parse_severity(config_.logging.level),
               config_.logging.file,
-              config_.logging.include_private_job_entropy),
+              private_job_entropy_logging_enabled(config_)),
       database_({config_.database.path,
                  static_cast<std::uint32_t>(config_.database.busy_timeout_ms),
                  config_.blocknotify.has_value() && !config_.blocknotify->empty(),
@@ -1259,6 +1266,8 @@ std::optional<StratumJob> Runtime::make_job(const MinerConnection &connection) {
                 std::string assigned_difficulty;
                 std::string network_difficulty;
                 std::string private_entropy;
+                const bool include_private_job_entropy =
+                    private_job_entropy_logging_enabled(config_);
                 if (debug_logging) {
                     try {
                         connection_public_id = connection.public_id;
@@ -1267,7 +1276,7 @@ std::optional<StratumJob> Runtime::make_job(const MinerConnection &connection) {
                         assigned_difficulty =
                             std::to_string(connection.assigned_difficulty);
                         network_difficulty = context->network_difficulty;
-                        if (config_.logging.include_private_job_entropy) {
+                        if (include_private_job_entropy) {
                             private_entropy = hex_encode(entropy);
                         }
                     }
@@ -1293,7 +1302,8 @@ std::optional<StratumJob> Runtime::make_job(const MinerConnection &connection) {
                     [this, database_id, connection_id, template_database_id,
                      job_height, generation, seed_id, connection_public_id,
                      encoded_id, agent_profile, seed_hash, assigned_difficulty,
-                     network_difficulty, private_entropy, debug_logging](
+                     network_difficulty, private_entropy, debug_logging,
+                     include_private_job_entropy](
                         const std::string_view wire_target,
                         const std::string_view target_encoding) {
                     try {
@@ -1303,7 +1313,7 @@ std::optional<StratumJob> Runtime::make_job(const MinerConnection &connection) {
                         // Logger's closed typed API uses initializer_lists;
                         // keep the two bounded forms explicit so entropy never
                         // reaches the public-field path accidentally.
-                        if (config_.logging.include_private_job_entropy) {
+                        if (include_private_job_entropy) {
                             logger_.log(
                                 logging::Severity::debug, "job.queued",
                                 {{logging::PublicStringKey::connection_public_id,
