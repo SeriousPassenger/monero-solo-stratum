@@ -56,7 +56,9 @@ At startup the entropy manager reads exactly 32 bytes from Linux
 `getrandom(2)`. It initializes the specified HMAC-DRBG-SHA-256 construction
 with domain `monero-solo-stratum/HMAC-DRBG-SHA256/v1`. State is mutex-owned,
 never persisted/logged, and re-seeded with a fresh independent 32-byte sample
-on interval, output-call limit, or PID/fork change.
+on interval, output-call limit, or PID/fork change. The default timed interval
+is 1,200 seconds (20 minutes); new job issuance fails closed if no reseed has
+succeeded by the default 1,260-second maximum age.
 
 Every private job makes two separate generates with domains
 `private-template-entropy/v1` and `private-job-id/v1`. A database transaction
@@ -140,13 +142,13 @@ The payout address is public and may be logged. Database private job blobs and
 hash material are intentionally persisted for reconstruction/audit and are
 available only through an authenticated sensitive API view. They are not
 wallet secrets, but should still be treated as operationally sensitive.
-The 16-byte private job entropy is the one explicit logging exception: it may
-be copied to a mode-0600 JSONL file only when
-`logging.include_private_job_entropy=true` and debug/trace is selected. It is
-never accepted by stderr logging and does not permit DRBG state, seed key,
-password, token, full private blob, or wallet-secret fields. Leave the setting
-off except for a bounded diagnostic run and protect/rotate the resulting file
-like the database.
+The 16-byte per-job template entropy is the one explicit logging exception.
+Trace logging copies it to `job.queued.private_job_entropy` automatically;
+`logging.include_private_job_entropy=true` enables the same field at debug.
+Both modes require a mode-0600 JSONL file. The field is never accepted by
+stderr logging and does not permit the OS seed, reseed material, DRBG state,
+RandomX seed key, password, token, full private blob, or wallet-secret fields.
+Protect and rotate a trace/private-entropy log like the database.
 
 Store config mode 0600 under the service account. Keep database/log directories
 non-world-writable. Never embed daemon credentials in `rpc_url`. Nonempty

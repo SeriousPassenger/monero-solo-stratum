@@ -73,6 +73,10 @@ void test_defaults_and_required_fields()
                 config.verifier.seed_init_threads == 0,
             "verifier auto-worker defaults differ");
     require(config.verifier.max_seeds == 2, "seed default differs");
+    require(config.entropy.reseed_interval_seconds == 1200 &&
+                config.entropy.max_reseed_age_seconds == 1260 &&
+                config.entropy.max_generate_calls == 1048576,
+            "entropy defaults differ");
     require(config.database.retention_days == 0, "retention default differs");
     require(config.api.top_shares_limit == 100 &&
                 config.api.recent_high_shares_limit == 100 &&
@@ -128,6 +132,26 @@ void test_private_job_entropy_logging_gate()
                   .validate_blocknotify_executable = false});
     require(parsed.logging.include_private_job_entropy,
             "private job entropy logging gate did not parse");
+
+    std::string trace_file = valid_config();
+    trace_file.replace(trace_file.find("\"logging\":{}"), 12,
+        "\"logging\":{\"level\":\"trace\","
+        "\"file\":\"/tmp/mss-trace.jsonl\"}");
+    const auto trace_parsed = monero_solo::parse_config_json(
+        trace_file, {.validate_paths = false,
+                     .validate_blocknotify_executable = false});
+    require(trace_parsed.logging.level == "trace" &&
+                !trace_parsed.logging.include_private_job_entropy,
+            "trace logging changed the explicit entropy option");
+
+    std::string trace_stderr = valid_config();
+    trace_stderr.replace(trace_stderr.find("\"logging\":{}"), 12,
+        "\"logging\":{\"level\":\"trace\"}");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            trace_stderr, {.validate_paths = false,
+                           .validate_blocknotify_executable = false});
+    }, "trace private job entropy logging to stderr was accepted");
 
     std::string stderr_target = valid_config();
     stderr_target.replace(stderr_target.find("\"logging\":{}"), 12,

@@ -55,8 +55,8 @@
     "log_level": "info"
   },
   "entropy": {
-    "reseed_interval_seconds": 1800,
-    "max_reseed_age_seconds": 1860,
+    "reseed_interval_seconds": 1200,
+    "max_reseed_age_seconds": 1260,
     "max_generate_calls": 1048576
   },
   "database": {
