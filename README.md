@@ -17,8 +17,9 @@ share accounting and abuse classification.
 
 ## Build
 
-The release build requires a C++20 compiler, CMake 3.16 or newer, OpenSSL 3,
-libcurl, POSIX threads, and the platform dynamic-loader library. SQLite,
+The release build requires a C++20 compiler, CMake 3.31.6 or newer (the Debian
+13 stable baseline), OpenSSL 3, libcurl, POSIX threads, and the platform
+dynamic-loader library. SQLite,
 nlohmann/json, the verifier, and RandomX are included in the source tree. The
 optional ZMQ listener loads `libzmq` at runtime; omit `daemon.zmq_address` if it
 is unavailable.

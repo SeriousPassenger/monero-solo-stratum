@@ -282,8 +282,9 @@ monero-solo-stratum/
     └── monero-stratum-pow-verifier/   # gitlink pinned to 856c015de433a23fe45d88a18dc08c821e50f1cb
 ```
 
-The server SHOULD use C++20 (C++17 is the verifier's minimum), CMake 3.16 or
-newer, and system dependencies with permissive/compatible licenses:
+The server SHOULD use C++20 (C++17 is the verifier's minimum), CMake 3.31.6 or
+newer (the Debian 13 stable baseline), and system dependencies with
+permissive/compatible licenses:
 
 - libuv for event-loop/TCP/process integration;
 - libcurl for daemon HTTP RPC;
@@ -299,14 +300,38 @@ native verifier pin may not float. Add it as a submodule and link its exported
 target:
 
 ```cmake
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.31.6)
 project(monero-solo-stratum VERSION 0.2.0 LANGUAGES C CXX)
+
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
+    if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR
+       CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.10)
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+    endif()
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_subdirectory(third_party/monero-stratum-pow-verifier)
+block()
+    if(DEFINED CACHE{CMAKE_WARN_DEPRECATED})
+        get_property(MSS_SAVED_CMAKE_WARN_DEPRECATED
+            CACHE CMAKE_WARN_DEPRECATED PROPERTY VALUE)
+        set(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED ON)
+    else()
+        set(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED OFF)
+    endif()
+    set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL
+        "Suppress deprecation warnings from pinned dependencies" FORCE)
+    add_subdirectory(third_party/monero-stratum-pow-verifier)
+    if(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED)
+        set(CMAKE_WARN_DEPRECATED "${MSS_SAVED_CMAKE_WARN_DEPRECATED}"
+            CACHE BOOL "Emit CMake deprecation warnings" FORCE)
+    else()
+        unset(CMAKE_WARN_DEPRECATED CACHE)
+    endif()
+endblock()
 
 add_executable(monero-solo-stratum
     # explicit source list
