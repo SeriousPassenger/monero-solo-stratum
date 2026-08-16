@@ -17,8 +17,9 @@ share accounting and abuse classification.
 
 ## Build
 
-The release build requires a C++20 compiler, CMake 3.16 or newer, OpenSSL 3,
-libcurl, POSIX threads, and the platform dynamic-loader library. SQLite,
+The release build requires a C++20 compiler, CMake 3.31.6 or newer (the Debian
+13 stable baseline), OpenSSL 3, libcurl, POSIX threads, and the platform
+dynamic-loader library. SQLite,
 nlohmann/json, the verifier, and RandomX are included in the source tree. The
 optional ZMQ listener loads `libzmq` at runtime; omit `daemon.zmq_address` if it
 is unavailable.
@@ -71,8 +72,8 @@ DESTDIR="$PWD/package-root" cmake --install build-package
 ```
 
 Git checkouts derive a human build revision and exact provenance automatically.
-The version is SemVer with build metadata, for example `0.1.1+rev.18`, where
-`18` is `git rev-list --count HEAD`; the separate 40-hex commit remains the
+The version is SemVer with build metadata, for example `0.2.0+rev.20`, where
+`20` is `git rev-list --count HEAD`; the separate 40-hex commit remains the
 exact source identity. Tracked local changes are reported as `.dirty` and use
 the all-zero commit rather than claiming that the binary matches `HEAD`.
 Automatic revisioning requires a full, non-shallow history.
@@ -90,7 +91,7 @@ cmake -S . -B build-package \
 ```
 
 With no Git metadata or explicit overrides, the honest fallback is
-`0.1.1+rev.0.unknown` with an all-zero commit.
+`0.2.0+rev.0.unknown` with an all-zero commit.
 
 The exact output is a five-line identity block containing the version, build
 time, copyright, MIT license, and canonical GitHub source URL.
@@ -128,6 +129,18 @@ hook validation. It does not open the database, allocate RandomX memory, bind
 listeners, or contact the daemon. Normal startup additionally checks the
 daemon network, validates a full template locally, and prepares the active
 RandomX seed before accepting miners.
+
+Configuration schema 2 retains individual shares only when their authoritative
+actual difficulty is at least 80 G by default, or when candidate/security
+evidence requires durability. Lower-value submission detail belongs in the
+debug/trace JSONL; compact database totals and round/hashrate accounting still
+cover every accepted result. Public templates and private jobs are live-memory
+and trace data, never SQLite rows or blobs. SQLite schema 3 is clean-only and
+does not migrate an older database. Same-height jobs intentionally remain
+eligible until a higher-height job is queued, the connection closes, or the
+process restarts; they are not capped by a history count or TTL. See
+`docs/CONFIGURATION.md` for the exact schema-1 config transformation and safe
+SQLite-file reset, and `docs/PERSISTENCE.md`.
 
 The install generates a hardened systemd unit with the configured bindir and
 sysconfdir and places it in `lib/systemd/system` by default. Override

@@ -36,9 +36,8 @@ public:
     [[nodiscard]] bool release(const DuplicateToken &token);
     void retain_height(std::uint64_t source_id, std::uint64_t height);
     // Returns every generation-tagged reservation removed when the bucket's
-    // final reference disappears.  Callers use these tokens to retire the
-    // matching durable duplicate_keys rows without risking a newer
-    // reservation of the same key.
+    // final reference disappears. Tokens let callers observe exact retirement
+    // without retaining an all-time durable duplicate ledger.
     [[nodiscard]] std::vector<DuplicateToken> retire_height(
         std::uint64_t source_id, std::uint64_t height);
     [[nodiscard]] std::vector<DuplicateToken> release_height(

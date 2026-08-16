@@ -4,7 +4,7 @@ CREATE TABLE schema_meta (
     value TEXT NOT NULL
 ) STRICT;
 
-INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2');
+INSERT INTO schema_meta(key, value) VALUES ('schema_version', '3');
 
 CREATE TABLE server_sessions (
     id INTEGER PRIMARY KEY,
@@ -17,7 +17,7 @@ CREATE TABLE server_sessions (
 ) STRICT;
 
 CREATE TABLE workers (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     login TEXT NOT NULL,
     rigid TEXT NOT NULL DEFAULT '',
     first_seen_unix_us INTEGER NOT NULL,
@@ -26,7 +26,7 @@ CREATE TABLE workers (
 ) STRICT;
 
 CREATE TABLE connections (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     public_id BLOB NOT NULL UNIQUE CHECK(length(public_id) = 16),
     session_id INTEGER NOT NULL REFERENCES server_sessions(id),
     worker_id INTEGER REFERENCES workers(id),
@@ -49,63 +49,19 @@ CREATE INDEX connections_worker_time
 CREATE INDEX connections_peer_time
     ON connections(peer_family, peer_address, opened_unix_us);
 
-CREATE TABLE public_templates (
-    id INTEGER PRIMARY KEY,
-    session_id INTEGER NOT NULL REFERENCES server_sessions(id),
-    generation INTEGER NOT NULL,
-    height INTEGER NOT NULL CHECK(height > 0),
-    prev_hash BLOB NOT NULL CHECK(length(prev_hash) = 32),
-    seed_hash BLOB NOT NULL CHECK(length(seed_hash) = 32),
-    next_seed_hash BLOB CHECK(next_seed_hash IS NULL OR length(next_seed_hash) = 32),
-    difficulty_dec TEXT NOT NULL,
-    wide_difficulty_hex TEXT,
-    reserved_offset INTEGER NOT NULL,
-    reserve_size INTEGER NOT NULL CHECK(reserve_size = 16),
-    blocktemplate_blob BLOB NOT NULL,
-    blockhashing_blob BLOB NOT NULL,
-    fetched_unix_us INTEGER NOT NULL,
-    fetch_reason TEXT NOT NULL,
-    UNIQUE(session_id, generation)
-) STRICT;
-
-CREATE INDEX public_templates_height
-    ON public_templates(height, id);
-
-CREATE TABLE private_jobs (
-    id INTEGER PRIMARY KEY,
-    public_job_id BLOB NOT NULL UNIQUE CHECK(length(public_job_id) = 16),
-    connection_id INTEGER NOT NULL REFERENCES connections(id),
-    template_id INTEGER NOT NULL REFERENCES public_templates(id),
-    height INTEGER NOT NULL,
-    entropy BLOB NOT NULL UNIQUE CHECK(length(entropy) = 16),
-    seed_hash BLOB NOT NULL CHECK(length(seed_hash) = 32),
-    mspv_seed_id_dec TEXT,
-    assigned_difficulty_dec TEXT NOT NULL,
-    target64_le BLOB NOT NULL CHECK(length(target64_le) = 8),
-    network_difficulty_dec TEXT NOT NULL,
-    nonce_offset INTEGER NOT NULL,
-    nonce_size INTEGER NOT NULL CHECK(nonce_size = 4),
-    reserved_offset INTEGER NOT NULL,
-    reserved_size INTEGER NOT NULL CHECK(reserved_size = 16),
-    private_block_blob BLOB NOT NULL,
-    hashing_blob BLOB NOT NULL,
-    created_unix_us INTEGER NOT NULL,
-    queued_unix_us INTEGER,
-    expires_unix_us INTEGER NOT NULL,
-    retired_unix_us INTEGER
-) STRICT;
-
-CREATE INDEX private_jobs_connection_time
-    ON private_jobs(connection_id, created_unix_us DESC);
-CREATE INDEX private_jobs_height
-    ON private_jobs(height, id);
-
 CREATE TABLE shares (
     id INTEGER PRIMARY KEY,
+    session_id INTEGER NOT NULL REFERENCES server_sessions(id),
     round_id INTEGER NOT NULL REFERENCES rounds(id),
-    connection_id INTEGER NOT NULL REFERENCES connections(id),
+    connection_id INTEGER REFERENCES connections(id),
     worker_id INTEGER REFERENCES workers(id),
-    job_id INTEGER REFERENCES private_jobs(id),
+    job_public_id BLOB CHECK(
+        job_public_id IS NULL OR length(job_public_id) = 16
+    ),
+    template_generation INTEGER CHECK(
+        template_generation IS NULL OR template_generation > 0
+    ),
+    height INTEGER CHECK(height IS NULL OR height > 0),
     request_sequence INTEGER NOT NULL CHECK(request_sequence >= 1),
     miner_request_id_type TEXT CHECK(
         miner_request_id_type IS NULL OR miner_request_id_type IN ('integer', 'string')
@@ -123,6 +79,11 @@ CREATE TABLE shares (
         candidate_admission IN (
             'not_candidate', 'admitted', 'deferred', 'existing',
             'trusted_rate_limited'
+        )
+    ),
+    retention_reason TEXT CHECK(
+        retention_reason IS NULL OR retention_reason IN (
+            'high_difficulty', 'candidate', 'security_evidence'
         )
     ),
     status TEXT NOT NULL CHECK(status IN (
@@ -144,6 +105,7 @@ CREATE TABLE shares (
         (miner_request_id_type IS NULL AND miner_request_id_text IS NULL) OR
         (miner_request_id_type IS NOT NULL AND miner_request_id_text IS NOT NULL)
     ),
+    CHECK(status IN ('received', 'verifying') OR retention_reason IS NOT NULL),
     UNIQUE(connection_id, request_sequence)
 ) STRICT;
 
@@ -151,6 +113,10 @@ CREATE INDEX shares_time ON shares(received_unix_us, id);
 CREATE INDEX shares_worker_time ON shares(worker_id, received_unix_us, id);
 CREATE INDEX shares_status_time ON shares(status, received_unix_us, id);
 CREATE INDEX shares_round_status ON shares(round_id, status, id);
+CREATE INDEX shares_job_public_id
+    ON shares(job_public_id, id);
+CREATE INDEX shares_template_generation
+    ON shares(session_id, template_generation, id);
 CREATE INDEX shares_accepted_actual_difficulty_rank
     ON shares(length(actual_difficulty_dec) DESC, actual_difficulty_dec DESC, id)
     WHERE status = 'accepted' AND actual_difficulty_dec IS NOT NULL;
@@ -171,27 +137,30 @@ CREATE TABLE share_hashes (
     PRIMARY KEY(share_id, role)
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE duplicate_keys (
-    key BLOB PRIMARY KEY CHECK(length(key) = 48),
-    height INTEGER NOT NULL,
-    first_share_id INTEGER NOT NULL REFERENCES shares(id),
-    role TEXT NOT NULL CHECK(role IN ('claimed', 'computed', 'both')),
-    active INTEGER NOT NULL CHECK(active IN (0, 1)),
-    reserved_unix_us INTEGER NOT NULL,
-    retired_unix_us INTEGER,
-    generation_token INTEGER NOT NULL
+CREATE TABLE share_totals (
+    status TEXT NOT NULL CHECK(status IN (
+        'accepted', 'stale', 'duplicate', 'low_difficulty', 'invalid_result',
+        'unknown_job', 'malformed', 'unauthenticated', 'server_busy',
+        'verifier_failed', 'cancelled'
+    )),
+    provenance TEXT NOT NULL CHECK(provenance IN ('verified', 'claimed', 'pending')),
+    share_count INTEGER NOT NULL CHECK(share_count > 0),
+    first_unix_us INTEGER NOT NULL,
+    last_unix_us INTEGER NOT NULL,
+    PRIMARY KEY(status, provenance),
+    CHECK(last_unix_us >= first_unix_us)
 ) WITHOUT ROWID, STRICT;
-
-CREATE INDEX duplicate_keys_active_height
-    ON duplicate_keys(active, height);
 
 CREATE TABLE candidates (
     id INTEGER PRIMARY KEY,
     candidate_key BLOB NOT NULL UNIQUE CHECK(length(candidate_key) = 32),
-    first_share_id INTEGER NOT NULL REFERENCES shares(id),
-    job_id INTEGER NOT NULL REFERENCES private_jobs(id),
+    session_id INTEGER NOT NULL REFERENCES server_sessions(id),
+    round_id INTEGER NOT NULL REFERENCES rounds(id),
+    first_share_id INTEGER REFERENCES shares(id),
+    job_public_id BLOB NOT NULL CHECK(length(job_public_id) = 16),
+    template_generation INTEGER NOT NULL CHECK(template_generation > 0),
     connection_id INTEGER NOT NULL REFERENCES connections(id),
-    height INTEGER NOT NULL,
+    height INTEGER NOT NULL CHECK(height > 0),
     peer_family INTEGER NOT NULL,
     peer_address BLOB NOT NULL,
     frozen_block_blob BLOB NOT NULL,
@@ -216,6 +185,7 @@ CREATE TABLE candidates (
 
 CREATE INDEX candidates_state_time ON candidates(state, updated_unix_us, id);
 CREATE INDEX candidates_miner_tx ON candidates(miner_tx_hash);
+CREATE INDEX candidates_job_public_id ON candidates(job_public_id, id);
 
 CREATE TABLE candidate_attempts (
     id INTEGER PRIMARY KEY,
@@ -280,6 +250,7 @@ CREATE TABLE rounds (
     block_id BLOB CHECK(block_id IS NULL OR length(block_id) = 32),
     credited_difficulty_dec TEXT NOT NULL DEFAULT '0',
     accepted_share_count INTEGER NOT NULL DEFAULT 0 CHECK(accepted_share_count >= 0),
+    max_share_height INTEGER NOT NULL DEFAULT 0 CHECK(max_share_height >= 0),
     effort_finalized_unix_us INTEGER,
     finalized_effort_segment_count INTEGER CHECK(
         finalized_effort_segment_count IS NULL OR
@@ -353,10 +324,6 @@ BEFORE UPDATE OF effort_finalized_unix_us, finalized_effort_segment_count ON rou
 WHEN OLD.effort_finalized_unix_us IS NULL AND
      NEW.effort_finalized_unix_us IS NOT NULL AND
      (NEW.state != 'closed' OR
-      EXISTS (
-          SELECT 1 FROM shares
-          WHERE round_id = NEW.id AND status IN ('received', 'verifying')
-      ) OR
       NEW.finalized_effort_segment_count != (
           SELECT count(*) FROM round_work_segments WHERE round_id = NEW.id
       ) OR
@@ -380,6 +347,7 @@ WHEN OLD.effort_finalized_unix_us IS NOT NULL AND
       NEW.block_id IS NOT OLD.block_id OR
       NEW.credited_difficulty_dec IS NOT OLD.credited_difficulty_dec OR
       NEW.accepted_share_count IS NOT OLD.accepted_share_count OR
+      NEW.max_share_height IS NOT OLD.max_share_height OR
       NEW.effort_finalized_unix_us IS NOT OLD.effort_finalized_unix_us OR
       NEW.finalized_effort_segment_count IS NOT
           OLD.finalized_effort_segment_count)
@@ -443,7 +411,7 @@ CREATE UNIQUE INDEX one_candidate_abuse_event_per_kind
     );
 
 CREATE TABLE candidate_verdicts (
-    share_id INTEGER NOT NULL REFERENCES shares(id),
+    share_id INTEGER NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('false_candidate', 'candidate_mismatch')),
     candidate_key BLOB NOT NULL CHECK(length(candidate_key) = 32),
     candidate_id INTEGER REFERENCES candidates(id),
@@ -505,8 +473,10 @@ CREATE TABLE events (
     type TEXT NOT NULL,
     connection_id INTEGER REFERENCES connections(id),
     worker_id INTEGER REFERENCES workers(id),
-    template_id INTEGER REFERENCES public_templates(id),
-    job_id INTEGER REFERENCES private_jobs(id),
+    template_generation INTEGER,
+    job_public_id BLOB CHECK(
+        job_public_id IS NULL OR length(job_public_id) = 16
+    ),
     share_id INTEGER REFERENCES shares(id),
     candidate_id INTEGER REFERENCES candidates(id),
     round_id INTEGER REFERENCES rounds(id),
@@ -515,6 +485,9 @@ CREATE TABLE events (
 
 CREATE INDEX events_time ON events(created_unix_us, id);
 CREATE INDEX events_type_id ON events(type, id);
+CREATE INDEX events_template_generation
+    ON events(session_id, template_generation, id);
+CREATE INDEX events_job_public_id ON events(job_public_id, id);
 CREATE INDEX events_share_result_share ON events(share_id, id)
     WHERE type = 'share_result' AND share_id IS NOT NULL;
 CREATE INDEX events_share_result_round_share ON events(round_id, share_id, id)

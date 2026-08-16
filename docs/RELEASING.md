@@ -2,15 +2,17 @@
 
 ## Version and provenance
 
-Release versions follow SemVer. Bug fixes increment PATCH, so this change is
-`0.1.1`; backward-compatible features increment MINOR, and incompatible
-configuration, protocol, persistence, or API changes increment MAJOR.
+Release versions follow SemVer. While the public contract remains pre-1.0,
+bug fixes increment PATCH and incompatible configuration, protocol,
+persistence, or API changes increment MINOR. This clean persistence redesign
+is therefore `0.2.0`. After 1.0, incompatible public-contract changes increment
+MAJOR.
 
 A Git build appends the automatically derived full-history counter as SemVer
-build metadata (`0.1.1+rev.N`). The 40-hex commit remains a separate exact
+build metadata (`0.2.0+rev.N`). The 40-hex commit remains a separate exact
 provenance field rather than serving as the human version. Release CI must use
 a full checkout (`fetch-depth: 0`). Tag the reviewed merged commit, not a PR
-head, with an annotated or signed `v0.1.1` tag.
+head, with an annotated or signed `v0.2.0` tag.
 
 The embedded UTC build timestamp is derived at binary build time and honors
 `SOURCE_DATE_EPOCH` exported for each `cmake --build` invocation. Record that

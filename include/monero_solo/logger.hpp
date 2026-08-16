@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -33,6 +34,7 @@ enum class PublicStringKey : std::uint8_t {
     template_public_id,
     job_public_id,
     share_public_id,
+    submission_id,
     candidate_key,
     round_public_id,
     ban_public_id,
@@ -151,14 +153,23 @@ class Logger final {
 
     [[nodiscard]] bool enabled(Severity severity) const noexcept;
 
-    // This is the only post-construction write operation.  It is noexcept,
-    // bounded, serializes a complete JSONL record under one mutex, and never
-    // accepts arbitrary JSON, byte arrays, or free-form field names.
+    // These are the only post-construction write operations. They are
+    // noexcept, bounded, serialize a complete JSONL record under one mutex,
+    // and never accept arbitrary JSON, byte arrays, or free-form field names.
     void log(Severity severity,
              std::string_view stable_code,
              std::initializer_list<PublicStringField> strings = {},
              std::initializer_list<IntegerField> integers = {},
              std::initializer_list<SensitiveHexField> sensitive = {}) noexcept;
+
+    // Equivalent bounded typed-field entry point for callers that need to
+    // conditionally omit a field (for example, a durable ID that does not
+    // exist for transient-only work).
+    void log_fields(Severity severity,
+                    std::string_view stable_code,
+                    std::span<const PublicStringField> strings,
+                    std::span<const IntegerField> integers,
+                    std::span<const SensitiveHexField> sensitive = {}) noexcept;
 
     [[nodiscard]] Severity threshold() const noexcept { return threshold_; }
     [[nodiscard]] bool file_backed() const noexcept { return owns_fd_; }

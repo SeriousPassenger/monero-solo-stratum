@@ -1304,6 +1304,8 @@ def format_event(entry: EventEntry) -> str:
             parts.append(f"h{fields['height']}")
         if fields.get("share_id") is not None:
             parts.append(f"share#{fields['share_id']}")
+        elif fields.get("submission_id") is not None:
+            parts.append(f"submit#{fields['submission_id']}")
         duration = finite_float(fields.get("duration_us"))
         verifier_ns = finite_float(fields.get("verifier_total_ns"))
         if duration is not None:
@@ -1312,8 +1314,10 @@ def format_event(entry: EventEntry) -> str:
             parts.append(f"rx {verifier_ns / 1e6:.2f}ms")
         return "  ".join(parts)
     if code == "template.refreshed":
+        generation = fields.get("template_generation",
+                                fields.get("template_id", "?"))
         return (f"{prefix}  TEMPLATE  {fields.get('fetch_reason', '?')}  "
-                f"h{fields.get('height', '?')}  template#{fields.get('template_id', '?')}  "
+                f"h{fields.get('height', '?')}  template#{generation}  "
                 f"net {human_si(fields.get('network_difficulty'), 'diff')}")
     if code == "job.queued":
         return (f"{prefix}  JOB  h{fields.get('height', '?')}  "
@@ -1323,7 +1327,7 @@ def format_event(entry: EventEntry) -> str:
         return (f"{prefix}  {code.upper()}  conn#{fields.get('connection_id', '?')}  "
                 f"worker#{fields.get('worker_id', '?')}  {fields.get('reason_code', '')}").rstrip()
     allow = ("status", "state", "reason_code", "height", "candidate_id",
-             "share_id", "delivery_id", "attempt", "exit_code")
+             "share_id", "submission_id", "delivery_id", "attempt", "exit_code")
     details = "  ".join(f"{key}={fields[key]}" for key in allow
                         if fields.get(key) is not None)
     return f"{prefix}  {code.upper()}" + (f"  {details}" if details else "")

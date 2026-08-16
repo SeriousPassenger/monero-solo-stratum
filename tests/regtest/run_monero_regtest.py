@@ -198,14 +198,13 @@ def run(args: argparse.Namespace) -> None:
         monerod_log = (root / "monerod.log").open("wb")
         server_log = (root / "server.log").open("wb")
         config = {
-            "schema_version": 1,
+            "schema_version": 2,
             "network": "regtest",
             "wallet_address": WALLET_ADDRESS,
             "blocknotify": None,
             "stratum": {
                 "listen": [f"127.0.0.1:{stratum_port}"],
                 "access_password": PASSWORD,
-                "job_history": 6,
                 "job_ttl_ms": 120000,
                 "max_pending_verifications_per_connection": 8,
             },
@@ -234,7 +233,11 @@ def run(args: argparse.Namespace) -> None:
                 "log_level": "warning",
             },
             "entropy": {},
-            "database": {"path": str(database_path)},
+            "database": {
+                "path": str(database_path),
+                "min_persisted_share_difficulty": 80000000000,
+                "accounting_flush_interval_ms": 1000,
+            },
             "events": {
                 "enabled": False,
                 "unix_socket": str(root / "events.sock"),
@@ -367,8 +370,12 @@ def run(args: argparse.Namespace) -> None:
                         "SQLite integrity_check failed")
                 require(not database.execute("PRAGMA foreign_key_check").fetchall(),
                         "SQLite foreign_key_check failed")
-                require(scalar(database, "SELECT count(*) FROM shares WHERE status='accepted' AND provenance='verified'") == 1,
-                        "verified accepted share was not durable")
+                require(scalar(database, "SELECT count(*) FROM shares WHERE status='accepted' AND provenance='verified' AND retention_reason='candidate'") == 1,
+                        "verified candidate share was not durable")
+                require(scalar(database, "SELECT sum(share_count) FROM share_totals WHERE status='accepted' AND provenance='verified'") == 1,
+                        "verified accepted share was not compactly accounted")
+                require(scalar(database, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('public_templates','private_jobs','duplicate_keys')") == 0,
+                        "removed transient tables were recreated")
                 require(scalar(database, "SELECT count(*) FROM candidates WHERE state='accepted'") == 1,
                         "accepted candidate was not durable")
                 require(scalar(database, "SELECT count(*) FROM candidate_attempts") == 1,

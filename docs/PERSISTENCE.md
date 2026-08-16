@@ -2,8 +2,8 @@
 
 The SQLite database is part of the mining safety boundary, not optional
 telemetry. A candidate is never sent until its exact frozen block and unique
-fingerprint are durable, and an accepted ordinary share is committed before an
-`OK` response is queued to the miner.
+fingerprint are durable. Ordinary share accounting is compact, batched
+telemetry; it is not part of the candidate-submission safety boundary.
 
 ## Open and schema policy
 
@@ -18,13 +18,15 @@ PRAGMA busy_timeout = <configured milliseconds>;
 ```
 
 Failure to establish WAL, FULL synchronous mode, foreign keys, or the exact
-busy timeout aborts startup. A new empty database receives schema version 2 in
-one transaction and `PRAGMA user_version=2`. An existing database must contain
-`schema_meta('schema_version','2')` and pass `foreign_key_check`. This test
-release deliberately has no v1 backfill/migration path: purge the old test
-database before installing it. An unknown version or a nonempty foreign
-database without schema metadata fails rather than being guessed or
-downgraded.
+busy timeout aborts startup. A new empty database receives schema version 3 in
+one transaction and `PRAGMA user_version=3`. An existing database must contain
+`schema_meta('schema_version','3')` and pass `foreign_key_check`. There is no
+v1/v2 migration path: stop the server and deliberately move aside the exact
+configured SQLite file and its `-wal`/`-shm` companions before starting this
+release. Preserve the configuration file and update it separately using the
+schema-1-to-2 checklist in `CONFIGURATION.md`. An unknown version or a nonempty
+foreign database without schema metadata fails rather than being guessed,
+deleted, or downgraded.
 
 The schema source is `src/db/schema.sql`, embedded into the binary at compile
 time. It uses SQLite STRICT tables, check constraints, foreign keys, unique
@@ -32,40 +34,73 @@ indexes, and conditional transition statements. The synchronous writer API is
 serialized through a bounded two-FIFO scheduler around one connection.
 Candidate journal/attempt/reconciliation/acceptance and admitted verifier
 completion/finalization commands have priority. Each queued command consumes
-one exact 512-byte envelope; referenced immutable block/job blobs are not
+one exact 512-byte envelope; referenced immutable candidate blobs are not
 copied. Ordinary callers are backpressured before the configured priority
 reserve, while priority callers may use the full configured item/byte bounds.
 The HTTP API has a separate `SQLITE_OPEN_READONLY` WAL connection and prepared,
 bounded queries.
+
+The persistence snapshot distinguishes `pending_accounting_items` (terminal
+ordinary contributions buffered for aggregate flush) from
+`pending_transient_shares` (structurally admitted live submissions that have not
+yet reached a terminal outcome). The latter is process memory, not a durable
+row count. Summary pending/total counters include it exactly once.
 
 ## Logical tables
 
 | Area | Tables and durable purpose |
 | --- | --- |
 | Identity/lifecycle | `server_sessions`, `workers`, `connections` |
-| Work | `public_templates`, `private_jobs`, `shares`, `share_hashes`, `duplicate_keys` |
+| Significant work | retained `shares`, retained `share_hashes` |
 | Blocks | `candidates`, `candidate_attempts`, `candidate_reconciliations`, `candidate_verdicts` |
-| Accounting | `rounds`, `round_work_segments`, `hashrate_buckets` |
+| Accounting | `share_totals`, `rounds`, `round_work_segments`, `hashrate_buckets` |
 | Defense/audit | `abuse_events`, `bans`, `ban_abuse_events`, `events` |
 | Hooks | `blocknotify_deliveries` |
 
-Binary public/private IDs, entropy, hashes, keys, nonces, addresses, and blobs
-are BLOBs. UTC time is signed Unix microseconds. Unsigned values that do not fit
+Binary public IDs, hashes, keys, nonces, addresses, and candidate blobs are
+BLOBs. UTC time is signed Unix microseconds. Unsigned values that do not fit
 SQLite's signed integer domain—RandomX seed IDs/tickets and difficulty/work
 values—are canonical unsigned decimal TEXT. Conversion to hex, decimal JSON,
 and RFC 3339 happens at an interface boundary.
 
-`database.retention_days` must be zero in this release. There is no automatic deletion;
-historical candidates, attempts, bans, sessions, rounds, and events remain
-until an operator performs an offline archival/migration procedure. Back up
-the database and its WAL consistently while the process is stopped, or use
-SQLite's online backup API from an external tool.
+`shares` is deliberately selective. An individual terminal row is retained
+when its authoritative actual difficulty is at least
+`database.min_persisted_share_difficulty`, or when it is candidate/security
+evidence. The comparison is inclusive. Verified mode selects on the computed
+hash, never the miner claim; trusted mode selects on the claim. Candidate and
+security evidence cannot be disabled. Sub-threshold detail remains in the
+configured debug/trace JSONL, while `share_totals` preserves compact outcome
+counts. Historical candidates, attempts, bans, sessions, rounds, retained
+shares, and events remain until an operator performs an offline archival
+procedure. Back up the database and its WAL consistently while the process is
+stopped, or use SQLite's online backup API from an external tool.
+
+Public templates and private jobs are never inserted into SQLite. Every job at
+the connection's latest queued height remains eligible and accumulates in live
+memory until a strictly higher-height job is completely queued, the connection
+closes, or the process restarts. Same-height jobs ignore TTL; TTL applies only
+to noncurrent jobs at a different height after a downward reorg. Retained
+shares denormalize their public job ID, template generation, height,
+difficulties, nonce, status, provenance, timings, and hashes. Candidates carry
+their own authoritative `round_id`, non-null originating `connection_id`,
+public job ID, template generation, height, peer, frozen block, and block
+identities. `first_share_id` is nullable
+correlation only; candidate recovery/acceptance never requires a share row.
+Routine template, job, connection, and low-value share events are trace-only
+and do not enter durable `events`.
+
+Connection and worker identity rows exist while live and remain only while a
+retained share, candidate, significant audit event, abuse record, or rolling
+hashrate bucket references them. Once a connection is closed and all such
+references have aged out or been removed, its row and an orphaned worker row
+are pruned. This avoids turning routine reconnect churn into permanent history.
 
 ## Uniqueness and idempotency
 
-Private job creation reserves both the 16-byte public job ID and independent
-16-byte private entropy with database-lifetime unique constraints. On either
-collision the entire pair is discarded and freshly drawn.
+Private job creation refuses a public job-ID collision against the live
+in-memory job set and draws a fresh pair. Private entropy is not checked for
+uniqueness. SQLite stores neither jobs nor private entropy and imposes no
+lifetime uniqueness promise on either independent 128-bit value.
 
 The ordinary duplicate key is the exact 48 bytes:
 
@@ -73,15 +108,10 @@ The ordinary duplicate key is the exact 48 bytes:
 private_job_entropy[16] || PoW_hash[32]
 ```
 
-`duplicate_keys` stores its first share, claimed/computed role, activity,
-height, and a generation token. The in-memory registry is reconstructed from
-active rows before opening Stratum. A generation-tagged release cannot retire
-a newer reservation of the same bytes. When a logically retired height loses
-its final job, verifier, or candidate reference, the registry returns the exact
-collected key/generation pairs and the runtime retires those durable active
-rows. Historical rows remain queryable. At restart, ordinary keys belonging
-only to jobs from the prior process retire immediately; recoverable candidates
-hold their height buckets until their terminal outcome.
+Ordinary duplicate keys live only in the bounded process-global registry. A
+restart invalidates every old private job, so an ordinary replay cannot cross
+that boundary. Candidate idempotency is separate and durable: the frozen-block
+candidate key remains unique for the database lifetime.
 
 The candidate identity is independent of a claimed result:
 
@@ -99,12 +129,13 @@ uncertainty flag are snapshotted and never rebuilt from a later template.
 
 Important writer operations are explicit transactions:
 
-- Job insertion atomically reserves entropy and public job ID.
 - Candidate journaling atomically inserts/attaches the unique candidate, links
   the share/verdict, stores frozen bytes, and creates dispatch intent before
   the first network send.
-- Share acceptance atomically finalizes status, hashes, credited assigned
-  difficulty, and global/connection/worker one-second work buckets.
+- Ordinary share results accumulate compact status/work deltas and flush in
+  one transaction at most every configured accounting interval.
+- Candidate acceptance first drains the closing round's pending accounting,
+  then performs the durable round transition.
 - Candidate attempt completion updates the attempt and candidate through a
   conditional state transition. The first daemon `OK` performs the one
   acceptance path.
@@ -164,16 +195,17 @@ On database open:
   observation and the candidate becomes recoverable;
 - orphaned `blocknotify` rows in `running` return to `pending`;
 - an existing open round is reused, or one is created if absent;
-- unexpired bans and active duplicate keys are loaded into memory;
+- unexpired bans are loaded into memory; the ordinary duplicate registry starts
+  empty because no job survives a process restart;
 - candidates in `journaled`, `dispatching`, `retry_wait`, or unresolved
   `ambiguous` state are loaded with the original frozen bytes and attempt
   snapshot.
 
 Before a replacement server session is created, startup idempotently marks
-every prior open session unclean, closes its open connections with
-`process_restarted`, and retires every orphan private job through the normal
-typed retirement workflow so deferred candidate evidence is not lost. A crash
-during this recovery can safely resume it on the next invocation.
+every prior open session unclean and closes its open connections with
+`process_restarted`. Recoverable candidates already contain every byte and
+identifier needed for reconciliation/retry; no private-job row is required. A
+crash during this recovery can safely resume on the next invocation.
 
 The runtime performs a reconciliation cycle before resuming due dispatch for a
 recoverable nonexhausted candidate. Retries always transmit the journaled bytes.
@@ -184,21 +216,22 @@ Server sessions record start/stop, binary public ID, version, verifier commit,
 and a clean-shutdown flag. An unclean prior session remains an audit record; a
 new process always receives a new public session ID. Events emitted while
 recovering a prior candidate belong to the new emitting session, while their
-connection/job/share correlation fields continue to name the immutable
-originating records.
+connection, public-job, template-generation, retained-share, and candidate
+correlation fields continue to name the immutable originating context.
 
 ## Rounds and hashrate
 
 A round closes only when one local candidate receives daemon `OK` or later
 positive reconciliation. A height change, remote block, candidate claim,
-rejection, or ambiguity does not close it. Each share stores its round at
-admission, so a verification completing across the close boundary is credited
-to its original round. A closed round is finalized only after those admitted
-shares leave `received`/`verifying`; triggers then freeze its work segments.
-Closed rounds are not reopened for later orphan/reorg correction in v2.
+rejection, or ambiguity does not close it. Each in-flight result retains its
+round assignment in memory, so a verification completing across the close
+boundary is credited to its original round. Candidate acceptance uses a flush
+barrier before freezing the closing round's work segments. Closed rounds are
+not reopened for later orphan/reorg correction in v3.
 
 Only final `accepted` shares add assigned difficulty to one-second buckets for
-global scope (`scope_id=0`), connection, and logical `(login,rigid)` worker.
+global scope (`scope_id=0`), connection, and logical `(login,rigid)` worker,
+whether or not the individual share row is retained.
 Verified and claimed sources have separate conflict keys. API windows cover
 exactly 60, 300, 600, 3,600, 21,600, and 86,400 seconds and divide by the
 nominal window length; stale/low/duplicate/mismatch/infrastructure shares add
@@ -207,6 +240,12 @@ network difficulty. `estimated_hashes` is this unbiased share-based work
 estimate; a Stratum server cannot observe the miner's exact attempted nonce
 count. Round effort is `100 * sum(credited_work / network_difficulty)` and may
 legitimately exceed 100 percent.
+
+Ordinary accounting batches flush no later than
+`database.accounting_flush_interval_ms` and on clean shutdown. An unclean exit
+may lose at most one interval of ordinary aggregate telemetry. Candidate
+journals, candidate transitions, and security evidence remain synchronous and
+recoverable; they are never deferred into the ordinary batch.
 
 ## Durable `blocknotify`
 

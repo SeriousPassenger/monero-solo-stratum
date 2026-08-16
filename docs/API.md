@@ -42,7 +42,7 @@ Example success and error envelopes:
 {
   "schema_version": 1,
   "generated_at": "2026-08-12T05:30:00.000000Z",
-  "data": {"alive": true, "version": "0.1.1+rev.123", "uptime_seconds": 30}
+  "data": {"alive": true, "version": "0.2.0+rev.123", "uptime_seconds": 30}
 }
 ```
 
@@ -99,16 +99,14 @@ their respective configured cap.
 | `GET /v1/health/live` | none | `{alive, version, uptime_seconds}`; 200 while served |
 | `GET /v1/health/ready` | none | Overall readiness, height/null, and database/entropy/daemon/template/verifier/stratum component states; 200 ready, otherwise 503 |
 | `GET /v1/summary` | none | Server identity/mode, compact daemon state, connection/worker/share/candidate counters, open round, active-source H/s |
-| `GET /v1/daemon` | none | Redacted live daemon/RPC/ZMQ/template snapshot; no credentials |
+| `GET /v1/daemon` | none | Redacted live daemon/RPC/ZMQ/template snapshot; `template_generation` is authoritative and legacy `template_id` is null |
 | `GET /v1/verifier` | none | Enabled/mode, native stats and tracked seed snapshots |
 | `GET /v1/hashrate` | `source=verified|claimed|all` | Global six-window H/s; default active mode; `all` may report `mixed` |
-| `GET /v1/persistence` | none | Schema/pragmas, file sizes, last commit, unresolved candidates, pending hook deliveries |
+| `GET /v1/persistence` | none | Schema 3/pragmas, file sizes, writer/ordinary-accounting queue depths, live transient-share count, last commit, unresolved candidates, pending hook deliveries |
 | `GET /v1/connections` | `active`, `worker_id`, `peer`, `after_time`, `before_time` | Connection resources |
-| `GET /v1/connections/{32hex}` | none | Connection, share counters, and at most 20 recent job/share links |
+| `GET /v1/connections/{32hex}` | none | Connection, explicitly retained-only share counters, and at most 20 recent retained-share links |
 | `GET /v1/workers` | `active`, exact `login`, exact `rigid`, `after_time`, `before_time` | Worker resources |
-| `GET /v1/templates` | `height`, times, `include_blobs` | Public templates |
-| `GET /v1/jobs` | `connection_id`, `template_id`, `height`, `active`, times, `include_blobs` | Private jobs |
-| `GET /v1/shares` | `status`, `connection_id`, `worker_id`, `job_id`, `candidate_id`, `height`, `min_difficulty`, times | Share resources |
+| `GET /v1/shares` | `status`, `connection_id`, `worker_id`, `job_id`, `candidate_id`, `height`, `min_difficulty`, times | Retained significant-share resources |
 | `GET /v1/shares/top` | optional `round_id` | Accepted shares ranked by exact actual difficulty, globally or for one round; bounded snapshot |
 | `GET /v1/shares/recent-high` | none | Newest accepted shares whose actual difficulty meets the configured threshold, independent of round; bounded snapshot |
 | `GET /v1/shares/{decimal}` | none | `{share, submission_url}` |
@@ -118,7 +116,7 @@ their respective configured cap.
 | `GET /v1/rounds` | `state`, times | Local rounds |
 | `GET /v1/rounds/current` | none | The one open round, or 503 |
 | `GET /v1/bans` | `active`, `peer`, times | Persistent ban history |
-| `GET /v1/events` | `type`, linked connection/worker/template/job/share/candidate/round IDs, times | Persistent committed events |
+| `GET /v1/events` | `type`, linked connection/worker, `template_generation`, public `job_id`, retained share/candidate/round IDs, times | Significant committed events |
 
 `status`/`share_status` values are `received`, `verifying`, `accepted`,
 `stale`, `duplicate`, `low_difficulty`, `invalid_result`, `unknown_job`,
@@ -126,6 +124,28 @@ their respective configured cap.
 `cancelled`. Candidate states are `journaled`, `dispatching`, `retry_wait`,
 `accepted`, `rejected`, `ambiguous`, and `accepted_by_reconciliation`. Round
 states are `open` and `closed`; hash roles are `claimed` and `computed`.
+
+Share collections are retained history, not an unbounded submission ledger.
+They contain authoritative shares at or above
+`database.min_persisted_share_difficulty` plus all candidate/security evidence.
+The threshold is inclusive and defaults to 80,000,000,000. Compact summary,
+round, and hashrate accounting still covers sub-threshold accepted results;
+their individual detail is available only in configured debug/trace JSONL.
+Public templates and private jobs are never SQLite resources. `/v1/templates`
+and `/v1/jobs` therefore return the normal JSON 404. The current template's
+redacted live state is available from `/v1/daemon`; routine template/job
+metadata is available only in configured debug/trace JSONL.
+
+Connection/worker collections contain active identities plus rows still needed
+by retained evidence or rolling hashrate buckets; they are not permanent logs
+of routine reconnect churn. Connection-detail counters and worker share counts
+are explicitly retained-row-only and must not be interpreted as the compact
+all-share totals reported by `/v1/summary`.
+
+Summary terminal share counters come from compact `share_totals`, so they cover
+retained and sub-threshold outcomes. Summary `shares.pending` combines active
+in-memory transient submissions with any provisional retained share rows; it is
+not limited to the retained `/v1/shares` collection.
 
 ## Resource fields
 
@@ -135,17 +155,15 @@ blob fields.
 | Resource | Fields |
 | --- | --- |
 | connection | `id` 32-hex, `session_id` 32-hex, `worker_id` decimal/null, `peer`, `peer_port`, `listen_address`, `agent`, `opened_at`, `authenticated_at` null/time, `closed_at` null/time, `close_reason` null/string, `last_sent_height`, `rx_bytes`, `tx_bytes`, `active`, `hashrate` |
-| worker | `id`, `login`, `rigid`, `first_seen_at`, `last_seen_at`, `active_connections`, `accepted_shares`, `rejected_shares`, `hashrate` |
-| template | `id`, `session_id`, `generation`, `height`, `prev_hash`, `seed_hash`, `next_seed_hash`, `difficulty`, `wide_difficulty_hex`, `reserved_offset`, `reserve_size`, `fetched_at`, `fetch_reason`; sensitive view adds `blocktemplate_blob`, `blockhashing_blob` |
-| job | `id` 32-hex, `connection_id` 32-hex, `template_id`, `height`, `seed_hash`, `verifier_seed_id`, `assigned_difficulty`, `target64_le`, `network_difficulty`, nonce/reserved offsets and sizes, `created_at`, `queued_at`, `expires_at`, `retired_at`; sensitive view adds `private_entropy`, `private_block_blob`, `hashing_blob` |
-| share | `id`, `connection_id`, `worker_id`, `job_id`, `request_sequence`, `miner_request_id_type`, `miner_request_id`, receive/complete times, `nonce`, `height`, assigned/actual/network difficulties, `height_is_older`, `claimed_candidate`, `candidate_admission`, `status`, error code/message, `provenance`, `credited_difficulty`, verifier ticket/seed/timings, claimed/computed hashes and target booleans, `candidate_id`, `round_id` |
+| worker | `id`, `login`, `rigid`, `first_seen_at`, `last_seen_at`, `active_connections`, retained-row `accepted_shares`, retained-row `rejected_shares`, `share_counts_retained_only` (always true), `hashrate` |
+| share | `id`, `connection_id`, `worker_id`, denormalized public `job_id`, `template_generation`, `request_sequence`, `miner_request_id_type`, `miner_request_id`, receive/complete times, `nonce`, `height`, assigned/actual/network difficulties, `height_is_older`, `claimed_candidate`, `candidate_admission`, `retention_reason`, `status`, error code/message, `provenance`, `credited_difficulty`, verifier ticket/seed/timings, claimed/computed hashes and target booleans, `candidate_id`, `round_id` |
 | hash | `share_id`, `role`, `hash`, share/network target booleans, `received_at`, `share_status`, `connection_id`, `worker_id`, `job_id`, assigned/actual/network/credited difficulties, `provenance`, `round_id` |
-| submission | `id`, `candidate_key`, `first_share_id`, `job_id`, `connection_id`, `height`, `peer`, `miner_tx_hash`, expected/canonical block IDs, `state`, attempt/max/indeterminate/reconciliation fields, create/update/accept times, `terminal_reason`; sensitive detail adds `frozen_block_blob` |
+| submission | `id`, `candidate_key`, `round_id`, nullable correlation `first_share_id`, denormalized public `job_id`, `template_generation`, originating `connection_id`, `height`, `peer`, `miner_tx_hash`, expected/canonical block IDs, `state`, attempt/max/indeterminate/reconciliation fields, create/update/accept times, `terminal_reason`; sensitive detail adds `frozen_block_blob` |
 | attempt | `id`, `candidate_id`, `attempt_number`, `rpc_request_id`, start/complete times, `classification`, HTTP/error/status/block-ID/excerpt nullable observations |
 | reconciliation | `id`, `candidate_id`, `cycle_number`, `lookup_kind`, `rpc_request_id`, requested/observed IDs, observed height/miner-tx/orphan, start/complete times, `classification`, excerpt |
-| round | `id`, open/close times, `state`, accepted candidate/height, miner transaction hash, block ID, `credited_difficulty`, `estimated_hashes`, `accepted_share_count`, `effort_finalized_at`, `effort` |
+| round | `id`, open/close times, `state`, accepted candidate/height, miner transaction hash, block ID, `credited_difficulty`, `estimated_hashes`, `accepted_share_count`, `max_share_height`, `effort_finalized_at`, `effort` |
 | ban | `id`, `peer`, create/expiry/evidence-window times, `reason`, `active`, ordered `abuse_event_ids` |
-| event | `id`, `session_id`, `created_at`, `type`, nullable linked connection/worker/template/job/share/candidate/round IDs, `payload` |
+| event | `id`, `session_id`, `created_at`, `type`, nullable linked connection/worker, scalar `template_generation`, public `job_id`, retained share/candidate/round IDs, `payload` |
 
 `candidate_admission` is `not_candidate`, `admitted`, `deferred`, `existing`,
 or `trusted_rate_limited`. `provenance` is `pending`, `verified`, or `claimed`.
@@ -184,18 +202,26 @@ when `effort.finalized` is true; `effort_finalized_at` records that boundary.
 
 The top-share response includes a `selection` object identifying global versus
 per-round scope and its configured cap. The recent-high response identifies
-its configured actual-difficulty threshold and cap. Both operate only on
-accepted shares with persisted actual difficulty.
+its configured actual-difficulty threshold and cap. Both selection objects set
+`retained_only: true`, and both operate only on accepted shares with persisted
+actual difficulty.
 
 The persistence response reports a live, exact snapshot of admitted writer
 queue items, their fixed 512-byte envelopes, and the subset in the priority
 FIFO. Commands blocked outside admission by the item/byte bounds are not queue
 items. `last_writer_error_*` are null; `last_commit_at` is the latest persistent
-event time.
+event time. `pending_accounting_items` is the live number of ordinary
+share-accounting contributions waiting for the next configured batch flush.
+`pending_transient_shares` is the live count of structurally admitted shares
+that have not reached a terminal outcome. Summary `shares.pending` is this live
+count plus provisional retained rows; summary `shares.total` adds the same live
+count to compact terminal totals.
 
-This release reads persistence schema 2 only. It intentionally performs no
+This release reads persistence schema 3 only. It intentionally performs no
 migration or statistical backfill; start it with a freshly initialized
-database when replacing a schema-1 test installation.
+database when replacing any schema-1 or schema-2 installation. Follow the exact
+configuration transformation and reversible SQLite-file reset in
+`CONFIGURATION.md`.
 
 ## Summary and readiness examples
 
@@ -205,7 +231,7 @@ database when replacing a schema-1 test installation.
   "generated_at": "2026-08-12T05:30:00.000000Z",
   "data": {
     "server": {
-      "version": "0.1.1+rev.123",
+      "version": "0.2.0+rev.123",
       "git_commit": "b1f1e365d7ab344ca5ca7f3334fdfbea5da7f9fd",
       "session_id": "0123456789abcdef0123456789abcdef",
       "started_at": "2026-08-12T05:00:00.000000Z",
@@ -221,7 +247,7 @@ database when replacing a schema-1 test installation.
       "zmq": "disabled",
       "height": 3736190,
       "template_generation": "42",
-      "template_id": "42"
+      "template_id": null
     },
     "connections": {"active": 1, "total": "1"},
     "workers": {"active": 1, "total": "1"},
@@ -238,6 +264,7 @@ database when replacing a schema-1 test installation.
       "id": "1", "state": "open",
       "opened_at": "2026-08-12T05:00:00.000000Z",
       "estimated_hashes": "0", "accepted_share_count": "0",
+      "max_share_height": 0,
       "effort": {
         "unit": "percent", "value": "0.000000",
         "precision": "0.000001", "rounding": "down",

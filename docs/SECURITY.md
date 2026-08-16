@@ -138,10 +138,12 @@ or application crash output:
 - private RandomX seed key bytes;
 - any future wallet secret.
 
-The payout address is public and may be logged. Database private job blobs and
-hash material are intentionally persisted for reconstruction/audit and are
-available only through an authenticated sensitive API view. They are not
-wallet secrets, but should still be treated as operationally sensitive.
+The payout address is public and may be logged. SQLite never stores public
+template or private job blobs. It intentionally retains frozen candidate block
+blobs and selected share hash evidence for reconstruction/audit; frozen
+candidate bytes are available only through an authenticated sensitive API
+view. They are not wallet secrets, but should still be treated as
+operationally sensitive.
 The 16-byte per-job template entropy is the one explicit logging exception.
 Trace logging copies it to `job.queued.private_job_entropy` automatically;
 `logging.include_private_job_entropy=true` enables the same field at debug.

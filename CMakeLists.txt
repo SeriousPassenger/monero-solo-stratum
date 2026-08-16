@@ -1,6 +1,16 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.31.6)
 
-project(monero-solo-stratum VERSION 0.1.1 LANGUAGES C CXX)
+project(monero-solo-stratum VERSION 0.2.0 LANGUAGES C CXX)
+
+# RandomX currently declares compatibility with CMake 3.5. CMake 4 warns that
+# support for policy versions older than 3.10 is deprecated; raise the policy
+# floor for bundled dependencies without modifying the pinned submodule.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
+    if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR
+       CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.10)
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+    endif()
+endif()
 
 include(CTest)
 include(GNUInstallDirs)
@@ -103,7 +113,26 @@ set(MSPV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(MSPV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MSPV_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
 set(MSPV_BUILD_FAST_TESTS OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/monero-stratum-pow-verifier)
+block()
+    # RandomX's pinned CMake 3.5 declaration is outside this project's control.
+    # Suppress only that dependency's known compatibility deprecation warning.
+    if(DEFINED CACHE{CMAKE_WARN_DEPRECATED})
+        get_property(MSS_SAVED_CMAKE_WARN_DEPRECATED
+            CACHE CMAKE_WARN_DEPRECATED PROPERTY VALUE)
+        set(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED ON)
+    else()
+        set(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED OFF)
+    endif()
+    set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL
+        "Suppress deprecation warnings from pinned dependencies" FORCE)
+    add_subdirectory(third_party/monero-stratum-pow-verifier)
+    if(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED)
+        set(CMAKE_WARN_DEPRECATED "${MSS_SAVED_CMAKE_WARN_DEPRECATED}"
+            CACHE BOOL "Emit CMake deprecation warnings" FORCE)
+    else()
+        unset(CMAKE_WARN_DEPRECATED CACHE)
+    endif()
+endblock()
 
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 set(JSON_Install OFF CACHE INTERNAL "")

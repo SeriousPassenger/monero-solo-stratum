@@ -40,7 +40,7 @@ monerod RPC poll / optional ZMQ hint
 | `Config` | Strict startup-only JSON, complete key/range checking, endpoint/address/path validation, and parsed no-shell hook argv. |
 | `Logger` | Thread-safe bounded JSONL records with UTC microseconds, severity filtering, stable codes, and a closed set of public string/integer correlation fields; stderr or an `O_NOFOLLOW` append-only mode-0600 file. |
 | `EntropyManager` | Process-private HMAC-DRBG-SHA-256 state seeded with Linux `getrandom(2)`; independent private-template entropy and job-ID draws. |
-| `Database` | Schema v1, WAL/FULL guarantees, sessions, templates/jobs/shares, duplicates, candidates, rounds, bans, events, hashrate, and notification delivery. |
+| `Database` | Clean-only schema v3, WAL/FULL candidate guarantees, selective significant shares, compact/batched accounting, candidates, rounds, bans, significant events, and notification delivery. |
 | `DaemonRpcClient` | Bounded libcurl JSON-RPC requests, Digest-only configured authentication, template and submit/reconciliation observation classification. |
 | `ZmqSubscriber` | Optional dynamically loaded `libzmq` subscriber. Notifications are refresh hints; polling remains authoritative. |
 | Monero primitives | Primary-address decoding, strict block/miner-transaction parsing, reserved-byte and nonce mutation, tree/hash blobs, block IDs, and exact difficulty checks. |
@@ -59,10 +59,10 @@ Startup is fail-closed:
 
 1. Strictly parse and statically validate the explicit config file.
 2. Open SQLite, require `foreign_keys=ON`, `journal_mode=WAL`, and
-   `synchronous=FULL`, validate schema v2, and recover interrupted durable
+   `synchronous=FULL`, validate schema v3, and recover interrupted durable
    states.
-3. Create the server session/open round and restore bans and active duplicate
-   identities.
+3. Create the server session/open round, restore bans, and start a fresh
+   ordinary duplicate registry (no pre-restart private job remains valid).
 4. Instantiate the OS-seeded entropy manager and, in verified mode, start the
    native verifier.
 5. Start enabled read-only data interfaces in a not-ready state.
@@ -80,14 +80,23 @@ readiness dependencies.
 Every valid `getblocktemplate` response is installed, including a same-height
 or byte-identical response, and receives a monotonic generation. The full block
 is parsed locally; its previous hash, coinbase height, exact 16-byte reserved
-region, and regenerated hashing blob must match the daemon response.
+region, and regenerated hashing blob must match the daemon response. One shared
+validated public-template snapshot is used for all jobs derived from that
+refresh; the daemon is not queried separately for each connection.
 
 For each connection and template, the runtime copies the full block, draws
 16 independent entropy bytes and a separate 16-byte job ID, replaces only the
-reserved region, reparses, and derives a new hashing blob. SQLite `UNIQUE`
-constraints on both entropy and public job ID are the lifetime reservation.
-The job retains the exact private block, hashing blob, seed ID, offsets,
-targets, and expiry. A nonce is never applied to a newer template.
+reserved region, reparses, and derives a new hashing blob. The live in-memory
+job map refuses a public job-ID collision. Private entropy is not checked for
+uniqueness, and neither independent 128-bit value has a database-lifetime
+uniqueness constraint. The job retains the exact private
+block, hashing blob, seed ID, offsets, targets, and expiry. A nonce is never
+applied to a newer template. Templates and jobs are never inserted into
+SQLite. Every job at the connection's latest queued height remains valid and
+accumulates in live memory until a complete strictly higher-height job has been
+queued to that connection, the connection closes, or the process restarts.
+Same-height jobs ignore TTL. TTL applies only to noncurrent work at a different
+height that can remain after a downward reorg.
 
 ## Share and candidate paths
 
@@ -96,6 +105,13 @@ structurally accepted share reserves the global binary identity
 `private_entropy || claimed_hash`. Verified mode submits an owned hashing blob
 copy to MSPV and treats only the computed hash as authoritative. Trusted mode
 uses the claim and labels its provenance `claimed`.
+
+Only authoritative results at or above the configured 80 G default threshold,
+plus candidate/security evidence, receive individual share rows. Lower-value
+results feed compact accounting batches and debug/trace JSONL. Retained shares
+denormalize their public job ID, template generation, height, difficulty,
+nonce, outcome, timing, and hash evidence; candidates carry the frozen block
+and all context required for retry/recovery.
 
 Staleness is evaluated only after work validity is known:
 
@@ -155,8 +171,9 @@ closes data interfaces. An uncertain transport observation is never rewritten
 as rejection merely to exit.
 
 At open, `dispatching` attempts become recoverable, orphaned `blocknotify`
-`running` rows return to `pending`, active bans/duplicates are restored, and
-nonterminal candidates are reconciled before another due dispatch. Candidate
+`running` rows return to `pending`, active bans are restored, the ordinary
+duplicate registry starts empty, and nonterminal candidates are reconciled
+before another due dispatch. Candidate
 acceptance and round close are conditional transactions, so replays and
 restart recovery cannot logically accept a candidate twice.
 

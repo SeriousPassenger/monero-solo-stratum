@@ -19,7 +19,6 @@ struct StratumConfig {
     std::uint64_t max_line_bytes{16384};
     std::uint64_t max_output_bytes_per_connection{1048576};
     std::uint64_t max_json_depth{32};
-    std::uint64_t job_history{6};
     std::uint64_t job_ttl_ms{120000};
     std::uint64_t max_pending_verifications_per_connection{8};
     // Zero selects a hardware-derived value at Runtime construction.
@@ -74,8 +73,8 @@ struct DatabaseConfig {
     std::uint64_t busy_timeout_ms{5000};
     std::uint64_t max_writer_queue_items{100000};
     std::uint64_t max_writer_queue_bytes{67108864};
-    std::uint64_t retention_days{0};
-    bool store_rejected_shares{true};
+    std::uint64_t min_persisted_share_difficulty{80000000000ULL};
+    std::uint64_t accounting_flush_interval_ms{1000};
 };
 
 struct EventsConfig {
@@ -97,7 +96,7 @@ struct ApiConfig {
     std::uint64_t max_pending_bytes_per_connection{2097152};
     std::uint64_t top_shares_limit{100};
     std::uint64_t recent_high_shares_limit{100};
-    std::uint64_t recent_high_share_min_difficulty{20000000000ULL};
+    std::uint64_t recent_high_share_min_difficulty{80000000000ULL};
 };
 
 struct DefenseConfig {

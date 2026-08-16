@@ -19,6 +19,93 @@ validation works on a development machine. Production should normally use
 `/run/monero-solo-stratum/events.sock`, mode `0600` for a credential-bearing
 config file, and nonempty independent Stratum/API secrets.
 
+## Upgrading configuration schema 1
+
+Configuration schema 2 is intentionally strict and has no implicit upgrade.
+Before starting this release, preserve the original file, change only the
+following fields, and validate the result:
+
+- set top-level `schema_version` to `2`;
+- remove `stratum.job_history`;
+- remove `database.retention_days` and `database.store_rejected_shares`;
+- add `database.min_persisted_share_difficulty` if desired (default
+  `80000000000`, inclusive);
+- add `database.accounting_flush_interval_ms` if desired (default `1000`); and
+- ensure `api.recent_high_share_min_difficulty` is at least the database
+  persistence threshold. The old example value `20000000000` must therefore be
+  raised to at least `80000000000` when the new default is used.
+
+This example performs those exact transformations while preserving every other
+JSON value and the original ownership/mode. It then moves the old schema-1/2
+SQLite files aside instead of deleting them. Review `CONFIG_PATH` and the
+derived `DB_PATH` before running it:
+
+```sh
+set -euo pipefail
+
+CONFIG_PATH=/etc/monero-solo-stratum/config.json
+DB_PATH=$(jq -er '.database.path | select(type == "string")' "$CONFIG_PATH")
+case "$DB_PATH" in
+  /*) ;;
+  *) printf 'database.path is not absolute: %s\n' "$DB_PATH" >&2; exit 1 ;;
+esac
+test "$DB_PATH" != /
+
+UPGRADE_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+CONFIG_BACKUP="$CONFIG_PATH.schema1.$UPGRADE_STAMP"
+test ! -e "$CONFIG_BACKUP"
+printf 'Configuration to transform after exact backup:\n  %s\n  -> %s\n' \
+  "$CONFIG_PATH" "$CONFIG_BACKUP"
+printf 'Existing SQLite files to move aside (none are deleted):\n'
+for DB_SOURCE in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
+  if test -e "$DB_SOURCE"; then
+    test ! -e "$DB_SOURCE.schema-old.$UPGRADE_STAMP"
+    printf '  %s\n  -> %s\n' \
+      "$DB_SOURCE" "$DB_SOURCE.schema-old.$UPGRADE_STAMP"
+  fi
+done
+printf 'Proceed? [y/N] '
+read -r UPGRADE_APPROVAL
+case "$UPGRADE_APPROVAL" in
+  y|Y|yes|YES) ;;
+  *) printf 'aborted; nothing changed\n' >&2; exit 1 ;;
+esac
+
+systemctl stop monero-solo-stratum.service
+cp --archive --no-clobber -- "$CONFIG_PATH" "$CONFIG_BACKUP"
+CONFIG_TMP=$(mktemp --tmpdir="$(dirname -- "$CONFIG_PATH")" .config.json.XXXXXX)
+jq '
+  .schema_version = 2
+  | del(.stratum.job_history,
+        .database.retention_days,
+        .database.store_rejected_shares)
+  | .database.min_persisted_share_difficulty //= 80000000000
+  | .database.accounting_flush_interval_ms //= 1000
+  | .api.recent_high_share_min_difficulty =
+      ([.api.recent_high_share_min_difficulty // 80000000000,
+        .database.min_persisted_share_difficulty] | max)
+' "$CONFIG_PATH" >"$CONFIG_TMP"
+chown --reference="$CONFIG_PATH" -- "$CONFIG_TMP"
+chmod --reference="$CONFIG_PATH" -- "$CONFIG_TMP"
+monero-solo-stratum --check-config --config "$CONFIG_TMP"
+mv -- "$CONFIG_TMP" "$CONFIG_PATH"
+
+for DB_SOURCE in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
+  if test -e "$DB_SOURCE"; then
+    mv --no-clobber -- \
+      "$DB_SOURCE" "$DB_SOURCE.schema-old.$UPGRADE_STAMP"
+  fi
+done
+
+monero-solo-stratum --check-config --config "$CONFIG_PATH"
+systemctl start monero-solo-stratum.service
+```
+
+The database reset targets only the configured SQLite path and its exact
+`-wal`/`-shm` companions. It does not inspect, move, or delete the Monero daemon
+data directory, and it does not remove any other file under
+`/etc/monero-solo-stratum`.
+
 ## Required structure
 
 The top level must contain exactly `schema_version`, `network`,
@@ -41,7 +128,7 @@ Every other key below is optional and takes the listed default.
 
 | Key | Type/default | Validation and meaning |
 | --- | --- | --- |
-| `schema_version` | required integer `1` | No other configuration schema is accepted. |
+| `schema_version` | required integer `2` | No other configuration schema is accepted. |
 | `network` | required string | `mainnet`, `testnet`, `stagenet`, or `regtest`. Daemon nettype must respectively be `mainnet`, `testnet`, `stagenet`, or `fakechain`. |
 | `wallet_address` | required string, max 256 bytes | Checksum-valid primary address only. Prefixes: mainnet/regtest 18, testnet 53, stagenet 24. Integrated/subaddress and network-mismatched addresses are rejected. |
 | `blocknotify` | required null/string | Null or empty disables. Otherwise max 65,536 bytes, must parse to nonempty argv, contain `%s`, and name an absolute executable. See below. |
@@ -59,8 +146,7 @@ Every other key below is optional and takes the listed default.
 | `max_line_bytes` | 16,384 | 1,024..1,048,576, excluding LF |
 | `max_output_bytes_per_connection` | 1,048,576 | 4,096..67,108,864 |
 | `max_json_depth` | 32 | 4..128 |
-| `job_history` | 6 | 1..64 current/prior jobs |
-| `job_ttl_ms` | 120,000 | 1,000..3,600,000 for prior jobs |
+| `job_ttl_ms` | 120,000 | 1,000..3,600,000; applies only to noncurrent jobs at a different height after reorg |
 | `max_pending_verifications_per_connection` | 8 | 1..4,096 and no greater than `verifier.max_outstanding` |
 | `submit_workers` | 0 (auto) | 0..256; zero derives a nonzero count from available CPU while reserving capacity for I/O |
 
@@ -68,6 +154,14 @@ With a nonempty `access_password`, the pre-authentication connection-rate
 bucket is bypassed so rental services can reconnect many miners behind one IP.
 The configured global/per-IP connection ceilings still apply, and failed
 authentication plus all post-connect request/submit limits remain enforced.
+
+Every successfully queued poll/notification refresh creates fresh jobs. All
+jobs at the connection's latest queued height remain valid regardless of
+`job_ttl_ms`; they accumulate until a strictly higher-height job is queued, the
+connection closes, or the process restarts. This deliberately favors valid
+same-height submissions over a fixed memory bound. `job_ttl_ms` applies only to
+noncurrent work at a different height that can remain visible during a
+downward-reorg sequence.
 
 ## Daemon
 
@@ -133,8 +227,21 @@ slower. At least two seeds are required for transitions. See `VERIFIER.md`.
 | `database.busy_timeout_ms` | 5,000 | 1..60,000 |
 | `database.max_writer_queue_items` | 100,000 | 1,024..10,000,000 |
 | `database.max_writer_queue_bytes` | 67,108,864 | 1,048,576..1,073,741,824 |
-| `database.retention_days` | 0 | Exactly 0 (unlimited) in this release |
-| `database.store_rejected_shares` | true | Boolean |
+| `database.min_persisted_share_difficulty` | 80,000,000,000 | 1..18,446,744,073,709,551,615; inclusive authoritative actual-difficulty threshold |
+| `database.accounting_flush_interval_ms` | 1,000 | 10..60,000; maximum ordinary accounting batch interval |
+
+In verified mode, persisted-share selection uses only the independently
+computed hash. In trusted mode it uses the claimed hash. Candidate and
+security-evidence shares are always persisted regardless of the threshold.
+Other terminal shares below the threshold update compact accounting totals but
+do not receive individual database rows; detailed low-value submissions remain
+available in the configured debug/trace JSONL. An unclean process exit may
+lose at most one configured flush interval of ordinary aggregate telemetry.
+Candidate state and security evidence are committed synchronously and are not
+subject to that loss window. Public templates and private jobs are
+live-memory/trace data and are never stored as SQLite rows or blobs. Same-height
+jobs intentionally accumulate without a fixed count/TTL bound until a strictly
+higher-height job is queued, the connection closes, or the process restarts.
 
 Writer capacity must additionally cover
 `defense.candidate_global_inflight + 1024` items in trusted mode, or
@@ -161,7 +268,11 @@ combinations fail static validation.
 | `api.max_pending_bytes_per_connection` | 2,097,152 | 4,096..67,108,864 |
 | `api.top_shares_limit` | 100 | 1..100; maximum/default rows in global and per-round actual-difficulty rankings |
 | `api.recent_high_shares_limit` | 100 | 1..100; maximum/default rows in the round-independent recent-high view |
-| `api.recent_high_share_min_difficulty` | 20,000,000,000 | 1..18,446,744,073,709,551,615; inclusive actual-difficulty threshold |
+| `api.recent_high_share_min_difficulty` | 80,000,000,000 | `database.min_persisted_share_difficulty`..18,446,744,073,709,551,615; inclusive actual-difficulty threshold |
+
+The recent-high API threshold cannot be lower than the persistence threshold,
+because `/v1/shares` exposes retained history rather than an unbounded record
+of every submitted share.
 
 The API token and Stratum password are unrelated. An unauthenticated API cannot
 request sensitive blob views even when it is loopback-only.

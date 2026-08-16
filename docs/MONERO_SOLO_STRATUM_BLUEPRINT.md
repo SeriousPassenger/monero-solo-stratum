@@ -127,8 +127,10 @@ The server MUST:
 - bypass verifier waiting for a miner-claimed network candidate and submit its
   frozen block to `monerod` immediately after durable journaling, deduplication,
   and candidate-abuse admission;
-- persist connections, jobs, claimed/computed hashes, shares, candidates,
-  attempts, rounds, bans, events, hashrate buckets, and block notifications;
+- persist connections, significant claimed/computed shares, compact share
+  totals, self-contained candidates, attempts, rounds, bans, significant
+  events, hashrate buckets, and block notifications; public templates and
+  private jobs remain live-memory/trace data only;
 - expose a versioned read-only JSON API;
 - optionally expose a live Unix-domain newline-delimited JSON event stream;
 - enforce aggressive but normal-miner-tolerant connection and request limits;
@@ -185,7 +187,8 @@ Recommended components and ownership:
 
 1. `Config`: strict JSON loading, defaults, validation, and redaction metadata.
 2. `EntropyManager`: OS entropy plus HMAC-DRBG-SHA-256.
-3. `Database`: migrations, one prioritized writer, read-only query pool.
+3. `Database`: exact clean-create schema validation, one prioritized writer,
+   read-only query pool.
 4. `DaemonRpc`: bounded HTTP JSON-RPC requests and response classification.
 5. `DaemonZmq`: optional `json-minimal-chain_main` notifications.
 6. `TemplateManager`: coalesced polling/ZMQ refresh and validated public snapshots.
@@ -279,8 +282,9 @@ monero-solo-stratum/
     └── monero-stratum-pow-verifier/   # gitlink pinned to 856c015de433a23fe45d88a18dc08c821e50f1cb
 ```
 
-The server SHOULD use C++20 (C++17 is the verifier's minimum), CMake 3.16 or
-newer, and system dependencies with permissive/compatible licenses:
+The server SHOULD use C++20 (C++17 is the verifier's minimum), CMake 3.31.6 or
+newer (the Debian 13 stable baseline), and system dependencies with
+permissive/compatible licenses:
 
 - libuv for event-loop/TCP/process integration;
 - libcurl for daemon HTTP RPC;
@@ -296,14 +300,38 @@ native verifier pin may not float. Add it as a submodule and link its exported
 target:
 
 ```cmake
-cmake_minimum_required(VERSION 3.16)
-project(monero-solo-stratum LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.31.6)
+project(monero-solo-stratum VERSION 0.2.0 LANGUAGES C CXX)
+
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
+    if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR
+       CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.10)
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+    endif()
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_subdirectory(third_party/monero-stratum-pow-verifier)
+block()
+    if(DEFINED CACHE{CMAKE_WARN_DEPRECATED})
+        get_property(MSS_SAVED_CMAKE_WARN_DEPRECATED
+            CACHE CMAKE_WARN_DEPRECATED PROPERTY VALUE)
+        set(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED ON)
+    else()
+        set(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED OFF)
+    endif()
+    set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL
+        "Suppress deprecation warnings from pinned dependencies" FORCE)
+    add_subdirectory(third_party/monero-stratum-pow-verifier)
+    if(MSS_CMAKE_WARN_DEPRECATED_WAS_CACHED)
+        set(CMAKE_WARN_DEPRECATED "${MSS_SAVED_CMAKE_WARN_DEPRECATED}"
+            CACHE BOOL "Emit CMake deprecation warnings" FORCE)
+    else()
+        unset(CMAKE_WARN_DEPRECATED CACHE)
+    endif()
+endblock()
 
 add_executable(monero-solo-stratum
     # explicit source list
@@ -349,11 +377,12 @@ wrong types, invalid encodings, out-of-range values, invalid addresses, and
 missing required keys MUST fail startup before a public listener opens. An
 explicit configuration-file error MUST NOT fall through to a different file.
 
-This is the complete v1 example. It contains no dashboard setting by design.
+This is the complete configuration-schema-v2 example. It contains no dashboard
+setting by design.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "network": "mainnet",
   "wallet_address": "4...",
   "blocknotify": null,
@@ -370,7 +399,6 @@ This is the complete v1 example. It contains no dashboard setting by design.
     "max_line_bytes": 16384,
     "max_output_bytes_per_connection": 1048576,
     "max_json_depth": 32,
-    "job_history": 6,
     "job_ttl_ms": 120000,
     "max_pending_verifications_per_connection": 8,
     "submit_workers": 0
@@ -418,8 +446,8 @@ This is the complete v1 example. It contains no dashboard setting by design.
     "busy_timeout_ms": 5000,
     "max_writer_queue_items": 100000,
     "max_writer_queue_bytes": 67108864,
-    "retention_days": 0,
-    "store_rejected_shares": true
+    "min_persisted_share_difficulty": 80000000000,
+    "accounting_flush_interval_ms": 1000
   },
   "events": {
     "enabled": true,
@@ -436,7 +464,10 @@ This is the complete v1 example. It contains no dashboard setting by design.
     "max_connections": 64,
     "request_rate_per_second": 20,
     "request_burst": 40,
-    "max_pending_bytes_per_connection": 2097152
+    "max_pending_bytes_per_connection": 2097152,
+    "top_shares_limit": 100,
+    "recent_high_shares_limit": 100,
+    "recent_high_share_min_difficulty": 80000000000
   },
   "defense": {
     "enabled": true,
@@ -494,7 +525,7 @@ Other omitted keys use the exact defaults shown above.
 
 | Key | Contract |
 | --- | --- |
-| `schema_version` | Exactly integer `1` for this blueprint. |
+| `schema_version` | Exactly integer `2` for this blueprint. |
 | `network` | One of `mainnet`, `testnet`, `stagenet`, `regtest`; use the exact mapping in section 6.4 and cross-check daemon before readiness. |
 | `wallet_address` | Full Base58/checksum/prefix validation; primary address only. Reject integrated addresses, subaddresses, unknown prefixes, checksum errors, and network mismatch using section 6.4. |
 | `blocknotify` | `null` or a nonempty no-shell command template documented in section 22. Empty string is treated as disabled. |
@@ -506,7 +537,7 @@ Other omitted keys use the exact defaults shown above.
 | `difficulty.mode` | Exactly `fixed` or `minimum`; there is no vardiff in v1. |
 | `difficulty.value` | Unsigned decimal integer, at least 1 and at most `UINT64_MAX`. |
 | `verifier.enabled` | `true` gives authoritative computed RandomX hashes; `false` is trusted-miner mode and allocates no RandomX verifier resources. |
-| `database.retention_days` | V1 requires exact integer `0`: unlimited retention and no automatic deletion. |
+| `database.min_persisted_share_difficulty` | Inclusive authoritative actual-difficulty floor for individual share rows; default 80,000,000,000. Candidate/security evidence bypasses it. |
 | `api.access_token` | `null`/`""` disables API authentication; nonempty means exact Bearer token. It is independent from the Stratum password. |
 
 Every omitted optional key takes the value in the complete example. JSON
@@ -527,8 +558,7 @@ decoding unless a field is explicitly hex.
 | `max_line_bytes` | 1,024..1,048,576; default 16,384, excluding LF. |
 | `max_output_bytes_per_connection` | 4,096..67,108,864; default 1,048,576. A job/result that cannot fit closes the connection without changing latest-sent state. |
 | `max_json_depth` | 4..128; default 32. |
-| `job_history` | 1..64 total retained current/prior jobs; default 6. |
-| `job_ttl_ms` | 1,000..3,600,000 for prior jobs; default 120,000. |
+| `job_ttl_ms` | 1,000..3,600,000 for noncurrent work at a different height after a downward reorg; default 120,000. It never expires jobs at the connection's latest queued height. |
 | `max_pending_verifications_per_connection` | 1..4,096 and no greater than `verifier.max_outstanding`; default 8. Validated even when verification is disabled. |
 | `submit_workers` | 0..256; default 0 selects a hardware-derived nonzero value while retaining CPU for I/O. |
 
@@ -576,8 +606,8 @@ presented. Global/per-IP socket ceilings and subsequent defense checks remain.
 | `database.busy_timeout_ms` | 1..60,000; default 5,000. |
 | `database.max_writer_queue_items` | 1,024..10,000,000; default 100,000. |
 | `database.max_writer_queue_bytes` | 1,048,576..1,073,741,824; default 67,108,864. Candidate dispatch intents use a separately reserved priority slot. |
-| `database.retention_days` | Exact integer 0 in v1; nonzero is rejected. |
-| `database.store_rejected_shares` | Boolean; default true. |
+| `database.min_persisted_share_difficulty` | 1..`UINT64_MAX`; default 80,000,000,000; inclusive and computed-hash authoritative in verified mode. |
+| `database.accounting_flush_interval_ms` | 10..60,000; default 1,000. |
 
 | Data-interface key | Type and allowed value |
 | --- | --- |
@@ -593,6 +623,96 @@ presented. Global/per-IP socket ceilings and subsequent defense checks remain.
 | `api.max_connections` | 1..10,000; default 64. |
 | `api.request_rate_per_second`, `api.request_burst` | Each 1..1,000,000 per immutable peer IP; defaults 20/40. |
 | `api.max_pending_bytes_per_connection` | 4,096..67,108,864; default 2,097,152. |
+| `api.top_shares_limit`, `api.recent_high_shares_limit` | Each 1..100; defaults 100/100. |
+| `api.recent_high_share_min_difficulty` | `database.min_persisted_share_difficulty`..`UINT64_MAX`; default 80,000,000,000 and inclusive. |
+
+The recent-high API floor cannot be lower than the persistence floor because
+the API ranks retained rows rather than an unbounded submission ledger.
+
+#### Configuration-schema-1 and database upgrade
+
+There is no implicit configuration or SQLite migration. Before this release:
+
+1. preserve the configuration file byte-for-byte as a backup;
+2. set top-level `schema_version` to `2`;
+3. remove `stratum.job_history`, `database.retention_days`, and
+   `database.store_rejected_shares`;
+4. add `database.min_persisted_share_difficulty` (default/inclusive
+   `80000000000`) and `database.accounting_flush_interval_ms` (default `1000`);
+5. make `api.recent_high_share_min_difficulty` at least the database threshold
+   (the old example's `20000000000` must become at least `80000000000` when
+   using the new default); and
+6. while the service is stopped, move aside only the configured SQLite file and
+   its exact `-wal` and `-shm` companions. Never inspect or remove the Monero
+   daemon data directory or unrelated files under `/etc/monero-solo-stratum`.
+
+The exact reversible sequence is:
+
+```sh
+set -euo pipefail
+
+CONFIG_PATH=/etc/monero-solo-stratum/config.json
+DB_PATH=$(jq -er '.database.path | select(type == "string")' "$CONFIG_PATH")
+case "$DB_PATH" in
+  /*) ;;
+  *) printf 'database.path is not absolute: %s\n' "$DB_PATH" >&2; exit 1 ;;
+esac
+test "$DB_PATH" != /
+
+UPGRADE_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+CONFIG_BACKUP="$CONFIG_PATH.schema1.$UPGRADE_STAMP"
+test ! -e "$CONFIG_BACKUP"
+printf 'Configuration to transform after exact backup:\n  %s\n  -> %s\n' \
+  "$CONFIG_PATH" "$CONFIG_BACKUP"
+printf 'Existing SQLite files to move aside (none are deleted):\n'
+for DB_SOURCE in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
+  if test -e "$DB_SOURCE"; then
+    test ! -e "$DB_SOURCE.schema-old.$UPGRADE_STAMP"
+    printf '  %s\n  -> %s\n' \
+      "$DB_SOURCE" "$DB_SOURCE.schema-old.$UPGRADE_STAMP"
+  fi
+done
+printf 'Proceed? [y/N] '
+read -r UPGRADE_APPROVAL
+case "$UPGRADE_APPROVAL" in
+  y|Y|yes|YES) ;;
+  *) printf 'aborted; nothing changed\n' >&2; exit 1 ;;
+esac
+
+systemctl stop monero-solo-stratum.service
+cp --archive --no-clobber -- "$CONFIG_PATH" "$CONFIG_BACKUP"
+CONFIG_TMP=$(mktemp --tmpdir="$(dirname -- "$CONFIG_PATH")" .config.json.XXXXXX)
+jq '
+  .schema_version = 2
+  | del(.stratum.job_history,
+        .database.retention_days,
+        .database.store_rejected_shares)
+  | .database.min_persisted_share_difficulty //= 80000000000
+  | .database.accounting_flush_interval_ms //= 1000
+  | .api.recent_high_share_min_difficulty =
+      ([.api.recent_high_share_min_difficulty // 80000000000,
+        .database.min_persisted_share_difficulty] | max)
+' "$CONFIG_PATH" >"$CONFIG_TMP"
+chown --reference="$CONFIG_PATH" -- "$CONFIG_TMP"
+chmod --reference="$CONFIG_PATH" -- "$CONFIG_TMP"
+monero-solo-stratum --check-config --config "$CONFIG_TMP"
+mv -- "$CONFIG_TMP" "$CONFIG_PATH"
+
+for DB_SOURCE in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
+  if test -e "$DB_SOURCE"; then
+    mv --no-clobber -- \
+      "$DB_SOURCE" "$DB_SOURCE.schema-old.$UPGRADE_STAMP"
+  fi
+done
+
+monero-solo-stratum --check-config --config "$CONFIG_PATH"
+systemctl start monero-solo-stratum.service
+```
+
+This sequence backs up the old config with its metadata, preserves ownership
+and mode on the transformed file, and moves database files instead of deleting
+them. `docs/CONFIGURATION.md` repeats the operator-facing procedure. An old
+database must fail closed; it is never guessed, deleted, or upgraded in place.
 
 | Defense/logging key | Type and allowed value |
 | --- | --- |
@@ -690,7 +810,7 @@ Startup MUST be fail-closed and ordered:
 ```text
 load strict JSON
 validate all types, ranges, paths, secrets, and payout address
-open SQLite and run forward-only migrations
+open SQLite; create schema v3 only when empty, otherwise require exact v3
 set WAL + synchronous=FULL + foreign_keys=ON
 create a new server-session record
 restore unexpired bans and the single open round
@@ -732,8 +852,9 @@ On restart:
 
 1. Reopen the existing open round; do not create another if one already exists.
 2. Restore active bans by normalized address and expiry.
-3. Reconstruct active duplicate identities from persisted, still-eligible jobs
-   and submissions so restart does not reopen a replay window.
+3. Start with an empty ordinary duplicate registry. Private jobs are
+   process-local and no pre-restart job is eligible after restart; durable
+   candidate keys continue to prevent duplicate candidate submission.
 4. Load candidates in `journaled`, `dispatching`, `retry_wait`, or `ambiguous`.
 5. Reconcile each against confirmed chain evidence before sending another RPC.
 6. Resume an existing logical submission sequence with the same frozen bytes,
@@ -982,36 +1103,36 @@ work. Operators may configure 3 or more when memory permits.
 
 ### 9.4 Private job derivation
 
-For every active connection and every public-template update:
+One validated public-template snapshot is shared by all jobs derived from a
+successful refresh. `getblocktemplate` is called for startup, configured polls,
+coalesced retry, and ZMQ-triggered refresh—not once per connection. For every
+active connection and installed public-template generation:
 
 ```text
 for attempt in 1..8:
     copy exact validated public full-block bytes
     draw independent private_entropy[16]
     draw independent job_id[16]
+    if job_id collides with the live in-memory job map:
+        discard both draws and retry
     replace exactly bytes [reserved_offset, reserved_offset + 16)
     reparse the mutated full block
     recompute miner transaction hash, Merkle root, and RandomX hashing blob
-    attempt one writer transaction inserting under both UNIQUE constraints
-    if either value collides:
-        discard both draws and retry with two fresh generate calls
-    retain the complete private context
+    retain the complete private context in live memory
     encode and queue the Stratum job
     only after queue success assign connection_last_sent_height = this_job.height
     return
 fail job derivation closed, mark readiness degraded, and emit a nonsecret event
 ```
 
-The successful serialized SQLite insert is the atomic reservation. The
-uniqueness scope is the lifetime of the configured SQLite database, which
-is stronger and simpler than live-job-only uniqueness. `public_job_id` and
-`entropy` each have independent UNIQUE constraints. A losing concurrent insert
-counts as that attempt's collision. Never reuse the noncolliding half of a
-pair, and never expose or persist a job whose transaction did not commit.
+The job is not a SQLite row. Its public ID is refused only on collision with
+the current process's live job map. The independent 128-bit entropy draw is not
+checked for uniqueness and has no database-lifetime uniqueness promise. A
+job-ID collision retry never reuses half of a discarded pair.
 
 The retained private context MUST include:
 
-- database/public template ID and generation;
+- public-template generation;
 - 16-byte job ID and 16-byte private entropy;
 - exact mutated full block bytes;
 - exact hashing blob bytes;
@@ -1023,10 +1144,14 @@ The retained private context MUST include:
 - monotonic creation time and UTC timestamp;
 - reference counts for connection history, verifier work, and candidate work.
 
-Retain the current job plus five previous jobs by default (six total). A prior
-job expires after 120 seconds. The current job remains until replaced even if
-older than the TTL. Submitted nonces are always applied to the exact retained
-private template, never to the newest template.
+Every job at the connection's latest completely queued height remains eligible,
+with no count or TTL bound, until a complete strictly higher-height job is
+queued to that connection, the connection closes, or the process restarts.
+`job_ttl_ms` applies only to noncurrent work at a different height that can
+remain after a downward reorg. Submitted nonces are always applied to the exact
+retained private template, never to the newest template. Template/job detail is
+available through live state and configured debug/trace JSONL only; neither
+full blob is stored in SQLite.
 
 ## 10. XMRig simple-mode Stratum protocol
 
@@ -1169,9 +1294,10 @@ Requirements:
 - IDs and hashes normalize to lowercase only after strict decoding.
 
 Assign every syntactically accepted submit a monotonically increasing internal
-`request_sequence` scoped to the connection. Persist request ID type and value
-for correlation, never as a uniqueness key; legal reuse after response creates
-a new sequence/share row.
+`request_sequence` scoped to the connection. Keep request ID type and value for
+correlation, never as a uniqueness key; legal reuse after response creates a
+new sequence/submission identity. Persist those fields only if selective
+retention keeps the share.
 
 Successful share response:
 
@@ -1260,7 +1386,9 @@ if claimed candidate: candidate admission + durable journal + immediate RPC
 if verifier enabled: submit exact hashing blob and claimed hash asynchronously
 else: classify from trusted claimed hash
 after authoritative/computed validation: assign accepted/stale/low/mismatch
-persist final share state, hash rows, work bucket, event, and response
+update compact totals/round/hashrate accounting
+persist a share/hash/significant event only when retention policy requires it
+queue exactly one response if the connection/request route still exists
 ```
 
 Malformed or unknown-job submissions never reach candidate or verifier code.
@@ -1392,7 +1520,7 @@ private_job_entropy[16] || PoW_result[32]
 ```
 
 It is global across the process and all connections. Connection ID, IP, label,
-nonce, public template ID, source ID, and height are not equality inputs.
+nonce, template generation, source ID, and height are not equality inputs.
 Height/source buckets exist only for lifecycle cleanup.
 
 Required properties:
@@ -1405,8 +1533,9 @@ Required properties:
 - reserve atomically so two concurrent identical submissions have one winner;
 - capacity exhaustion fails closed as `server_busy`; never evict a still-
   eligible identity merely to admit another;
-- the active cache is memory-bounded and its historical record remains in
-  SQLite after memory release.
+- the active cache is memory-bounded; ordinary keys are not persisted because
+  a restart invalidates every old private job. Durable candidate idempotency is
+  independently enforced by the unique frozen-block candidate key.
 
 Suggested configurable/default caps, inherited as reference values, are
 131,072 active entries process-wide and 65,536 per source **summed across all
@@ -1447,8 +1576,8 @@ Trusted mode has no computed identity and retains the claimed key.
 - When the final reference disappears, free the in-memory bucket immediately.
 - A downward reorg can retain higher- and lower-height buckets together.
 - An old submission may never roll a source's observed height backward.
-- On restart, rebuild still-relevant identities from SQLite before opening
-  Stratum listeners.
+- On restart, begin with an empty ordinary duplicate registry because no
+  pre-restart private job remains valid.
 
 Use generation-tagged reservation tokens so releasing an old provisional
 token cannot erase a later reservation of the same key.
@@ -1463,8 +1592,9 @@ When `verifier.enabled = true`:
 - do not issue a job until its exact seed is ready;
 - insert the submitted nonce into an owned copy of the exact job hashing blob;
 - call `mspv_verify_submit` with the exact seed ID and all 32 claimed bytes;
-- use a durable numeric share/verification row ID as `user_tag`, not a pointer;
-- persist the library ticket-to-share mapping;
+- use a process-unique numeric submission/share ID as `user_tag`, not a pointer;
+- keep the library ticket-to-submission mapping until completion; it need not
+  become a durable row when selective retention drops the detail;
 - treat `completion.hash` as authoritative only when
   `completion.result == MSPV_RESULT_OK` and `completion.error == MSPV_OK`;
 - derive target, duplicate, candidate, stale, and accounting outcomes from the
@@ -1518,10 +1648,10 @@ function admit_verification(share, job, hashing_blob, claimed_hash):
         job.mspv_seed_id,
         hashing_blob,
         claimed_hash,
-        user_tag = share.database_id)
+        user_tag = share.server_submission_id)
 
     if status == MSPV_OK:
-        persist ticket and state=verifying
+        record ticket and state=verifying in live submission context
         increment connection pending count
     else if status == MSPV_QUEUE_FULL:
         release provisional duplicate key
@@ -1531,8 +1661,8 @@ function admit_verification(share, job, hashing_blob, claimed_hash):
         finalize verifier_failed; degrade health when appropriate
 ```
 
-Completion order is arbitrary. A completion handler finds the immutable share
-row by `user_tag`, checks the ticket/seed ID, updates hashes and duplicate
+Completion order is arbitrary. A completion handler finds the immutable live
+submission context by `user_tag`, checks the ticket/seed ID, updates hashes and duplicate
 reservations, performs exact target checks, and only then sends one final miner
 response if the connection/request route still exists.
 
@@ -1854,9 +1984,11 @@ PRAGMA busy_timeout = 5000;
 
 `busy_timeout` uses configuration. If WAL or FULL cannot be established, do
 not open Stratum. The candidate journal and its dispatch intent commit before
-network send. Ordinary share finalization and its work bucket commit before a
-success response. A writer may batch ordinary rows for at most 10 ms, but a
-candidate request preempts the batch queue.
+network send. Ordinary accounting may batch for at most
+`database.accounting_flush_interval_ms`; a candidate request preempts the
+ordinary batch and candidate acceptance drains the closing round first. An
+unclean exit may lose no more than one interval of ordinary aggregate
+telemetry. Candidate and security-evidence writes remain synchronous.
 
 Store binary hashes, entropy, IDs, and blobs as SQLite `BLOB`, not hex text.
 The exception is unsigned numeric identifiers: store every MSPV seed ID/ticket
@@ -1869,9 +2001,17 @@ boundaries.
 
 ### 17.2 Normative logical schema
 
-The following DDL is a blueprint-level v1 schema. Migrations may split fields
-for performance, but names, uniqueness, durability, and relationships must be
-preserved.
+The following DDL is the blueprint-level v3 clean-create schema contract.
+There is no in-place migration from an earlier schema.
+
+There are deliberately no `public_templates`, `private_jobs`, or durable
+ordinary duplicate-key tables. Retained shares denormalize the public job ID,
+template generation, height, nonce, difficulty/outcome/timing, and hashes.
+Every terminal share row has `retention_reason=high_difficulty`, `candidate`,
+or `security_evidence`; ordinary sub-threshold outcomes update compact totals
+instead. Candidates are recovery-complete through their own round, job,
+template-generation, peer, height, frozen block, and block identity fields;
+`first_share_id` is optional correlation, not a recovery dependency.
 
 ```sql
 CREATE TABLE schema_meta (
@@ -1879,7 +2019,7 @@ CREATE TABLE schema_meta (
     value TEXT NOT NULL
 ) STRICT;
 
-INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1');
+INSERT INTO schema_meta(key, value) VALUES ('schema_version', '3');
 
 CREATE TABLE server_sessions (
     id INTEGER PRIMARY KEY,
@@ -1892,7 +2032,7 @@ CREATE TABLE server_sessions (
 ) STRICT;
 
 CREATE TABLE workers (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     login TEXT NOT NULL,
     rigid TEXT NOT NULL DEFAULT '',
     first_seen_unix_us INTEGER NOT NULL,
@@ -1901,7 +2041,7 @@ CREATE TABLE workers (
 ) STRICT;
 
 CREATE TABLE connections (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     public_id BLOB NOT NULL UNIQUE CHECK(length(public_id) = 16),
     session_id INTEGER NOT NULL REFERENCES server_sessions(id),
     worker_id INTEGER REFERENCES workers(id),
@@ -1924,62 +2064,19 @@ CREATE INDEX connections_worker_time
 CREATE INDEX connections_peer_time
     ON connections(peer_family, peer_address, opened_unix_us);
 
-CREATE TABLE public_templates (
-    id INTEGER PRIMARY KEY,
-    session_id INTEGER NOT NULL REFERENCES server_sessions(id),
-    generation INTEGER NOT NULL,
-    height INTEGER NOT NULL CHECK(height > 0),
-    prev_hash BLOB NOT NULL CHECK(length(prev_hash) = 32),
-    seed_hash BLOB NOT NULL CHECK(length(seed_hash) = 32),
-    next_seed_hash BLOB CHECK(next_seed_hash IS NULL OR length(next_seed_hash) = 32),
-    difficulty_dec TEXT NOT NULL,
-    wide_difficulty_hex TEXT,
-    reserved_offset INTEGER NOT NULL,
-    reserve_size INTEGER NOT NULL CHECK(reserve_size = 16),
-    blocktemplate_blob BLOB NOT NULL,
-    blockhashing_blob BLOB NOT NULL,
-    fetched_unix_us INTEGER NOT NULL,
-    fetch_reason TEXT NOT NULL,
-    UNIQUE(session_id, generation)
-) STRICT;
-
-CREATE INDEX public_templates_height
-    ON public_templates(height, id);
-
-CREATE TABLE private_jobs (
-    id INTEGER PRIMARY KEY,
-    public_job_id BLOB NOT NULL UNIQUE CHECK(length(public_job_id) = 16),
-    connection_id INTEGER NOT NULL REFERENCES connections(id),
-    template_id INTEGER NOT NULL REFERENCES public_templates(id),
-    height INTEGER NOT NULL,
-    entropy BLOB NOT NULL UNIQUE CHECK(length(entropy) = 16),
-    seed_hash BLOB NOT NULL CHECK(length(seed_hash) = 32),
-    mspv_seed_id_dec TEXT,
-    assigned_difficulty_dec TEXT NOT NULL,
-    target64_le BLOB NOT NULL CHECK(length(target64_le) = 8),
-    network_difficulty_dec TEXT NOT NULL,
-    nonce_offset INTEGER NOT NULL,
-    nonce_size INTEGER NOT NULL CHECK(nonce_size = 4),
-    reserved_offset INTEGER NOT NULL,
-    reserved_size INTEGER NOT NULL CHECK(reserved_size = 16),
-    private_block_blob BLOB NOT NULL,
-    hashing_blob BLOB NOT NULL,
-    created_unix_us INTEGER NOT NULL,
-    queued_unix_us INTEGER,
-    expires_unix_us INTEGER NOT NULL,
-    retired_unix_us INTEGER
-) STRICT;
-
-CREATE INDEX private_jobs_connection_time
-    ON private_jobs(connection_id, created_unix_us DESC);
-CREATE INDEX private_jobs_height
-    ON private_jobs(height, id);
-
 CREATE TABLE shares (
     id INTEGER PRIMARY KEY,
-    connection_id INTEGER NOT NULL REFERENCES connections(id),
+    session_id INTEGER NOT NULL REFERENCES server_sessions(id),
+    round_id INTEGER NOT NULL REFERENCES rounds(id),
+    connection_id INTEGER REFERENCES connections(id),
     worker_id INTEGER REFERENCES workers(id),
-    job_id INTEGER REFERENCES private_jobs(id),
+    job_public_id BLOB CHECK(
+        job_public_id IS NULL OR length(job_public_id) = 16
+    ),
+    template_generation INTEGER CHECK(
+        template_generation IS NULL OR template_generation > 0
+    ),
+    height INTEGER CHECK(height IS NULL OR height > 0),
     request_sequence INTEGER NOT NULL CHECK(request_sequence >= 1),
     miner_request_id_type TEXT CHECK(
         miner_request_id_type IS NULL OR miner_request_id_type IN ('integer', 'string')
@@ -1999,6 +2096,11 @@ CREATE TABLE shares (
             'trusted_rate_limited'
         )
     ),
+    retention_reason TEXT CHECK(
+        retention_reason IS NULL OR retention_reason IN (
+            'high_difficulty', 'candidate', 'security_evidence'
+        )
+    ),
     status TEXT NOT NULL CHECK(status IN (
         'received', 'verifying', 'accepted', 'stale', 'duplicate',
         'low_difficulty', 'invalid_result', 'unknown_job', 'malformed',
@@ -2013,17 +2115,33 @@ CREATE TABLE shares (
     verifier_queue_ns INTEGER,
     verifier_hash_ns INTEGER,
     verifier_total_ns INTEGER,
-    candidate_id INTEGER,
+    candidate_id INTEGER REFERENCES candidates(id),
     CHECK(
         (miner_request_id_type IS NULL AND miner_request_id_text IS NULL) OR
         (miner_request_id_type IS NOT NULL AND miner_request_id_text IS NOT NULL)
     ),
+    CHECK(status IN ('received', 'verifying') OR retention_reason IS NOT NULL),
     UNIQUE(connection_id, request_sequence)
 ) STRICT;
 
 CREATE INDEX shares_time ON shares(received_unix_us, id);
 CREATE INDEX shares_worker_time ON shares(worker_id, received_unix_us, id);
 CREATE INDEX shares_status_time ON shares(status, received_unix_us, id);
+CREATE INDEX shares_round_status ON shares(round_id, status, id);
+CREATE INDEX shares_job_public_id
+    ON shares(job_public_id, id);
+CREATE INDEX shares_template_generation
+    ON shares(session_id, template_generation, id);
+CREATE INDEX shares_accepted_actual_difficulty_rank
+    ON shares(length(actual_difficulty_dec) DESC, actual_difficulty_dec DESC, id)
+    WHERE status = 'accepted' AND actual_difficulty_dec IS NOT NULL;
+
+CREATE TRIGGER share_round_is_immutable
+BEFORE UPDATE OF round_id ON shares
+WHEN NEW.round_id != OLD.round_id
+BEGIN
+    SELECT RAISE(ABORT, 'share round is immutable');
+END;
 
 CREATE TABLE share_hashes (
     share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
@@ -2034,27 +2152,30 @@ CREATE TABLE share_hashes (
     PRIMARY KEY(share_id, role)
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE duplicate_keys (
-    key BLOB PRIMARY KEY CHECK(length(key) = 48),
-    height INTEGER NOT NULL,
-    first_share_id INTEGER NOT NULL REFERENCES shares(id),
-    role TEXT NOT NULL CHECK(role IN ('claimed', 'computed', 'both')),
-    active INTEGER NOT NULL CHECK(active IN (0, 1)),
-    reserved_unix_us INTEGER NOT NULL,
-    retired_unix_us INTEGER,
-    generation_token INTEGER NOT NULL
+CREATE TABLE share_totals (
+    status TEXT NOT NULL CHECK(status IN (
+        'accepted', 'stale', 'duplicate', 'low_difficulty', 'invalid_result',
+        'unknown_job', 'malformed', 'unauthenticated', 'server_busy',
+        'verifier_failed', 'cancelled'
+    )),
+    provenance TEXT NOT NULL CHECK(provenance IN ('verified', 'claimed', 'pending')),
+    share_count INTEGER NOT NULL CHECK(share_count > 0),
+    first_unix_us INTEGER NOT NULL,
+    last_unix_us INTEGER NOT NULL,
+    PRIMARY KEY(status, provenance),
+    CHECK(last_unix_us >= first_unix_us)
 ) WITHOUT ROWID, STRICT;
-
-CREATE INDEX duplicate_keys_active_height
-    ON duplicate_keys(active, height);
 
 CREATE TABLE candidates (
     id INTEGER PRIMARY KEY,
     candidate_key BLOB NOT NULL UNIQUE CHECK(length(candidate_key) = 32),
-    first_share_id INTEGER NOT NULL REFERENCES shares(id),
-    job_id INTEGER NOT NULL REFERENCES private_jobs(id),
+    session_id INTEGER NOT NULL REFERENCES server_sessions(id),
+    round_id INTEGER NOT NULL REFERENCES rounds(id),
+    first_share_id INTEGER REFERENCES shares(id),
+    job_public_id BLOB NOT NULL CHECK(length(job_public_id) = 16),
+    template_generation INTEGER NOT NULL CHECK(template_generation > 0),
     connection_id INTEGER NOT NULL REFERENCES connections(id),
-    height INTEGER NOT NULL,
+    height INTEGER NOT NULL CHECK(height > 0),
     peer_family INTEGER NOT NULL,
     peer_address BLOB NOT NULL,
     frozen_block_blob BLOB NOT NULL,
@@ -2079,6 +2200,7 @@ CREATE TABLE candidates (
 
 CREATE INDEX candidates_state_time ON candidates(state, updated_unix_us, id);
 CREATE INDEX candidates_miner_tx ON candidates(miner_tx_hash);
+CREATE INDEX candidates_job_public_id ON candidates(job_public_id, id);
 
 CREATE TABLE candidate_attempts (
     id INTEGER PRIMARY KEY,
@@ -2142,11 +2264,111 @@ CREATE TABLE rounds (
     miner_tx_hash BLOB CHECK(miner_tx_hash IS NULL OR length(miner_tx_hash) = 32),
     block_id BLOB CHECK(block_id IS NULL OR length(block_id) = 32),
     credited_difficulty_dec TEXT NOT NULL DEFAULT '0',
-    accepted_share_count INTEGER NOT NULL DEFAULT 0
+    accepted_share_count INTEGER NOT NULL DEFAULT 0 CHECK(accepted_share_count >= 0),
+    max_share_height INTEGER NOT NULL DEFAULT 0 CHECK(max_share_height >= 0),
+    effort_finalized_unix_us INTEGER,
+    finalized_effort_segment_count INTEGER CHECK(
+        finalized_effort_segment_count IS NULL OR
+        finalized_effort_segment_count >= 0
+    ),
+    CHECK(
+        (state = 'open' AND closed_unix_us IS NULL AND
+         accepted_candidate_id IS NULL AND accepted_height IS NULL AND
+         miner_tx_hash IS NULL AND block_id IS NULL AND
+         effort_finalized_unix_us IS NULL AND
+         finalized_effort_segment_count IS NULL) OR
+        (state = 'closed' AND closed_unix_us IS NOT NULL AND
+         closed_unix_us >= opened_unix_us AND
+         accepted_candidate_id IS NOT NULL AND accepted_height IS NOT NULL AND
+         miner_tx_hash IS NOT NULL AND
+         ((effort_finalized_unix_us IS NULL AND
+           finalized_effort_segment_count IS NULL) OR
+          (effort_finalized_unix_us >= closed_unix_us AND
+           finalized_effort_segment_count IS NOT NULL)))
+    )
 ) STRICT;
 
 CREATE UNIQUE INDEX exactly_one_open_round
     ON rounds(state) WHERE state = 'open';
+
+CREATE TABLE round_work_segments (
+    round_id INTEGER NOT NULL REFERENCES rounds(id),
+    source TEXT NOT NULL CHECK(source IN ('verified', 'claimed')),
+    network_difficulty_dec TEXT NOT NULL CHECK(network_difficulty_dec != '0'),
+    credited_difficulty_dec TEXT NOT NULL CHECK(credited_difficulty_dec != '0'),
+    accepted_share_count INTEGER NOT NULL CHECK(accepted_share_count > 0),
+    PRIMARY KEY(round_id, source, network_difficulty_dec),
+    CHECK(length(network_difficulty_dec) > 0),
+    CHECK(length(credited_difficulty_dec) > 0),
+    CHECK(network_difficulty_dec NOT GLOB '*[^0-9]*'),
+    CHECK(credited_difficulty_dec NOT GLOB '*[^0-9]*'),
+    CHECK(length(network_difficulty_dec) = 1 OR
+          substr(network_difficulty_dec, 1, 1) != '0'),
+    CHECK(length(credited_difficulty_dec) = 1 OR
+          substr(credited_difficulty_dec, 1, 1) != '0')
+) WITHOUT ROWID, STRICT;
+
+CREATE TRIGGER round_work_segment_insert_before_finalization
+BEFORE INSERT ON round_work_segments
+WHEN (SELECT effort_finalized_unix_us FROM rounds WHERE id = NEW.round_id)
+     IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'finalized round effort is immutable');
+END;
+
+CREATE TRIGGER round_work_segment_update_before_finalization
+BEFORE UPDATE ON round_work_segments
+WHEN (SELECT effort_finalized_unix_us FROM rounds WHERE id = OLD.round_id)
+         IS NOT NULL OR
+     (SELECT effort_finalized_unix_us FROM rounds WHERE id = NEW.round_id)
+         IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'finalized round effort is immutable');
+END;
+
+CREATE TRIGGER round_work_segment_delete_before_finalization
+BEFORE DELETE ON round_work_segments
+WHEN (SELECT effort_finalized_unix_us FROM rounds WHERE id = OLD.round_id)
+     IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'finalized round effort is immutable');
+END;
+
+CREATE TRIGGER round_effort_finalization_is_consistent
+BEFORE UPDATE OF effort_finalized_unix_us, finalized_effort_segment_count ON rounds
+WHEN OLD.effort_finalized_unix_us IS NULL AND
+     NEW.effort_finalized_unix_us IS NOT NULL AND
+     (NEW.state != 'closed' OR
+      NEW.finalized_effort_segment_count != (
+          SELECT count(*) FROM round_work_segments WHERE round_id = NEW.id
+      ) OR
+      NEW.accepted_share_count != coalesce((
+          SELECT sum(accepted_share_count)
+          FROM round_work_segments WHERE round_id = NEW.id
+      ), 0))
+BEGIN
+    SELECT RAISE(ABORT, 'round effort cannot be finalized');
+END;
+
+CREATE TRIGGER finalized_round_is_immutable
+BEFORE UPDATE ON rounds
+WHEN OLD.effort_finalized_unix_us IS NOT NULL AND
+     (NEW.opened_unix_us IS NOT OLD.opened_unix_us OR
+      NEW.closed_unix_us IS NOT OLD.closed_unix_us OR
+      NEW.state IS NOT OLD.state OR
+      NEW.accepted_candidate_id IS NOT OLD.accepted_candidate_id OR
+      NEW.accepted_height IS NOT OLD.accepted_height OR
+      NEW.miner_tx_hash IS NOT OLD.miner_tx_hash OR
+      NEW.block_id IS NOT OLD.block_id OR
+      NEW.credited_difficulty_dec IS NOT OLD.credited_difficulty_dec OR
+      NEW.accepted_share_count IS NOT OLD.accepted_share_count OR
+      NEW.max_share_height IS NOT OLD.max_share_height OR
+      NEW.effort_finalized_unix_us IS NOT OLD.effort_finalized_unix_us OR
+      NEW.finalized_effort_segment_count IS NOT
+          OLD.finalized_effort_segment_count)
+BEGIN
+    SELECT RAISE(ABORT, 'finalized round is immutable');
+END;
 
 CREATE TABLE hashrate_buckets (
     scope_type TEXT NOT NULL CHECK(scope_type IN ('global', 'connection', 'worker')),
@@ -2204,7 +2426,7 @@ CREATE UNIQUE INDEX one_candidate_abuse_event_per_kind
     );
 
 CREATE TABLE candidate_verdicts (
-    share_id INTEGER NOT NULL REFERENCES shares(id),
+    share_id INTEGER NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('false_candidate', 'candidate_mismatch')),
     candidate_key BLOB NOT NULL CHECK(length(candidate_key) = 32),
     candidate_id INTEGER REFERENCES candidates(id),
@@ -2227,7 +2449,6 @@ CREATE TABLE candidate_verdicts (
 
 CREATE INDEX candidate_verdicts_candidate
     ON candidate_verdicts(candidate_id, disposition, share_id);
-
 CREATE INDEX candidate_verdicts_key
     ON candidate_verdicts(candidate_key, disposition, share_id);
 
@@ -2267,8 +2488,10 @@ CREATE TABLE events (
     type TEXT NOT NULL,
     connection_id INTEGER REFERENCES connections(id),
     worker_id INTEGER REFERENCES workers(id),
-    template_id INTEGER REFERENCES public_templates(id),
-    job_id INTEGER REFERENCES private_jobs(id),
+    template_generation INTEGER,
+    job_public_id BLOB CHECK(
+        job_public_id IS NULL OR length(job_public_id) = 16
+    ),
     share_id INTEGER REFERENCES shares(id),
     candidate_id INTEGER REFERENCES candidates(id),
     round_id INTEGER REFERENCES rounds(id),
@@ -2277,6 +2500,13 @@ CREATE TABLE events (
 
 CREATE INDEX events_time ON events(created_unix_us, id);
 CREATE INDEX events_type_id ON events(type, id);
+CREATE INDEX events_template_generation
+    ON events(session_id, template_generation, id);
+CREATE INDEX events_job_public_id ON events(job_public_id, id);
+CREATE INDEX events_share_result_share ON events(share_id, id)
+    WHERE type = 'share_result' AND share_id IS NOT NULL;
+CREATE INDEX events_share_result_round_share ON events(round_id, share_id, id)
+    WHERE type = 'share_result' AND round_id IS NOT NULL AND share_id IS NOT NULL;
 
 CREATE TABLE blocknotify_deliveries (
     id INTEGER PRIMARY KEY,
@@ -2294,10 +2524,10 @@ CREATE TABLE blocknotify_deliveries (
 ) STRICT;
 ```
 
-SQLite does not allow a foreign key to a table declared later in all migration
-styles equally cleanly; production migrations may create `shares.candidate_id`
-without an immediate FK and add integrity checks, or reorder/split creation.
-The logical relationship remains mandatory.
+This is a clean-create schema, not a migration template. SQLite resolves the
+forward references after the complete script is created, and startup requires
+`PRAGMA foreign_key_check` to return no rows. Existing schema versions are
+rejected rather than rewritten in place.
 
 ### 17.3 Candidate acceptance transaction
 
@@ -2395,12 +2625,29 @@ retry, and recovery idempotent. No actionable event is later revoked.
 
 ### 17.6 Retention
 
-- V1 accepts only `retention_days = 0` and deletes nothing automatically.
-- Nonzero retention is a reserved future feature and MUST fail v1 config
-  validation; it cannot silently start a partial purge implementation.
-- `store_rejected_shares = false` may suppress only ordinary noncandidate
-  rejected-share detail after counters/abuse state are safely recorded. It
-  never suppresses malformed/candidate/security evidence needed for bans.
+- Persist a terminal share row when its authoritative actual difficulty is at
+  least `database.min_persisted_share_difficulty` (inclusive), or when it is
+  candidate/security evidence. Verified mode uses only the computed hash for
+  the ordinary threshold; trusted mode uses the claim.
+- Candidate and security-evidence rows are mandatory and synchronous. An
+  operator cannot disable them.
+- Sub-threshold accepted/rejected outcomes update `share_totals` and round/
+  hashrate accounting without individual share/hash/event rows. Detailed
+  low-value submissions remain available in debug/trace JSONL.
+- Ordinary aggregates flush within
+  `database.accounting_flush_interval_ms`. An unclean exit may lose no more
+  than one interval of aggregate telemetry, never candidate/security state.
+- Public templates/private jobs are never inserted into SQLite. Retained shares
+  denormalize the audit fields they need, and candidates carry their complete
+  frozen recovery context. Every job at a connection's latest queued height
+  remains eligible, without a count/TTL bound, until a complete strictly
+  higher-height job is queued, the connection closes, or the process restarts.
+  TTL applies only to different-height reorg work. Routine
+  template/job/connection events are trace-only.
+- Connection and worker rows are provisional identity state. After close they
+  remain only while retained shares, candidates, significant audit/abuse
+  evidence, or rolling hashrate buckets reference them; otherwise prune the
+  closed connection and any orphaned worker.
 
 ## 18. Rounds and hashrate accounting
 
@@ -2539,9 +2786,7 @@ Error shape:
 | `GET /v1/connections` | Cursor-paginated connections; filters `active`, `worker_id`, `peer`, `after_time`. |
 | `GET /v1/connections/{public_id}` | Connection metadata and its six H/s windows. |
 | `GET /v1/workers` | Logical `(login, rigid)` workers and six H/s windows. |
-| `GET /v1/templates` | Public-template metadata; optional bounded `include_blobs=true`. |
-| `GET /v1/jobs` | Private-job metadata. Entropy/hash/blob fields require authenticated API and `include_blobs=true`; never expose secrets. |
-| `GET /v1/shares` | Filters for status, connection, worker, height, min difficulty, time. Includes hash provenance and candidate ID. |
+| `GET /v1/shares` | Retained significant shares; filters for status, connection, worker, height, min difficulty, and time. Includes retention reason, hash provenance, and candidate ID. |
 | `GET /v1/shares/{id}` | Full share/hash/verification record and linked candidate summary. |
 | `GET /v1/hashes` | Claimed/computed hash rows with share/status filters. |
 | `GET /v1/submissions` | Candidate journal and final states. Large frozen blobs are omitted by default. |
@@ -2562,7 +2807,7 @@ There are no POST, PUT, PATCH, or DELETE control endpoints in v1.
   "generated_at": "2026-08-12T05:30:00.000000Z",
   "data": {
     "server": {
-      "version": "0.1.1+rev.123",
+      "version": "0.2.0+rev.123",
       "git_commit": "0123456789abcdef0123456789abcdef01234567",
       "session_id": "0123456789abcdef0123456789abcdef",
       "started_at": "2026-08-11T05:30:00.000000Z",
@@ -2578,7 +2823,7 @@ There are no POST, PUT, PATCH, or DELETE control endpoints in v1.
       "zmq": "healthy",
       "height": 3736190,
       "template_generation": "664",
-      "template_id": "912"
+      "template_id": null
     },
     "connections": {
       "active": 24,
@@ -2690,17 +2935,15 @@ nullable are present with `null` when unavailable.
 | Object | Required fields and types |
 | --- | --- |
 | `connection` | `id` string (32 hex), `session_id` string (32 hex), `worker_id` decimal string/null, `peer` string, `peer_port` integer, `listen_address` string, `agent` string, `opened_at` timestamp, `authenticated_at` timestamp/null, `closed_at` timestamp/null, `close_reason` string/null, `last_sent_height` integer, `rx_bytes` decimal string, `tx_bytes` decimal string, `active` boolean, `hashrate` object |
-| `worker` | `id` decimal string, `login` string, `rigid` string, `first_seen_at` timestamp, `last_seen_at` timestamp, `active_connections` integer, `accepted_shares` decimal string, `rejected_shares` decimal string, `hashrate` object |
-| `template` | `id` decimal string, `session_id` string (32 hex), `generation` decimal string, `height` integer, `prev_hash` 64-hex, `seed_hash` 64-hex, `next_seed_hash` 64-hex/null, `difficulty` decimal string, `wide_difficulty_hex` string/null, `reserved_offset` integer, `reserve_size` integer, `fetched_at` timestamp, `fetch_reason` string; authenticated `include_blobs=true` additionally adds `blocktemplate_blob` and `blockhashing_blob` hex strings |
-| `job` | `id` 32-hex, `connection_id` 32-hex, `template_id` decimal string, `height` integer, `seed_hash` 64-hex, `verifier_seed_id` decimal string/null, `assigned_difficulty` decimal string, `target64_le` 16-hex, `network_difficulty` decimal string, `nonce_offset` integer, `nonce_size` integer, `reserved_offset` integer, `reserved_size` integer, `created_at` timestamp, `queued_at` timestamp/null, `expires_at` timestamp, `retired_at` timestamp/null; authenticated `include_blobs=true` additionally adds `private_entropy`, `private_block_blob`, and `hashing_blob` hex strings |
-| `share` | `id` decimal string, `connection_id` 32-hex, `worker_id` decimal string/null, `job_id` 32-hex/null, `request_sequence` decimal string, `miner_request_id_type` (`integer`/`string`)/null, `miner_request_id` string/null (canonical decimal text for integer type, exact text for string type), `received_at` timestamp, `completed_at` timestamp/null, `nonce` 8-hex/null, `height` integer/null, `assigned_difficulty` decimal string/null, `actual_difficulty` decimal string/null, `network_difficulty` decimal string/null, `height_is_older` boolean, `claimed_candidate` boolean, `candidate_admission` (`not_candidate`/`admitted`/`deferred`/`existing`/`trusted_rate_limited`), `status` string, `error_code` string/null, `error_message` string/null, `provenance` string, `credited_difficulty` decimal string/null, `verifier_ticket` decimal string/null, `verifier_seed_id` decimal string/null, `verifier_queue_ns` decimal string/null, `verifier_hash_ns` decimal string/null, `verifier_total_ns` decimal string/null, `claimed_hash` 64-hex/null, `computed_hash` 64-hex/null, `claimed_meets_share_target` boolean/null, `computed_meets_share_target` boolean/null, `claimed_meets_network_target` boolean/null, `computed_meets_network_target` boolean/null, `candidate_id` decimal string/null |
+| `worker` | `id` decimal string, `login` string, `rigid` string, `first_seen_at` timestamp, `last_seen_at` timestamp, `active_connections` integer, retained-row `accepted_shares` decimal string, retained-row `rejected_shares` decimal string, `share_counts_retained_only` boolean (always true), `hashrate` object |
+| `share` | `id` decimal string, `connection_id` 32-hex/null, `worker_id` decimal string/null, denormalized public `job_id` 32-hex/null, `template_generation` decimal string/null, `request_sequence` decimal string, `miner_request_id_type` (`integer`/`string`)/null, `miner_request_id` string/null (canonical decimal text for integer type, exact text for string type), `received_at` timestamp, `completed_at` timestamp/null, `nonce` 8-hex/null, `height` integer/null, `assigned_difficulty` decimal string/null, `actual_difficulty` decimal string/null, `network_difficulty` decimal string/null, `height_is_older` boolean, `claimed_candidate` boolean, `candidate_admission` (`not_candidate`/`admitted`/`deferred`/`existing`/`trusted_rate_limited`), `retention_reason` (`high_difficulty`/`candidate`/`security_evidence`)/null while provisional, `status` string, `error_code` string/null, `error_message` string/null, `provenance` string, `credited_difficulty` decimal string/null, `verifier_ticket` decimal string/null, `verifier_seed_id` decimal string/null, `verifier_queue_ns` decimal string/null, `verifier_hash_ns` decimal string/null, `verifier_total_ns` decimal string/null, `claimed_hash` 64-hex/null, `computed_hash` 64-hex/null, `claimed_meets_share_target` boolean/null, `computed_meets_share_target` boolean/null, `claimed_meets_network_target` boolean/null, `computed_meets_network_target` boolean/null, `candidate_id` decimal string/null, `round_id` decimal string |
 | `hash` | `share_id` decimal string, `role` (`claimed` or `computed`), `hash` 64-hex, `meets_share_target` boolean/null, `meets_network_target` boolean/null, plus `received_at`, `share_status`, `connection_id`, `worker_id`, and `job_id` for filtering/correlation |
-| `submission` | `id` decimal string, `candidate_key` 64-hex, `first_share_id` decimal string, `job_id` 32-hex, `connection_id` 32-hex, `height` integer, `peer` string, `miner_tx_hash` 64-hex, `expected_block_id` 64-hex/null, `canonical_block_id` 64-hex/null, `state` string, `attempt_count` integer, `max_attempts` integer, `had_indeterminate` boolean, `reconciliation_cycle_count` integer, `next_reconciliation_at` timestamp/null, `reconciliation_exhausted_at` timestamp/null, `created_at` timestamp, `updated_at` timestamp, `accepted_at` timestamp/null, `terminal_reason` string/null; authenticated detail with `include_blobs=true` adds `frozen_block_blob` |
+| `submission` | `id` decimal string, `candidate_key` 64-hex, `round_id` decimal string, `first_share_id` decimal string/null, denormalized public `job_id` 32-hex, `template_generation` decimal string, `connection_id` 32-hex, `height` integer, `peer` string, `miner_tx_hash` 64-hex, `expected_block_id` 64-hex/null, `canonical_block_id` 64-hex/null, `state` string, `attempt_count` integer, `max_attempts` integer, `had_indeterminate` boolean, `reconciliation_cycle_count` integer, `next_reconciliation_at` timestamp/null, `reconciliation_exhausted_at` timestamp/null, `created_at` timestamp, `updated_at` timestamp, `accepted_at` timestamp/null, `terminal_reason` string/null; authenticated detail with `include_blobs=true` adds `frozen_block_blob` |
 | `attempt` | `id` decimal string, `candidate_id` decimal string, `attempt_number` integer, `rpc_request_id` decimal string, `started_at` timestamp, `completed_at` timestamp/null, `classification` string, `http_status` integer/null, `rpc_error_code` integer/null for non-error/indeterminate observations and integer (0 fallback) for explicit error observations, `daemon_status` string/null, `daemon_block_id` 64-hex/null, `response_excerpt` string/null |
 | `reconciliation` | `id` decimal string, `candidate_id` decimal string, `cycle_number` integer, `lookup_kind` string, `rpc_request_id` decimal string, `requested_block_id` 64-hex/null, `started_at` timestamp, `completed_at` timestamp/null, `classification` string, `observed_block_id` 64-hex/null, `observed_height` integer/null, `observed_miner_tx_hash` 64-hex/null, `observed_orphan` boolean/null, `response_excerpt` string/null |
-| `round` | `id` decimal string, `opened_at` timestamp, `closed_at` timestamp/null, `state` (`open` or `closed`), `accepted_candidate_id` decimal string/null, `accepted_height` integer/null, `miner_tx_hash` 64-hex/null, `block_id` 64-hex/null, `credited_difficulty` decimal string, `accepted_share_count` decimal string. Rounds deliberately have no `hashrate` field; v1 buckets only global, connection, and worker scopes. |
+| `round` | `id` decimal string, `opened_at` timestamp, `closed_at` timestamp/null, `state` (`open` or `closed`), `accepted_candidate_id` decimal string/null, `accepted_height` integer/null, `miner_tx_hash` 64-hex/null, `block_id` 64-hex/null, `credited_difficulty` decimal string, `accepted_share_count` decimal string, `max_share_height` integer, `estimated_hashes` decimal string, `effort_finalized_at` timestamp/null, `effort` object. Rounds deliberately have no `hashrate` field; v1 buckets only global, connection, and worker scopes. |
 | `ban` | `id` decimal string, `peer` string, `created_at` timestamp, `expires_at` timestamp, `evidence_window_started_at` timestamp, `evidence_window_ended_at` timestamp, `reason` string, `active` boolean, `abuse_event_ids` array of decimal strings ordered by event ID |
-| `event` | `id` decimal string, `session_id` 32-hex, `created_at` timestamp, `type` string, `connection_id` 32-hex/null, `worker_id` decimal string/null, `template_id` decimal string/null, `job_id` 32-hex/null, `share_id` decimal string/null, `candidate_id` decimal string/null, `round_id` decimal string/null, `payload` exact wrapper object `{payload_schema_version:1,data:object}` |
+| `event` | `id` decimal string, `session_id` 32-hex, `created_at` timestamp, `type` string, `connection_id` 32-hex/null, `worker_id` decimal string/null, `template_generation` decimal string/null, public `job_id` 32-hex/null, retained `share_id` decimal string/null, `candidate_id` decimal string/null, `round_id` decimal string/null, `payload` exact wrapper object `{payload_schema_version:1,data:object}` |
 
 `event.payload` is the sole deliberately extensible v1 subobject. Its outer
 keys are exactly integer `payload_schema_version` (value 1) and object `data`.
@@ -2748,20 +2991,25 @@ documented `include_blobs`.
 | `/v1/verifier` | none | `enabled`, operating mode, exact `mspv_stats`, worker/capacity configuration, and an array of `mspv_seed_info` representations; no internal pointers/keys beyond public seed hash |
 | `/v1/hashrate` | `source=verified|claimed|all` | global `hashrate`; `all` returns `source:mixed` only when necessary |
 | `/v1/connections` | common pagination; `active`; `worker_id`; `peer`; `after_time`; `before_time` | `connection[]` |
-| `/v1/connections/{id}` | none | one `connection` plus counters and its latest bounded 20 jobs/shares as links, not embedded blobs |
+| `/v1/connections/{id}` | none | one `connection` plus retained-only counters and its latest bounded 20 retained shares as links |
 | `/v1/workers` | common pagination; `active`; exact `login`; exact `rigid`; `after_time`; `before_time` | `worker[]` |
-| `/v1/templates` | common pagination; `height`; `after_time`; `before_time`; `include_blobs` | `template[]` |
-| `/v1/jobs` | common pagination; `connection_id`; `template_id`; `height`; `active`; `after_time`; `before_time`; `include_blobs` | `job[]` |
 | `/v1/shares` | common pagination; comma `status`; `connection_id`; `worker_id`; `job_id`; `candidate_id`; `height`; `min_difficulty`; `after_time`; `before_time` | `share[]` |
-| `/v1/shares/{id}` | none | one `share` and a `submission_link` string/null |
+| `/v1/shares/{id}` | none | one `share` and a `submission_url` string/null |
 | `/v1/hashes` | common pagination; `role`; comma `share_status`; `connection_id`; `worker_id`; `job_id`; `after_time`; `before_time` | `hash[]` |
 | `/v1/submissions` | common pagination; comma `state`; `connection_id`; `job_id`; `height`; `peer`; `after_time`; `before_time` | `submission[]` |
 | `/v1/submissions/{id}` | `include_blobs` only | `{submission, attempts, reconciliations, blocknotify}`; arrays are complete for that candidate and ordered by ID |
 | `/v1/rounds` | common pagination; `state`; `after_time`; `before_time` | `round[]` |
 | `/v1/rounds/current` | none | one open `round`; missing open round is 503 `round_unavailable` |
 | `/v1/bans` | common pagination; `active`; `peer`; `after_time`; `before_time` | `ban[]` |
-| `/v1/events` | common pagination; comma `type`; any one or more linked `connection_id`, `worker_id`, `template_id`, `job_id`, `share_id`, `candidate_id`, `round_id`; `after_time`; `before_time` | `event[]` |
-| `/v1/persistence` | none | schema version, journal mode, synchronous mode, database/WAL bytes, writer queue depths, last successful commit, last writer error/null, unresolved candidates, pending block notifications |
+| `/v1/events` | common pagination; comma `type`; any one or more linked `connection_id`, `worker_id`, `template_generation`, public `job_id`, retained `share_id`, `candidate_id`, `round_id`; `after_time`; `before_time` | `event[]` |
+| `/v1/persistence` | none | schema version, journal mode, synchronous mode, database/WAL bytes, writer queue depths, ordinary accounting backlog, live transient-share count, last successful commit, last writer error/null, unresolved candidates, pending block notifications |
+
+There are no historical `/v1/templates` or `/v1/jobs` collections; those paths
+return the normal JSON 404. `/v1/daemon` exposes only the redacted current live
+template generation/height (`template_id` remains null for compatibility).
+Routine template/job metadata is trace data, not a database API resource.
+`/v1/shares` contains only retained significant/candidate/security rows; its
+public `job_id` is the denormalized 16-byte job ID, not a foreign resource.
 
 `include_blobs=true` is permitted only when a nonempty `api.access_token` is
 configured and the request supplied it successfully. Otherwise return 403
@@ -2815,9 +3063,9 @@ each value is exactly `{ready:boolean,degraded:boolean,reason:string|null}`.
 | `daemon` | `ready` boolean, `rpc` (`initializing`/`healthy`/`degraded`/`unavailable`), `zmq` (`disabled`/`connecting`/`healthy`/`degraded`), `height` integer/null, `template_generation` decimal string/null, `template_id` decimal string/null |
 | `connections` | `active` integer, `total` decimal string |
 | `workers` | `active` integer, `total` decimal string |
-| `shares` | Decimal strings `pending`, `accepted`, `stale`, `duplicate`, `low_difficulty`, `invalid_result`, `infrastructure_failed`, and `total`; these are all-time persisted counts. |
+| `shares` | Decimal strings `pending`, `accepted`, `stale`, `duplicate`, `low_difficulty`, `invalid_result`, `infrastructure_failed`, and `total`; terminal totals come from compact aggregate accounting and include unretained low-value shares. `pending` combines active transient work with provisional retained rows so neither is omitted or double-counted; `total` is terminal totals plus that pending value. |
 | `candidates` | Decimal strings `active`, `accepted`, `rejected`, `ambiguous`, and `total`; active means `journaled`/`dispatching`/`retry_wait`, accepted combines both acceptance states. |
-| `round` | Current compact object: `id`, `state`, `opened_at`; all as in `round`, and state must be `open`. |
+| `round` | Current compact object: `id`, `state`, `opened_at`, `estimated_hashes`, `accepted_share_count`, `max_share_height`, and `effort`; types are as in `round`, and state must be `open`. |
 | `hashrate` | Exact six-window object from section 19.5. |
 
 `/v1/daemon` `data` contains exactly:
@@ -2833,7 +3081,7 @@ each value is exactly `{ready:boolean,degraded:boolean,reason:string|null}`.
 | `network` | `mainnet`, `testnet`, `stagenet`, or `fakechain`/null as reported. |
 | `height`, `target_height` | Integer/null. |
 | `synchronized` | Boolean/null. |
-| `template_id`, `template_generation` | Decimal string/null. |
+| `template_id`, `template_generation` | `template_id` is always null because templates are not database resources; live `template_generation` is a decimal string/null. |
 | `template_height` | Integer/null. |
 | `template_fetched_at`, `last_rpc_success_at`, `last_template_success_at`, `last_error_at` | Timestamp/null. |
 | `last_error_code`, `last_error_message` | Sanitized string/null. |
@@ -2857,10 +3105,12 @@ each value is exactly `{ready:boolean,degraded:boolean,reason:string|null}`.
 
 | Field | Type/meaning |
 | --- | --- |
-| `schema_version` | Integer 1 (also present in the envelope by design). |
+| `schema_version` | Integer 3 (the SQLite schema version; the response envelope independently remains API schema version 1). |
 | `journal_mode`, `synchronous`, `foreign_keys` | Exact strings `wal`, `full`, and boolean true after startup verification. |
 | `database_bytes`, `wal_bytes` | Decimal strings. |
 | `writer_queue_items`, `writer_queue_bytes`, `writer_priority_items` | Integers within configured bounds. |
+| `pending_accounting_items` | Integer count of ordinary aggregate-accounting items currently buffered for the next flush. |
+| `pending_transient_shares` | Integer live count of structurally admitted shares that have not reached a terminal outcome; process memory, not a durable row count. |
 | `last_commit_at` | Timestamp/null. |
 | `last_writer_error_at`, `last_writer_error_code`, `last_writer_error_message` | Timestamp/string/string, all null when absent and always sanitized. |
 | `unresolved_candidates`, `pending_blocknotify` | Decimal strings. |
@@ -2870,9 +3120,11 @@ Detail endpoint composition is exact:
 - `/v1/connections/{id}` returns `{connection,counters,recent}`. `connection`
   is the resource in section 19.5. `counters` has decimal strings
   `pending`, `accepted`, `stale`, `duplicate`, `low_difficulty`,
-  `invalid_result`, `infrastructure_failed`, and `total`. `recent` has arrays
-  `jobs` and `shares`, each descending by database ID and capped at 20; link
-  objects are exactly `{id,url}` strings and contain no embedded record.
+  `invalid_result`, `infrastructure_failed`, and `total`, plus
+  `retained_only` boolean (always true). `recent.shares` is
+  descending by database ID and capped at 20; link objects are exactly
+  `{id,url}` strings and contain no embedded record. There is no durable
+  recent-job list.
 - `/v1/shares/{id}` returns `{share,submission_url}` where `submission_url` is
   `/v1/submissions/<decimal-id>` or null.
 - `/v1/submissions/{id}` returns
@@ -2936,23 +3188,20 @@ record is first assigned a persistent `events.id`; broadcast it only after its
 transaction commits. The live `payload` uses the same versioned opaque wrapper
 as the API resource. Persisted-event frames have exactly these keys in this
 order: `schema_version`, `event_id`, `session_id`, `time_utc`, `type`,
-`connection_id`, `worker_id`, `template_id`, `job_id`, `share_id`,
+`connection_id`, `worker_id`, `template_generation`, `job_id`, `share_id`,
 `candidate_id`, `round_id`, and `payload`. Nullable correlation fields are
 present as JSON null. Example:
 
 ```json
-{"schema_version":1,"event_id":"61077","session_id":"0123456789abcdef0123456789abcdef","time_utc":"2026-08-12T05:30:00.252000Z","type":"share_result","connection_id":"fedcba9876543210fedcba9876543210","worker_id":"7","template_id":"912","job_id":"05777c49926e2d4a58f85ddd8aeff990","share_id":"61077","candidate_id":null,"round_id":"12","payload":{"payload_schema_version":1,"data":{"height":3736190,"nonce":"d0030040","claimed_hash":"e1364b8782719d7683e2ccd3d8f724bc59dfa780a9e960e7c0e0046acdb40100","computed_hash":"e1364b8782719d7683e2ccd3d8f724bc59dfa780a9e960e7c0e0046acdb40100","assigned_difficulty":"1048576","status":"accepted","provenance":"verified"}}}
+{"schema_version":1,"event_id":"61077","session_id":"0123456789abcdef0123456789abcdef","time_utc":"2026-08-12T05:30:00.252000Z","type":"share_result","connection_id":"fedcba9876543210fedcba9876543210","worker_id":"7","template_generation":"912","job_id":"05777c49926e2d4a58f85ddd8aeff990","share_id":"61077","candidate_id":null,"round_id":"12","payload":{"payload_schema_version":1,"data":{"height":3736190,"nonce":"d0030040","claimed_hash":"e1364b8782719d7683e2ccd3d8f724bc59dfa780a9e960e7c0e0046acdb40100","computed_hash":"e1364b8782719d7683e2ccd3d8f724bc59dfa780a9e960e7c0e0046acdb40100","assigned_difficulty":"1048576","status":"accepted","provenance":"verified"}}}
 ```
 
 Event vocabulary includes:
 
 - `server_started`, `server_ready`, `server_degraded`, `server_stopping`;
-- `connection_opened`, `login_succeeded`, `login_failed`, `connection_closed`;
-- `template_refresh`, `template_cached`, `template_error`, `zmq_notification`;
-- `seed_prepare`, `seed_ready`, `seed_failed`, `seed_released`;
-- `job_derived`, `job_sent`;
-- `share_received`, `verification_requested`, `verification_result`,
-  `verification_mismatch`, `share_result`;
+- significant authentication/defense failures and `template_error`;
+- `seed_failed` and verifier consistency failures;
+- retained `share_result` and `verification_mismatch` evidence;
 - `candidate_journaled`, `candidate_attempt`, `candidate_retry`,
   `candidate_result`, `candidate_reconciled`;
 - `verifier_consistency_error`;
@@ -2960,8 +3209,10 @@ Event vocabulary includes:
 - `round_opened`, `round_closed`;
 - `blocknotify_started`, `blocknotify_result`.
 
-Large blobs are persisted but omitted from normal live events. Consumers obtain
-them through authenticated API detail endpoints when required.
+Routine connection open/close, successful template refresh, job creation/sent,
+and sub-threshold share events are debug/trace JSONL only. Candidate frozen
+blocks are the only mining-template blobs persisted; they are omitted from
+normal events and available only through authenticated candidate detail.
 
 ## 21. DDoS defense, abuse scoring, and persistent bans
 
@@ -3844,14 +4095,15 @@ on verifier wakeup:
         status, completion = mspv_completion_poll(timeout=0)
 
         if status == MSPV_OK:
-            share = lookup immutable row by completion.user_tag
-            confirm persisted ticket and expected seed_id
+            share = lookup immutable live submission by completion.user_tag
+            confirm recorded ticket and expected seed_id
             decrement connection pending count exactly once
 
             if completion.result == MSPV_RESULT_OK and
                completion.error == MSPV_OK:
-                persist computed hash and timings
-                finalize comparison/target/duplicate/stale/candidate logic
+                record computed hash and timings
+                finalize comparison/target/duplicate/stale/candidate logic,
+                    compact accounting, and selective persistence
             else if completion.result == MSPV_RESULT_CANCELLED:
                 finalize infrastructure cancellation; no miner strike
             else:
@@ -4212,8 +4464,10 @@ payout address is acceptable), listeners, daemon/ZMQ readiness, verifier
 resource outcomes, template heights, candidate state, round close, bans, and
 hook outcome. DEBUG may include timings and state transitions. TRACE may include
 per-share IDs but not raw secrets, seed key bytes, full private blobs, or
-passwords. Full public block/share material is available through authenticated
-API detail endpoints and SQLite, not routine logs.
+passwords. Public-template/private-job blobs are not stored in SQLite or
+exposed by historical API routes. A candidate's exact frozen block is durable
+and available only through authenticated candidate detail; retained share
+hash evidence is available through the retained-share API.
 
 Every verbose `job.queued` record carries `connection_public_id` and the
 independent `job_public_id`. Trace additionally carries
@@ -4232,7 +4486,7 @@ actually exists:
 | `docs/ARCHITECTURE.md` | Components, concurrency, candidate bypass, state diagrams, ownership. |
 | `docs/CONFIGURATION.md` | Every key/default/range/restart behavior, password null/empty semantics, valid complete examples, blocknotify parser. |
 | `docs/API.md` | Every endpoint/filter/field/type/unit/cursor/auth rule and JSON examples; state explicitly that no dashboard is embedded. |
-| `docs/PERSISTENCE.md` | Schema/migrations, WAL/FULL, crash recovery, retention, rounds, hashrate buckets, candidate and notification delivery. |
+| `docs/PERSISTENCE.md` | Exact clean-create schema/reset policy, WAL/FULL, crash recovery, selective retention, rounds, hashrate buckets, candidate and notification delivery. |
 | `docs/STRATUM_PROTOCOL.md` | Framing, login/job/submit/keepalive examples, difficulty target encoding, statuses. |
 | `docs/SECURITY.md` | Threat model, secrets, entropy, immediate-candidate rate limits, bans, no-shell hook, trusted-mode warning. |
 | `docs/VERIFIER.md` | The complete pinned public API contract in section 23, integration mapping, lifecycle, examples, known unknowns. |
@@ -4335,8 +4589,9 @@ The server itself never renders these records.
 - regtest requires daemon `fakechain` and mainnet primary prefix 18; mainnet
   daemon is rejected under regtest despite the shared prefix;
 - primary address succeeds; subaddress/integrated/checksum/prefix failures fail;
-- `max_seeds < 2`, impossible writer-reserve formulas, and nonzero
-  `retention_days` fail;
+- `max_seeds < 2`, impossible writer-reserve formulas, a zero persisted-share
+  threshold, an accounting flush interval outside 10..60,000 ms, and an API
+  recent-high threshold below the persistence threshold fail;
 - `daemon.max_pending_requests < 2` fails; null/empty daemon credentials disable
   auth, mixed empty/nonempty fails, and nonempty credentials use Digest only;
 - `blocknotify` quoting/placeholder/executable validation is exhaustive;
@@ -4359,9 +4614,11 @@ Use an injectable fake OS source for deterministic tests:
   failed attempts occur only at 1/2/4/8/16/32/60-second retry boundaries;
 - existing submission/recovery/API behavior remains active while issuance stops;
 - two separate labeled calls produce job entropy and job ID;
-- no repeated entropy/job IDs in a large deterministic run;
-- forced private-entropy collision and forced job-ID collision each discard
-  both draws, retry at most eight pairs, and ultimately fail closed;
+- no repeated entropy/job IDs in a large deterministic run (a statistical test,
+  not an entropy-uniqueness enforcement contract);
+- repeated private entropy is accepted without a uniqueness lookup; a forced
+  job-ID collision discards both draws, retries at most eight pairs, and
+  ultimately fails closed;
 - state/reseed bytes never appear in diagnostics.
 
 ### 26.3 Monero parsing and template derivation
@@ -4511,7 +4768,8 @@ Recreate the behavioral tests independently, without copying GPL code:
 
 ### 26.9 SQLite, rounds, and hashrate
 
-- migration from empty DB and each prior schema version;
+- clean creation of schema v3 from an empty path and fail-closed rejection of
+  every prior/unknown/non-MSS schema;
 - verify WAL, FULL, foreign keys, busy timeout;
 - kill process before commit: no RPC marker is allowed;
 - kill after commit/before send, during send, after send/before response, and
@@ -4646,7 +4904,7 @@ Acceptance: every config/auth/default/secret test passes; no listener exists.
 
 ### Phase 2 — SQLite and deterministic state machines
 
-- migrations and writer/read architecture;
+- exact schema-v3 clean creation/validation and writer/read architecture;
 - WAL/FULL verification;
 - server sessions, open round, events;
 - duplicate registry, candidate key/state/attempt classification;
@@ -4815,7 +5073,8 @@ Blueprint-resolved choices, explicitly added to remove prior ambiguity:
 - event stream is live Unix NDJSON; API events provide replay;
 - API token null/empty semantics mirror explicit authentication disabling but
   remain a separate secret;
-- active duplicate protection is rebuilt from SQLite after restart;
+- ordinary duplicate protection is process-local and starts empty after a
+  restart because every pre-restart private job is invalid;
 - `blocknotify` is no-shell durable at-least-once and hook programs must be
   idempotent;
 - v1 fails unsupported miner-signature templates closed rather than accepting
