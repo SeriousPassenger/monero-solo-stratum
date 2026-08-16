@@ -486,7 +486,7 @@ while :; do
           (if ($r.data.ready // false) then styled("1;32"; "READY")
            else styled("1;31"; "NOT READY") end),
         "\($data.server.network // "unknown")  height \($data.daemon.height // "?")  uptime \($data.server.uptime_seconds // 0 | human_duration)",
-        "Node      RPC \(health($data.daemon.rpc))  ZMQ \(health($data.daemon.zmq))  template #\($data.daemon.template_id // "?") / gen \($data.daemon.template_generation // "?")",
+        "Node      RPC \(health($data.daemon.rpc))  ZMQ \(health($data.daemon.zmq))  template gen \($data.daemon.template_generation // "?")",
         "Miners    \(count_word($data.connections.active // 0; "connection"; "connections"))  \(count_word($data.workers.active // 0; "worker"; "workers"))",
         "Hashrate  1m \($rate["1m"] // 0 | human_rate)  5m \($rate["5m"] // 0 | human_rate)  1h \($rate["1h"] // 0 | human_rate)  [\($rate.source // "unknown")]",
         "",

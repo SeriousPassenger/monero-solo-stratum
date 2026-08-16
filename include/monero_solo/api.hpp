@@ -25,8 +25,6 @@ namespace monero_solo {
 enum class ApiCollection {
     connections,
     workers,
-    templates,
-    jobs,
     shares,
     top_shares,
     recent_high_shares,

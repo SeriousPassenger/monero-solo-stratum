@@ -342,7 +342,7 @@ void validate_rpc_url(std::string_view url)
           "daemon", "difficulty", "verifier", "entropy", "database", "events",
           "api", "defense", "logging"});
     Config result;
-    result.schema_version = integer(root, "schema_version", 0, 1, 1, "config");
+    result.schema_version = integer(root, "schema_version", 0, 2, 2, "config");
     result.network = parse_network(string(root, "network", {}, 16, "config", true));
     result.wallet_address = string(root, "wallet_address", {}, 256, "config", true);
     validate_primary_address(result.wallet_address, result.network);
@@ -356,8 +356,8 @@ void validate_rpc_url(std::string_view url)
     keys(s, "stratum",
          {"listen", "access_password", "max_connections", "max_connections_per_ip",
           "login_timeout_ms", "idle_timeout_ms", "max_line_bytes",
-          "max_output_bytes_per_connection", "max_json_depth", "job_history",
-          "job_ttl_ms", "max_pending_verifications_per_connection",
+          "max_output_bytes_per_connection", "max_json_depth", "job_ttl_ms",
+          "max_pending_verifications_per_connection",
           "submit_workers"},
          {"listen", "access_password"});
     if (!s.at("listen").is_array() || s.at("listen").empty() ||
@@ -384,7 +384,6 @@ void validate_rpc_url(std::string_view url)
     result.stratum.max_output_bytes_per_connection = integer(
         s, "max_output_bytes_per_connection", 1048576, 4096, 67108864, "stratum");
     result.stratum.max_json_depth = integer(s, "max_json_depth", 32, 4, 128, "stratum");
-    result.stratum.job_history = integer(s, "job_history", 6, 1, 64, "stratum");
     result.stratum.job_ttl_ms = integer(s, "job_ttl_ms", 120000, 1000, 3600000, "stratum");
     result.stratum.max_pending_verifications_per_connection = integer(
         s, "max_pending_verifications_per_connection", 8, 1, 4096, "stratum");
@@ -471,15 +470,19 @@ void validate_rpc_url(std::string_view url)
     const Json &db = root.at("database");
     keys(db, "database",
          {"path", "busy_timeout_ms", "max_writer_queue_items", "max_writer_queue_bytes",
-          "retention_days", "store_rejected_shares"}, {"path"});
+          "min_persisted_share_difficulty", "accounting_flush_interval_ms"},
+         {"path"});
     result.database.path = string(db, "path", {}, 4096, "database", true);
     if (options.validate_paths) validate_database_path(result.database.path);
     else if (result.database.path.front() != '/') throw ValidationError("database.path must be absolute");
     result.database.busy_timeout_ms = integer(db, "busy_timeout_ms", 5000, 1, 60000, "database");
     result.database.max_writer_queue_items = integer(db, "max_writer_queue_items", 100000, 1024, 10000000, "database");
     result.database.max_writer_queue_bytes = integer(db, "max_writer_queue_bytes", 67108864, 1048576, 1073741824, "database");
-    result.database.retention_days = integer(db, "retention_days", 0, 0, 0, "database");
-    result.database.store_rejected_shares = boolean(db, "store_rejected_shares", true, "database");
+    result.database.min_persisted_share_difficulty = integer(
+        db, "min_persisted_share_difficulty", 80000000000ULL, 1,
+        std::numeric_limits<std::uint64_t>::max(), "database");
+    result.database.accounting_flush_interval_ms = integer(
+        db, "accounting_flush_interval_ms", 1000, 10, 60000, "database");
 
     const Json &events = root.at("events");
     keys(events, "events", {"enabled", "unix_socket", "permissions", "max_clients",
@@ -525,8 +528,14 @@ void validate_rpc_url(std::string_view url)
     result.api.top_shares_limit = integer(api, "top_shares_limit", 100, 1, 100, "api");
     result.api.recent_high_shares_limit = integer(api, "recent_high_shares_limit", 100, 1, 100, "api");
     result.api.recent_high_share_min_difficulty = integer(
-        api, "recent_high_share_min_difficulty", 20000000000ULL, 1,
+        api, "recent_high_share_min_difficulty", 80000000000ULL, 1,
         std::numeric_limits<std::uint64_t>::max(), "api");
+    if (result.api.recent_high_share_min_difficulty <
+        result.database.min_persisted_share_difficulty) {
+        throw ValidationError(
+            "api.recent_high_share_min_difficulty must be at least "
+            "database.min_persisted_share_difficulty");
+    }
 
     const Json &defense = root.at("defense");
     keys(defense, "defense",

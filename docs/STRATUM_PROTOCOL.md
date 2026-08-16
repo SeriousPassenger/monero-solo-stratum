@@ -146,10 +146,14 @@ authenticated connection. It is sent as a notification:
 }
 ```
 
-The server retains the configured current/prior job history and applies every
-nonce to the exact retained private block. `connection_last_sent_height` is
-the height of the latest complete job frame successfully queued, not a
-maximum-ever height. A downward reorg can lower it.
+The server applies every nonce to the exact retained private block. Every job
+at the connection's latest queued height remains valid, even after repeated
+same-height polls and beyond `job_ttl_ms`, until a strictly higher-height job is
+successfully queued, the connection closes, or the process restarts. Jobs at a
+different noncurrent height may expire under `job_ttl_ms` during a downward
+reorg sequence. `connection_last_sent_height` is the height of the latest
+complete job frame successfully queued, not a maximum-ever height, so a
+downward reorg can lower it.
 
 ## Difficulty target
 
@@ -201,8 +205,9 @@ no host-endian numeric reinterpretation.
 
 A monotonically increasing per-connection `request_sequence` is assigned after
 strict parameter/length decoding. Request-ID reuse after a prior response
-creates a distinct share row; the request ID is correlation text, not a
-database uniqueness key.
+creates a distinct submission identity; the request ID is correlation text,
+not a uniqueness key. It becomes part of a SQLite share row only when the
+selective retention policy keeps that submission.
 
 Success:
 
@@ -219,17 +224,21 @@ Application errors use code `-1` and one of the intentionally short messages
 `Unauthenticated`, `Unknown job`, `Duplicate share`, `Low difficulty share`,
 `Stale share`, `Invalid result`, or `Server busy`. Syntax/envelope and unknown
 method errors use standard `-32600`/`-32601` where a response can safely be
-formed. Rich internal codes remain in SQLite/API/events.
+formed. Retained significant evidence keeps rich internal codes in
+SQLite/API/events; routine low-value detail remains in debug/trace JSONL.
 
 The response is only the ordinary share classification. It is never a promise
 that a candidate block was accepted. Candidate submit/retry/reconciliation and
 `blocknotify` continue independently, and no second Stratum response reports
 their outcome.
 
-Verified mode responds after the MSPV completion and durable final share
-transaction. Trusted mode responds after synchronous claimed-hash
-classification. If the TCP connection disappears first, the result remains
-persisted and no response is sent.
+Verified mode responds after the MSPV completion and terminal classification.
+Trusted mode responds after synchronous claimed-hash classification. Candidate
+and security evidence commit synchronously before their dependent actions;
+ordinary terminal accounting may use the configured batch interval, and only
+selectively retained shares receive durable detail rows. If the TCP connection
+disappears first, classification/accounting still completes and no response is
+sent.
 
 ## Classification order and staleness
 

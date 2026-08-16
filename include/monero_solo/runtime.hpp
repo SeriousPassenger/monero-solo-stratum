@@ -53,6 +53,11 @@ private:
     struct JobLease;
     struct CandidateTask;
     struct VerificationResult;
+    struct DeferredConnectionClose {
+        std::int64_t connection_id{};
+        std::int64_t closed_unix_us{};
+        std::string reason;
+    };
 
     void validate_daemon_network();
     [[nodiscard]] bool refresh_template(std::string reason);
@@ -65,9 +70,6 @@ private:
     void observe_connection(const MinerConnection &connection, std::string_view event);
     void retire_job_context(const std::shared_ptr<JobContext> &job,
                             std::int64_t retired_unix_us) noexcept;
-    void persist_retired_duplicates(
-        std::vector<DuplicateToken> tokens,
-        std::int64_t retired_unix_us) noexcept;
     void apply_actionable_verdicts(
         const std::vector<ActionableCandidateVerdict> &verdicts) noexcept;
     void update_readiness() noexcept;
@@ -79,13 +81,15 @@ private:
         std::uint64_t share_id);
     void template_loop(std::stop_token token) noexcept;
     void entropy_loop(std::stop_token token) noexcept;
+    void accounting_loop(std::stop_token token) noexcept;
     [[nodiscard]] bool wait_for_zmq_tip_change(std::stop_token token);
     void candidate_loop(std::stop_token token) noexcept;
     void committed_event_loop(std::stop_token token) noexcept;
     [[nodiscard]] bool enqueue_candidate(CandidateTask task) noexcept;
     [[nodiscard]] CandidateJournalResult journal_candidate(
-        std::int64_t share_id, const std::shared_ptr<JobContext> &job,
-        const MinerConnection &connection, const ParsedBlock &frozen,
+        std::int64_t &share_id, const std::shared_ptr<JobContext> &job,
+        const MinerConnection &connection, std::string_view submission_id,
+        const ParsedBlock &frozen,
         bool claimed_path, bool bypass_admission,
         std::optional<bool> *admission_acquired = nullptr);
     [[nodiscard]] bool reconcile_candidate(const CandidateTask &task);
@@ -97,12 +101,7 @@ private:
     void release_candidate_boundary_unlocked(std::int64_t candidate_id) noexcept;
     void release_candidate_boundary(std::int64_t candidate_id) noexcept;
     [[nodiscard]] ApiDataSource api_data_source();
-    void emit(std::string type, nlohmann::json data,
-              std::optional<std::int64_t> connection_id = std::nullopt,
-              std::optional<std::int64_t> job_id = std::nullopt,
-              std::optional<std::int64_t> share_id = std::nullopt,
-              std::optional<std::int64_t> candidate_id = std::nullopt,
-              std::optional<std::int64_t> round_id = std::nullopt) noexcept;
+    void emit(std::string type, nlohmann::json data) noexcept;
 
     Config config_;
     logging::Logger logger_;
@@ -133,6 +132,7 @@ private:
     std::atomic<bool> job_issuance_allowed_{true};
     std::atomic<bool> template_refresh_requested_{false};
     std::atomic<std::uint64_t> template_generation_{0};
+    std::atomic<std::uint64_t> next_job_id_{0};
     std::atomic<std::uint64_t> current_height_{0};
     std::int64_t started_unix_us_{};
     std::int64_t event_stream_start_id_{};
@@ -147,7 +147,8 @@ private:
     std::unordered_map<std::string, std::deque<std::string>> connection_jobs_;
     std::unordered_map<std::string, std::size_t> pending_verifications_;
     std::unordered_map<std::string, std::size_t> accepted_submits_;
-    std::unordered_set<std::string> disconnected_connections_;
+    std::unordered_map<std::string, DeferredConnectionClose>
+        deferred_connection_closes_;
     std::optional<std::string> last_error_;
 
     mutable std::mutex lifecycle_mutex_;
@@ -165,6 +166,7 @@ private:
     std::map<std::int64_t, std::uint64_t> unresolved_candidate_heights_;
     std::optional<std::uint64_t> accepted_candidate_height_fence_;
     std::jthread entropy_thread_;
+    std::jthread accounting_thread_;
     std::jthread template_thread_;
     std::jthread committed_event_thread_;
 };

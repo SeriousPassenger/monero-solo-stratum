@@ -339,74 +339,38 @@ void test_sqlite_backed_persisted_resources()
         "XMRig/6.26.0",
         1'700'000'001'000'000,
     });
-    monero_solo::Hash32 prev{};
-    monero_solo::Hash32 seed{};
-    prev[0] = 3;
-    seed[0] = 4;
-    const std::int64_t template_id = database.insert_public_template({
-        session,
-        1,
-        3736190,
-        prev,
-        seed,
-        std::nullopt,
-        "1000",
-        std::nullopt,
-        8,
-        {1, 2, 3},
-        {4, 5, 6},
-        1'700'000'002'000'000,
-        "startup",
-    });
     monero_solo::PublicId job_public{};
-    monero_solo::PublicId entropy{};
     job_public[0] = 5;
-    entropy[0] = 6;
-    std::array<std::uint8_t, 8> target{};
-    target.fill(0xff);
-    const std::int64_t job = database.insert_private_job({
-        job_public,
-        connection,
-        template_id,
-        3736190,
-        entropy,
-        seed,
-        std::string("1"),
-        "1048576",
-        target,
-        "1000",
-        39,
-        8,
-        {7, 8, 9},
-        {10, 11, 12},
-        1'700'000'003'000'000,
-        1'700'000'003'100'000,
-        1'700'000'123'000'000,
-    });
     std::array<std::uint8_t, 4> nonce{1, 2, 3, 4};
     const std::int64_t share = database.insert_share({
-        connection,
-        worker,
-        job,
-        1,
-        std::string("integer"),
-        std::string("2"),
-        1'700'000'004'000'000,
-        nonce,
-        std::string("1048576"),
-        std::string("1000"),
-        false,
-        false,
-        "not_candidate",
-        "received",
-        "pending",
+        .session_id = session,
+        .connection_id = connection,
+        .worker_id = worker,
+        .job_public_id = job_public,
+        .template_generation = 1,
+        .height = 3736190,
+        .request_sequence = 1,
+        .miner_request_id_type = std::string("integer"),
+        .miner_request_id_text = std::string("2"),
+        .received_unix_us = 1'700'000'004'000'000,
+        .nonce = nonce,
+        .assigned_difficulty_dec = std::string("1048576"),
+        .network_difficulty_dec = std::string("1000"),
+        .height_is_older = false,
+        .claimed_candidate = false,
+        .candidate_admission = "not_candidate",
+        .status = "received",
+        .provenance = "pending",
     });
+    monero_solo::Hash32 computed_hash{};
+    computed_hash[0] = 0xaa;
+    database.insert_share_hash(share, "computed", computed_hash, true, false);
     const auto accepted = database.accept_share({
         .share_id = share,
         .completed_unix_us = 1'700'000'004'500'000,
         .assigned_difficulty_dec = "1048576",
         .source = monero_solo::HashrateSource::verified,
-        .actual_difficulty_dec = "25000000000",
+        .actual_difficulty_dec = "100000000000",
         .verifier_ticket_dec = std::nullopt,
         .verifier_seed_id_dec = std::nullopt,
         .verifier_queue_ns = std::nullopt,
@@ -414,10 +378,10 @@ void test_sqlite_backed_persisted_resources()
         .verifier_total_ns = std::nullopt,
     });
     require(accepted.accepted, "API fixture share did not accept");
-    monero_solo::Hash32 computed_hash{};
-    computed_hash[0] = 0xaa;
-    database.insert_share_hash(share, "computed", computed_hash, true, false);
-
+    const std::int64_t retained_share = database.ensure_share_persisted(
+        share, "high_difficulty").share_id;
+    require(retained_share > 0,
+            "high-difficulty fixture share was not retained");
     const auto insert_fractional_share =
         [&](const std::uint8_t public_marker,
             const std::uint64_t request_sequence,
@@ -426,47 +390,28 @@ void test_sqlite_backed_persisted_resources()
             const std::string &actual_difficulty,
             const std::int64_t received_unix_us) {
             monero_solo::PublicId fractional_job_public{};
-            monero_solo::PublicId fractional_entropy{};
             fractional_job_public[0] = public_marker;
-            fractional_entropy[0] = static_cast<std::uint8_t>(
-                public_marker + 16U);
-            const std::int64_t fractional_job = database.insert_private_job({
-                fractional_job_public,
-                connection,
-                template_id,
-                3736190,
-                fractional_entropy,
-                seed,
-                std::string("1"),
-                assigned_difficulty,
-                target,
-                network_difficulty,
-                39,
-                8,
-                {7, 8, public_marker},
-                {10, 11, public_marker},
-                received_unix_us - 500'000,
-                received_unix_us - 400'000,
-                1'700'000'123'000'000,
-            });
             std::array<std::uint8_t, 4> fractional_nonce{
                 public_marker, 2, 3, 4};
             const std::int64_t fractional_share = database.insert_share({
-                connection,
-                worker,
-                fractional_job,
-                request_sequence,
-                std::string("integer"),
-                std::to_string(request_sequence),
-                received_unix_us,
-                fractional_nonce,
-                assigned_difficulty,
-                network_difficulty,
-                false,
-                false,
-                "not_candidate",
-                "received",
-                "pending",
+                .session_id = session,
+                .connection_id = connection,
+                .worker_id = worker,
+                .job_public_id = fractional_job_public,
+                .template_generation = 1,
+                .height = 3736190,
+                .request_sequence = request_sequence,
+                .miner_request_id_type = std::string("integer"),
+                .miner_request_id_text = std::to_string(request_sequence),
+                .received_unix_us = received_unix_us,
+                .nonce = fractional_nonce,
+                .assigned_difficulty_dec = assigned_difficulty,
+                .network_difficulty_dec = network_difficulty,
+                .height_is_older = false,
+                .claimed_candidate = false,
+                .candidate_admission = "not_candidate",
+                .status = "received",
+                .provenance = "pending",
             });
             const auto result = database.accept_share({
                 .share_id = fractional_share,
@@ -486,12 +431,16 @@ void test_sqlite_backed_persisted_resources()
                     "fixture shares unexpectedly crossed rounds");
             return fractional_share;
         };
-    const std::int64_t threshold_share = insert_fractional_share(
-        7, 2, "1", "200000000", "20000000000",
+    const std::int64_t threshold_share_alias = insert_fractional_share(
+        7, 2, "1", "200000000", "80000000000",
         1'700'000'004'100'000);
+    const std::int64_t threshold_share = database.ensure_share_persisted(
+        threshold_share_alias, "high_difficulty").share_id;
     const std::int64_t below_threshold_share = insert_fractional_share(
-        8, 3, "2", "400000000", "19999999999",
+        8, 3, "2", "400000000", "79999999999",
         1'700'000'004'200'000);
+    require(threshold_share > 0 && below_threshold_share < 0,
+            "selective share persistence threshold is wrong");
 
     monero_solo::Hash32 candidate_key{};
     monero_solo::Hash32 miner_tx_hash{};
@@ -499,8 +448,11 @@ void test_sqlite_backed_persisted_resources()
     miner_tx_hash[0] = 0xc2;
     const auto candidate = database.journal_candidate({
         .candidate_key = candidate_key,
-        .first_share_id = share,
-        .job_id = job,
+        .first_share_id = retained_share,
+        .session_id = session,
+        .round_id = accepted.round_id,
+        .job_public_id = job_public,
+        .template_generation = 1,
         .connection_id = connection,
         .height = 3736190,
         .peer_family = AF_INET,
@@ -521,7 +473,7 @@ void test_sqlite_backed_persisted_resources()
 
     monero_solo::ApiDataSource live;
     live.readiness = [] { return ready_snapshot(); };
-    live.singleton = [template_id](const monero_solo::ApiSingleton resource)
+    live.singleton = [](const monero_solo::ApiSingleton resource)
         -> std::optional<Json> {
         if (resource == monero_solo::ApiSingleton::summary) {
             return Json{{"server",
@@ -543,14 +495,14 @@ void test_sqlite_backed_persisted_resources()
                         {"zmq_state", "disabled"},
                         {"height", 3736190},
                         {"template_generation", "1"},
-                        {"template_id", std::to_string(template_id)}};
+                        {"template_id", nullptr}};
         }
         return std::nullopt;
     };
     monero_solo::ApiConfig analytics_api;
     analytics_api.top_shares_limit = 2;
     analytics_api.recent_high_shares_limit = 1;
-    analytics_api.recent_high_share_min_difficulty = 20'000'000'000ULL;
+    analytics_api.recent_high_share_min_difficulty = 80'000'000'000ULL;
     auto source = monero_solo::make_sqlite_api_data_source({
         {path, 5000, false},
         analytics_api,
@@ -562,6 +514,8 @@ void test_sqlite_backed_persisted_resources()
                 .queued_items = 7,
                 .queued_bytes = 3584,
                 .priority_items = 2,
+                .pending_accounting_items = 3,
+                .pending_transient_shares = 2,
             };
         },
     });
@@ -578,25 +532,21 @@ void test_sqlite_backed_persisted_resources()
                 connections["data"][0]["worker_id"] == std::to_string(worker),
             "SQLite connection serialization is wrong");
 
-    const Json jobs = body(service.handle(request(
-        "/v1/jobs", "include_blobs=true")));
-    require(jobs["data"].size() == 3U &&
-                jobs["data"][0]["id"] ==
-                    "05000000000000000000000000000000" &&
-                jobs["data"][0]["private_entropy"] ==
-                    "06000000000000000000000000000000" &&
-                jobs["data"][0]["hashing_blob"] == "0a0b0c",
-            "SQLite job/blob serialization is wrong");
+    require(service.handle(request("/v1/jobs")).status == 404 &&
+                service.handle(request("/v1/templates")).status == 404,
+            "removed transient job/template history routes are still exposed");
 
     const Json shares = body(service.handle(request("/v1/shares")));
-    require(shares["data"].size() == 3U &&
-                shares["data"][0]["id"] == std::to_string(share) &&
+    require(shares["data"].size() == 2U &&
+                shares["data"][0]["id"] == std::to_string(retained_share) &&
                 shares["data"][0]["status"] == "accepted" &&
                 shares["data"][0]["credited_difficulty"] == "1048576" &&
-                shares["data"][0]["actual_difficulty"] == "25000000000" &&
+                shares["data"][0]["actual_difficulty"] == "100000000000" &&
                 shares["data"][0]["round_id"] ==
                     std::to_string(accepted.round_id) &&
-                shares["data"][0]["height"] == 3736190,
+                shares["data"][0]["height"] == 3736190 &&
+                shares["data"][0]["template_generation"] == "1" &&
+                shares["data"][0]["retention_reason"] == "high_difficulty",
             "SQLite share serialization is wrong");
 
     const Json minimum = body(service.handle(
@@ -610,10 +560,10 @@ void test_sqlite_backed_persisted_resources()
 
     const Json hashes = body(service.handle(request("/v1/hashes")));
     require(hashes["data"].size() == 1U &&
-                hashes["data"][0]["share_id"] == std::to_string(share) &&
+                hashes["data"][0]["share_id"] == std::to_string(retained_share) &&
                 hashes["data"][0]["role"] == "computed" &&
                 hashes["data"][0]["assigned_difficulty"] == "1048576" &&
-                hashes["data"][0]["actual_difficulty"] == "25000000000" &&
+                hashes["data"][0]["actual_difficulty"] == "100000000000" &&
                 hashes["data"][0]["network_difficulty"] == "1000" &&
                 hashes["data"][0]["credited_difficulty"] == "1048576" &&
                 hashes["data"][0]["provenance"] == "verified" &&
@@ -623,7 +573,7 @@ void test_sqlite_backed_persisted_resources()
 
     const Json top = body(service.handle(request("/v1/shares/top")));
     require(top["data"].size() == 2U &&
-                top["data"][0]["id"] == std::to_string(share) &&
+                top["data"][0]["id"] == std::to_string(retained_share) &&
                 top["data"][1]["id"] == std::to_string(threshold_share) &&
                 top["selection"]["kind"] == "top_actual_difficulty" &&
                 top["selection"]["configured_limit"] == 2,
@@ -648,16 +598,16 @@ void test_sqlite_backed_persisted_resources()
     require(recent_high["data"].size() == 1U &&
                 recent_high["data"][0]["id"] ==
                     std::to_string(threshold_share) &&
-                recent_high["data"][0]["actual_difficulty"] == "20000000000" &&
+                recent_high["data"][0]["actual_difficulty"] == "80000000000" &&
                 recent_high["selection"]["min_actual_difficulty"] ==
-                    "20000000000" &&
+                    "80000000000" &&
                 recent_high["selection"]["configured_limit"] == 1 &&
                 recent_high["data"][0]["id"] !=
                     std::to_string(below_threshold_share),
             "recent high-share threshold/order/cap is wrong");
 
     const Json share_detail = body(service.handle(
-        request("/v1/shares/" + std::to_string(share))));
+        request("/v1/shares/" + std::to_string(retained_share))));
     require(share_detail["data"]["share"]["status"] == "accepted" &&
                 share_detail["data"]["submission_url"] ==
                     "/v1/submissions/" +
@@ -670,6 +620,7 @@ void test_sqlite_backed_persisted_resources()
                     std::to_string(accepted.round_id) &&
                 round_history["data"][0]["state"] == "closed" &&
                 round_history["data"][0]["accepted_share_count"] == "3" &&
+                round_history["data"][0]["max_share_height"] == 3736190 &&
                 round_history["data"][0]["credited_difficulty"] == "1048579" &&
                 round_history["data"][0]["estimated_hashes"] == "1048579" &&
                 round_history["data"][0]["effort_finalized_at"].is_string() &&
@@ -690,6 +641,7 @@ void test_sqlite_backed_persisted_resources()
     require(current_round["data"]["id"] == std::to_string(current_round_id) &&
                 current_round["data"]["state"] == "open" &&
                 current_round["data"]["accepted_share_count"] == "0" &&
+                current_round["data"]["max_share_height"] == 0 &&
                 current_round["data"]["estimated_hashes"] == "0" &&
                 current_round["data"]["effort_finalized_at"].is_null() &&
                 current_round["data"]["effort"]["value"] == "0.000000" &&
@@ -712,12 +664,14 @@ void test_sqlite_backed_persisted_resources()
                 summary["data"]["connections"]["total"] == "1" &&
                 summary["data"]["workers"]["active"] == 1 &&
                 summary["data"]["shares"]["accepted"] == "3" &&
-                summary["data"]["shares"]["total"] == "3" &&
+                summary["data"]["shares"]["pending"] == "2" &&
+                summary["data"]["shares"]["total"] == "5" &&
                 summary["data"]["candidates"]["accepted"] == "1" &&
                 summary["data"]["candidates"]["total"] == "1" &&
                 summary["data"]["round"]["state"] == "open" &&
                 summary["data"]["round"]["estimated_hashes"] == "0" &&
                 summary["data"]["round"]["accepted_share_count"] == "0" &&
+                summary["data"]["round"]["max_share_height"] == 0 &&
                 summary["data"]["round"]["effort"]["value"] ==
                     "0.000000" &&
                 summary["data"]["daemon"]["rpc"] == "healthy" &&
@@ -728,7 +682,7 @@ void test_sqlite_backed_persisted_resources()
     const auto persistence_response = service.handle(request("/v1/persistence"));
     const Json persistence = body(persistence_response);
     require(persistence_response.status == 200 &&
-                persistence["data"]["schema_version"] == 2 &&
+                persistence["data"]["schema_version"] == 3 &&
                 persistence["data"]["journal_mode"] == "wal" &&
                 persistence["data"]["synchronous"] == "full" &&
                 persistence["data"]["foreign_keys"] == true &&
@@ -737,6 +691,8 @@ void test_sqlite_backed_persisted_resources()
                 persistence["data"]["writer_queue_items"] == 7 &&
                 persistence["data"]["writer_queue_bytes"] == 3584 &&
                 persistence["data"]["writer_priority_items"] == 2 &&
+                persistence["data"]["pending_accounting_items"] == 3 &&
+                persistence["data"]["pending_transient_shares"] == 2 &&
                 persistence["data"]["last_commit_at"].is_string(),
             "SQLite persistence snapshot is wrong");
 }

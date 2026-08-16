@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "network": "mainnet",
   "wallet_address": "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A",
   "blocknotify": null,
@@ -16,7 +16,6 @@
     "max_line_bytes": 16384,
     "max_output_bytes_per_connection": 1048576,
     "max_json_depth": 32,
-    "job_history": 6,
     "job_ttl_ms": 120000,
     "max_pending_verifications_per_connection": 8,
     "submit_workers": 0
@@ -64,8 +63,8 @@
     "busy_timeout_ms": 5000,
     "max_writer_queue_items": 100000,
     "max_writer_queue_bytes": 67108864,
-    "retention_days": 0,
-    "store_rejected_shares": true
+    "min_persisted_share_difficulty": 80000000000,
+    "accounting_flush_interval_ms": 1000
   },
   "events": {
     "enabled": true,
@@ -85,7 +84,7 @@
     "max_pending_bytes_per_connection": 2097152,
     "top_shares_limit": 100,
     "recent_high_shares_limit": 100,
-    "recent_high_share_min_difficulty": 20000000000
+    "recent_high_share_min_difficulty": 80000000000
   },
   "defense": {
     "enabled": false,

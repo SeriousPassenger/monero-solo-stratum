@@ -145,6 +145,7 @@ class RecordBuilder final {
     case PublicStringKey::template_public_id: return "template_public_id";
     case PublicStringKey::job_public_id: return "job_public_id";
     case PublicStringKey::share_public_id: return "share_public_id";
+    case PublicStringKey::submission_id: return "submission_id";
     case PublicStringKey::candidate_key: return "candidate_key";
     case PublicStringKey::round_public_id: return "round_public_id";
     case PublicStringKey::ban_public_id: return "ban_public_id";
@@ -453,6 +454,20 @@ void Logger::log(const Severity severity,
                  const std::initializer_list<PublicStringField> strings,
                  const std::initializer_list<IntegerField> integers,
                  const std::initializer_list<SensitiveHexField> sensitive) noexcept
+{
+    log_fields(
+        severity, stable_code,
+        std::span<const PublicStringField>(strings.begin(), strings.size()),
+        std::span<const IntegerField>(integers.begin(), integers.size()),
+        std::span<const SensitiveHexField>(sensitive.begin(), sensitive.size()));
+}
+
+void Logger::log_fields(
+    const Severity severity,
+    const std::string_view stable_code,
+    const std::span<const PublicStringField> strings,
+    const std::span<const IntegerField> integers,
+    const std::span<const SensitiveHexField> sensitive) noexcept
 {
     if (!valid_severity(severity)) {
         rejected_.fetch_add(1, std::memory_order_relaxed);

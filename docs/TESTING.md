@@ -33,17 +33,17 @@ ctest --test-dir build -R 'config|database|protocol' --output-on-failure
 
 | Test | Coverage in the current source tree |
 | --- | --- |
-| `config_tests` | Defaults/required keys, strict/duplicate JSON, unknown keys, address and cross-capacity/security rules, no-shell blocknotify tokenizer, and complete example config loading |
+| `config_tests` | Schema-2 defaults/required keys, persistence threshold/flush bounds and API-floor cross-check, strict/duplicate JSON, removed `job_history`/legacy database-key rejection, address/security rules, no-shell blocknotify tokenizer, and complete example loading |
 | `entropy_tests` | Exact HMAC-DRBG construction vector, independent/reseed behavior, failure atomicity, and timed retry/backoff |
 | `logger_tests` | JSONL schema/time/severity/typed-field output, filtering and bounds, sensitive-entropy construction gating, mode-0600 append/open safety, stderr/failure containment, and concurrent noninterleaving writes |
 | `monero_tests` | Legacy Keccak/address validation, share/network target boundaries, constant-time hash comparison, block/parser/mutation vectors, duplicate and candidate keys |
 | `monero_template_tests` | Realistic daemon template parse/regeneration, private reserved-byte mutation, exact nonce/frozen candidate reconstruction |
-| `database_tests` | Schema/pragmas, sessions/jobs/shares/duplicates, candidate journaling/attempt/reconciliation state, bounded writer item/byte reserve and priority ordering/stats, durable share-to-round assignment, exact/frozen round effort segments, rounds/hashrate, bans/verdicts/events, strict event-payload validation, hook recovery, orphan lifecycle cleanup, duplicate-capacity reclamation, and restart event attribution |
+| `database_tests` | Clean schema v3/pragmas, absence of template/job blob tables, selective denormalized shares, compact share totals, self-contained candidate journaling/attempt/reconciliation state, bounded writer reserve and priority ordering, exact/frozen round effort, rounds/hashrate, bans/verdicts/significant events, hook recovery, and restart attribution |
 | `verifier_tests` | Exact server-to-native config mapping, known RandomX answer, tag/ticket/seed correlation, rotation/release, completion draining, cancel and drain shutdown |
 | `api_tests` | Bearer/null-empty semantics, GET-only/errors/health, strict filters/cursor binding, sensitive views, persisted SQLite resources/detail shapes, mixed-difficulty hashrate/effort, and bounded top/recent-high share rankings |
 | `protocol_tests` | Duplicate registry bounds/lifecycle, defense/ban admission, loopback Stratum login/job/submit/keepalive/framing, ordinary and NiceHash compact-target simple-mode jobs, full nonce preservation, Unix event stream, blocknotify supervisor |
 | `http_tests` | Real TCP HTTP framing, empty-body enforcement, transfer-encoding rejection, duplicate headers, and transport-error envelopes |
-| `runtime_tests` | In-process mock `monerod`, real Stratum/API sockets, private jobs, byte-identical same-height refresh with prior-job acceptance, trusted share persistence, restart state, candidate/template round-boundary gating, fail-closed template validation, verbose post-commit job/share JSONL correlation, debug entropy opt-out/trace automatic inclusion, and configured-secret non-disclosure |
+| `runtime_tests` | In-process mock `monerod`, real Stratum/API sockets, private jobs, byte-identical repeated same-height refresh beyond TTL with prior-job acceptance until a higher height queues, trusted share persistence, restart state, candidate/template round-boundary gating, fail-closed template validation, verbose post-commit job/share JSONL correlation, debug entropy opt-out/trace automatic inclusion, and configured-secret non-disclosure |
 | `rental_fanin_tests` | 200 simultaneous authenticated miners across three loopback source IPs, fixed event/worker thread count, refresh delivery to every miner, bounded concurrent submits, connection reaping, and timing/RSS diagnostics |
 | `watch_status_tests` | Legacy stubbed-API rendering and arguments plus split-TUI parsing, adaptive mixed-event sampling, themes/layouts, source fallbacks, host/monerod metrics, bounded history, selection, empty-field-pruned JSON export, rotation/truncation and noninteractive render fixtures |
 
@@ -191,7 +191,9 @@ For extended fault/reorg validation beyond that core smoke, cover:
    `network=regtest`; require `get_info.nettype=fakechain`.
 2. Start verified light mode and wait until `/v1/health/ready` is 200.
 3. Connect XMRig/simple test client, receive a private `rx/0` job, submit a
-   known valid share, and confirm one accepted row/credited bucket.
+   known valid share, and confirm one compact accepted total plus credited
+   bucket. Require an individual share row only when it meets the configured
+   persistence threshold or is candidate/security evidence.
 4. Generate a candidate at easy regtest difficulty. Verify that the candidate
    row/frozen bytes exist before the first `submitblock`, daemon `OK` closes
    exactly one round, and hook delivery is created once.
@@ -199,8 +201,9 @@ For extended fault/reorg validation beyond that core smoke, cover:
    bytes on retry and acceptance by positive `get_block` reconciliation.
 6. Submit retained older valid work after a higher job is queued to that same
    connection; require `stale`. Same-height earlier work must not be stale.
-7. Restart with a nonterminal candidate, active ban, active duplicate, and
-   running hook row; verify recovery/idempotency.
+7. Restart with a nonterminal candidate, active ban, and running hook row;
+   verify their recovery/idempotency and verify the process-local ordinary
+   duplicate registry starts empty because pre-restart private jobs are invalid.
 8. Exercise a downward reorg/template parent change and ensure latest-sent
    height is replaced rather than treated as maximum-ever.
 
@@ -218,7 +221,7 @@ Use process termination or a daemon fault proxy at each durable boundary:
 | During `dispatching`/lost response | Interrupted attempt becomes indeterminate; reconcile before resend |
 | After daemon accepts, before local acceptance | Positive reconciliation accepts exactly once |
 | After round close, before hook success | Round stays closed; pending/running hook retries at least once |
-| During share finalization | No success response unless the accepted/accounting transaction committed |
+| During ordinary accounting batch | At most one configured flush interval of aggregate telemetry is lost; no candidate/security record is lost |
 
 After each crash, run `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, and
 API state assertions. Do not manually mutate the live test database.

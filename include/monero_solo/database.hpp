@@ -29,6 +29,8 @@ struct DatabaseOptions {
     std::uint64_t max_writer_queue_items{100000};
     std::uint64_t max_writer_queue_bytes{67108864};
     std::uint64_t writer_priority_reserve_items{0};
+    std::uint64_t min_persisted_share_difficulty{80000000000ULL};
+    std::uint32_t accounting_flush_interval_ms{1000};
 };
 
 /*
@@ -40,6 +42,8 @@ struct DatabaseWriterStats {
     std::uint64_t queued_items{};
     std::uint64_t queued_bytes{};
     std::uint64_t priority_items{};
+    std::uint64_t pending_accounting_items{};
+    std::uint64_t pending_transient_shares{};
 };
 
 struct DatabasePragmas {
@@ -62,8 +66,8 @@ struct EventInsert {
     std::string type;
     std::optional<std::int64_t> connection_id;
     std::optional<std::int64_t> worker_id;
-    std::optional<std::int64_t> template_id;
-    std::optional<std::int64_t> job_id;
+    std::optional<std::int64_t> template_generation;
+    std::optional<PublicId> job_public_id;
     std::optional<std::int64_t> share_id;
     std::optional<std::int64_t> candidate_id;
     std::optional<std::int64_t> round_id;
@@ -77,7 +81,7 @@ struct PersistedEvent {
     std::string type;
     std::optional<PublicId> connection_public_id;
     std::optional<std::int64_t> worker_id;
-    std::optional<std::int64_t> template_id;
+    std::optional<std::int64_t> template_generation;
     std::optional<PublicId> job_public_id;
     std::optional<std::int64_t> share_id;
     std::optional<std::int64_t> candidate_id;
@@ -103,51 +107,14 @@ struct ConnectionInsert {
     std::int64_t opened_unix_us{};
 };
 
-struct PublicTemplateInsert {
-    std::int64_t session_id{};
-    std::int64_t generation{};
-    std::uint64_t height{};
-    Hash32 prev_hash{};
-    Hash32 seed_hash{};
-    std::optional<Hash32> next_seed_hash;
-    std::string difficulty_dec;
-    std::optional<std::string> wide_difficulty_hex;
-    std::uint64_t reserved_offset{};
-    ByteVector blocktemplate_blob;
-    ByteVector blockhashing_blob;
-    std::int64_t fetched_unix_us{};
-    std::string fetch_reason;
-};
-
-struct PrivateJobInsert {
-    PublicId public_job_id{};
-    std::int64_t connection_id{};
-    std::int64_t template_id{};
-    std::uint64_t height{};
-    PublicId entropy{};
-    Hash32 seed_hash{};
-    std::optional<std::string> mspv_seed_id_dec;
-    std::string assigned_difficulty_dec;
-    std::array<std::uint8_t, 8> target64_le{};
-    std::string network_difficulty_dec;
-    std::uint64_t nonce_offset{};
-    std::uint64_t reserved_offset{};
-    ByteVector private_block_blob;
-    ByteVector hashing_blob;
-    std::int64_t created_unix_us{};
-    std::optional<std::int64_t> queued_unix_us;
-    std::int64_t expires_unix_us{};
-};
-
 enum class CandidateVerdictKind {
     false_candidate,
     candidate_mismatch,
 };
 
-// A value snapshot of the evidence that became actionable in the same
-// transaction that retired the job.  In particular, peer_address is copied
-// from the persisted connection; callers never have to consult mutable live
-// connection state in order to score the verdict.
+// A value snapshot of durable security evidence. In particular, peer_address
+// is copied from the persisted connection; callers never have to consult
+// mutable live connection state in order to score the verdict.
 struct ActionableCandidateVerdict {
     std::int64_t abuse_event_id{};
     std::int64_t share_id{};
@@ -157,24 +124,19 @@ struct ActionableCandidateVerdict {
     ByteVector peer_address;
 };
 
-struct JobRetirementResult {
-    bool retired{};
-    std::uint32_t newly_actionable_false_candidates{};
-    std::uint32_t newly_actionable_candidate_mismatches{};
-    std::vector<ActionableCandidateVerdict> actionable_verdicts;
-};
-
 struct InterruptedRuntimeRecovery {
     std::uint64_t sessions_stopped{};
     std::uint64_t connections_closed{};
-    std::uint64_t jobs_retired{};
     std::vector<ActionableCandidateVerdict> actionable_verdicts;
 };
 
 struct ShareInsert {
-    std::int64_t connection_id{};
+    std::int64_t session_id{};
+    std::optional<std::int64_t> connection_id;
     std::optional<std::int64_t> worker_id;
-    std::optional<std::int64_t> job_id;
+    std::optional<PublicId> job_public_id;
+    std::optional<std::int64_t> template_generation;
+    std::optional<std::uint64_t> height;
     std::uint64_t request_sequence{};
     std::optional<std::string> miner_request_id_type;
     std::optional<std::string> miner_request_id_text;
@@ -189,28 +151,6 @@ struct ShareInsert {
     std::string provenance{"pending"};
 };
 
-enum class DuplicateRole {
-    claimed,
-    computed,
-    both,
-};
-
-struct DuplicateReservationResult {
-    bool reserved{};
-    bool already_active{};
-    std::int64_t first_share_id{};
-    std::int64_t generation_token{};
-};
-
-struct ActiveDuplicate {
-    DuplicateKey key{};
-    std::uint64_t source_id{};
-    std::uint64_t height{};
-    std::int64_t first_share_id{};
-    DuplicateRole role{DuplicateRole::claimed};
-    std::int64_t generation_token{};
-};
-
 enum class CandidateState {
     journaled,
     dispatching,
@@ -223,8 +163,11 @@ enum class CandidateState {
 
 struct CandidateJournal {
     Hash32 candidate_key{};
-    std::int64_t first_share_id{};
-    std::int64_t job_id{};
+    std::optional<std::int64_t> first_share_id;
+    std::int64_t session_id{};
+    std::int64_t round_id{};
+    PublicId job_public_id{};
+    std::int64_t template_generation{};
     std::int64_t connection_id{};
     std::uint64_t height{};
     int peer_family{};
@@ -240,6 +183,10 @@ struct CandidateJournalResult {
     std::int64_t candidate_id{};
     bool inserted{};
     CandidateState state{CandidateState::journaled};
+    // True means the origin round is no longer open or a higher-height share
+    // was already admitted to it. No candidate row is inserted and
+    // candidate_id remains zero.
+    bool round_contaminated{};
 };
 
 enum class CandidateAttemptClassification {
@@ -313,8 +260,10 @@ struct CandidateReconciliationResult {
 struct CandidateRecovery {
     std::int64_t candidate_id{};
     Hash32 candidate_key{};
-    std::int64_t first_share_id{};
-    std::int64_t job_id{};
+    std::optional<std::int64_t> first_share_id;
+    std::int64_t round_id{};
+    PublicId job_public_id{};
+    std::int64_t template_generation{};
     std::int64_t connection_id{};
     std::uint64_t height{};
     int peer_family{};
@@ -340,6 +289,13 @@ struct ShareAcceptanceResult {
     bool accepted{};
     std::int64_t round_id{};
     std::int64_t event_id{};
+    // Zero for an ordinary transient-only share, otherwise the durable row ID.
+    std::int64_t persisted_share_id{};
+};
+
+struct PersistedShareIdentity {
+    std::int64_t share_id{};
+    std::int64_t round_id{};
 };
 
 struct ShareAcceptance {
@@ -367,6 +323,14 @@ struct ShareFinalization {
     std::optional<std::uint64_t> verifier_queue_ns;
     std::optional<std::uint64_t> verifier_hash_ns;
     std::optional<std::uint64_t> verifier_total_ns;
+};
+
+struct ShareFinalizationResult {
+    bool finalized{};
+    // Zero for an ordinary transient-only share, otherwise the durable row ID.
+    std::int64_t persisted_share_id{};
+
+    [[nodiscard]] operator bool() const noexcept { return finalized; }
 };
 
 struct HashrateWindows {
@@ -477,28 +441,22 @@ public:
 
     [[nodiscard]] std::int64_t upsert_worker(const WorkerInsert &worker);
     [[nodiscard]] std::int64_t insert_connection(const ConnectionInsert &connection);
+    [[nodiscard]] std::int64_t upsert_worker_and_authenticate_connection(
+        std::int64_t connection_id, const WorkerInsert &worker,
+        std::string_view agent, std::int64_t authenticated_unix_us);
     void authenticate_connection(std::int64_t connection_id,
                                  std::int64_t worker_id,
                                  std::string_view agent,
                                  std::int64_t authenticated_unix_us);
+    [[nodiscard]] bool update_connection_last_sent_height(
+        std::int64_t connection_id, std::uint64_t height);
     [[nodiscard]] bool close_connection(std::int64_t connection_id,
                                         std::int64_t closed_unix_us,
                                         std::string_view reason);
-    [[nodiscard]] std::int64_t insert_public_template(const PublicTemplateInsert &value);
-    [[nodiscard]] std::int64_t insert_private_job(const PrivateJobInsert &job);
-    void mark_job_queued(std::int64_t job_id, std::int64_t queued_unix_us);
-    [[nodiscard]] JobRetirementResult retire_job(
-        std::int64_t job_id, std::int64_t retired_unix_us);
     [[nodiscard]] std::int64_t insert_share(const ShareInsert &share);
-
-    [[nodiscard]] DuplicateReservationResult reserve_duplicate(
-        const DuplicateKey &key, std::uint64_t height, std::int64_t first_share_id,
-        DuplicateRole role, std::int64_t reserved_unix_us,
-        std::int64_t generation_token);
-    [[nodiscard]] bool retire_duplicate(const DuplicateKey &key,
-                                        std::int64_t generation_token,
-                                        std::int64_t retired_unix_us);
-    [[nodiscard]] std::vector<ActiveDuplicate> load_active_duplicates() const;
+    [[nodiscard]] PersistedShareIdentity ensure_share_persisted(
+        std::int64_t share_id, std::string_view retention_reason);
+    void flush_accounting();
 
     [[nodiscard]] CandidateJournalResult journal_candidate(const CandidateJournal &candidate);
     [[nodiscard]] std::optional<CandidateJournalResult> find_candidate_by_key(
@@ -541,8 +499,8 @@ public:
                            const Hash32 &hash,
                            std::optional<bool> meets_share_target,
                            std::optional<bool> meets_network_target);
-    [[nodiscard]] bool finalize_share(std::int64_t share_id,
-                                      const ShareFinalization &finalization);
+    [[nodiscard]] ShareFinalizationResult finalize_share(
+        std::int64_t share_id, const ShareFinalization &finalization);
     void set_candidate_admission(std::int64_t share_id,
                                  std::string_view admission);
     [[nodiscard]] HashrateWindows hashrate(

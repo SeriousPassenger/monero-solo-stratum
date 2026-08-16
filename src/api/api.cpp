@@ -643,8 +643,6 @@ std::string_view api_collection_path(const ApiCollection resource) noexcept
     switch (resource) {
     case ApiCollection::connections: return "/v1/connections";
     case ApiCollection::workers: return "/v1/workers";
-    case ApiCollection::templates: return "/v1/templates";
-    case ApiCollection::jobs: return "/v1/jobs";
     case ApiCollection::shares: return "/v1/shares";
     case ApiCollection::top_shares: return "/v1/shares/top";
     case ApiCollection::recent_high_shares: return "/v1/shares/recent-high";
@@ -923,6 +921,10 @@ HttpResponse ApiService::persistence_response(
                        {"writer_queue_items", writer.queued_items},
                        {"writer_queue_bytes", writer.queued_bytes},
                        {"writer_priority_items", writer.priority_items},
+                       {"pending_accounting_items",
+                        writer.pending_accounting_items},
+                       {"pending_transient_shares",
+                        writer.pending_transient_shares},
                        {"last_commit_at", nullptr},
                        {"last_writer_error_at", nullptr},
                        {"last_writer_error_code", nullptr},
@@ -1076,8 +1078,9 @@ HttpResponse ApiService::handle_collection(
     };
     validate_bool("active");
     validate_bool("include_blobs");
-    for (const char *const name : {"worker_id", "template_id", "candidate_id",
-                                   "share_id", "round_id", "height"}) {
+    for (const char *const name : {"worker_id", "template_generation",
+                                   "candidate_id", "share_id", "round_id",
+                                   "height"}) {
         validate_decimal(name);
     }
     for (const char *const name : {"connection_id", "job_id"}) {
@@ -1207,6 +1210,7 @@ HttpResponse ApiService::handle_collection(
             {"round_id", round == filters.end() ? Json(nullptr) :
                                                   Json(round->second)},
             {"configured_limit", ranking_limit},
+            {"retained_only", true},
         };
     }
     else if (recent_high_shares) {
@@ -1214,6 +1218,7 @@ HttpResponse ApiService::handle_collection(
             {"kind", "recent_high_actual_difficulty"},
             {"min_actual_difficulty", filters.at("min_actual_difficulty")},
             {"configured_limit", ranking_limit},
+            {"retained_only", true},
         };
     }
     if (contains_oversize_blob(document)) {
@@ -1278,16 +1283,11 @@ HttpResponse ApiService::handle_authenticated(const HttpRequest &request,
         return singleton_response(ApiSingleton::current_round, now_unix_us);
     }
 
-    static const std::array<CollectionRoute, 12> collections = {{
+    static const std::array<CollectionRoute, 10> collections = {{
         {ApiCollection::connections, "/v1/connections", 1,
          {"active", "worker_id", "peer", "after_time", "before_time"}},
         {ApiCollection::workers, "/v1/workers", 2,
          {"active", "login", "rigid", "after_time", "before_time"}},
-        {ApiCollection::templates, "/v1/templates", 3,
-         {"height", "after_time", "before_time", "include_blobs"}},
-        {ApiCollection::jobs, "/v1/jobs", 4,
-         {"connection_id", "template_id", "height", "active", "after_time",
-          "before_time", "include_blobs"}},
         {ApiCollection::shares, "/v1/shares", 5,
          {"status", "connection_id", "worker_id", "job_id", "candidate_id",
           "height", "min_difficulty", "after_time", "before_time"}},
@@ -1306,8 +1306,9 @@ HttpResponse ApiService::handle_authenticated(const HttpRequest &request,
         {ApiCollection::bans, "/v1/bans", 9,
          {"active", "peer", "after_time", "before_time"}},
         {ApiCollection::events, "/v1/events", 10,
-         {"type", "connection_id", "worker_id", "template_id", "job_id",
-          "share_id", "candidate_id", "round_id", "after_time", "before_time"}},
+         {"type", "connection_id", "worker_id", "template_generation",
+          "job_id", "share_id", "candidate_id", "round_id", "after_time",
+          "before_time"}},
     }};
     for (const CollectionRoute &route : collections) {
         if (request.path == route.path) {
@@ -1702,9 +1703,9 @@ public:
             ReadStatement schema(database_,
                                  "SELECT value FROM schema_meta "
                                  "WHERE key='schema_version'");
-            if (!schema.row() || schema.text(0) != "2" || schema.row()) {
+            if (!schema.row() || schema.text(0) != "3" || schema.row()) {
                 throw DatabaseError(
-                    "read-only API database schema is not version 2");
+                    "read-only API database schema is not version 3");
             }
         }
         catch (...) {
@@ -1744,9 +1745,6 @@ private:
         const RowFormatter &formatter);
     [[nodiscard]] Json connection_resource(ReadStatement &statement);
     [[nodiscard]] Json worker_resource(ReadStatement &statement);
-    [[nodiscard]] Json template_resource(ReadStatement &statement,
-                                         bool include_blobs);
-    [[nodiscard]] Json job_resource(ReadStatement &statement, bool include_blobs);
     [[nodiscard]] Json share_resource(ReadStatement &statement);
     [[nodiscard]] Json hash_resource(ReadStatement &statement);
     [[nodiscard]] Json submission_resource(ReadStatement &statement);
@@ -1912,71 +1910,19 @@ Json SqliteApiReader::worker_resource(ReadStatement &row)
         {"active_connections", row.integer(5)},
         {"accepted_shares", std::to_string(row.integer(6))},
         {"rejected_shares", std::to_string(row.integer(7))},
+        {"share_counts_retained_only", true},
         {"hashrate", hashrate_resource("worker", row.integer(0))},
     };
-}
-
-Json SqliteApiReader::template_resource(ReadStatement &row,
-                                        const bool include_blobs)
-{
-    Json result{
-        {"id", std::to_string(row.integer(0))},
-        {"session_id", hex_encode(row.blob(1))},
-        {"generation", std::to_string(row.integer(2))},
-        {"height", row.integer(3)},
-        {"prev_hash", hex_encode(row.blob(4))},
-        {"seed_hash", hex_encode(row.blob(5))},
-        {"next_seed_hash", nullable_blob_hex(row, 6)},
-        {"difficulty", row.text(7)},
-        {"wide_difficulty_hex", nullable_text(row, 8)},
-        {"reserved_offset", row.integer(9)},
-        {"reserve_size", row.integer(10)},
-        {"fetched_at", format_rfc3339_utc_us(row.integer(11))},
-        {"fetch_reason", row.text(12)},
-    };
-    if (include_blobs) {
-        result["blocktemplate_blob"] = hex_encode(row.blob(13));
-        result["blockhashing_blob"] = hex_encode(row.blob(14));
-    }
-    return result;
-}
-
-Json SqliteApiReader::job_resource(ReadStatement &row, const bool include_blobs)
-{
-    Json result{
-        {"id", hex_encode(row.blob(1))},
-        {"connection_id", hex_encode(row.blob(2))},
-        {"template_id", std::to_string(row.integer(3))},
-        {"height", row.integer(4)},
-        {"seed_hash", hex_encode(row.blob(5))},
-        {"verifier_seed_id", nullable_text(row, 6)},
-        {"assigned_difficulty", row.text(7)},
-        {"target64_le", hex_encode(row.blob(8))},
-        {"network_difficulty", row.text(9)},
-        {"nonce_offset", row.integer(10)},
-        {"nonce_size", row.integer(11)},
-        {"reserved_offset", row.integer(12)},
-        {"reserved_size", row.integer(13)},
-        {"created_at", format_rfc3339_utc_us(row.integer(14))},
-        {"queued_at", nullable_timestamp(row, 15)},
-        {"expires_at", format_rfc3339_utc_us(row.integer(16))},
-        {"retired_at", nullable_timestamp(row, 17)},
-    };
-    if (include_blobs) {
-        result["private_entropy"] = hex_encode(row.blob(18));
-        result["private_block_blob"] = hex_encode(row.blob(19));
-        result["hashing_blob"] = hex_encode(row.blob(20));
-    }
-    return result;
 }
 
 Json SqliteApiReader::share_resource(ReadStatement &row)
 {
     return Json{
         {"id", std::to_string(row.integer(0))},
-        {"connection_id", hex_encode(row.blob(1))},
+        {"connection_id", nullable_blob_hex(row, 1)},
         {"worker_id", nullable_decimal(row, 2)},
         {"job_id", nullable_blob_hex(row, 3)},
+        {"template_generation", nullable_decimal(row, 35)},
         {"request_sequence", std::to_string(row.integer(4))},
         {"miner_request_id_type", nullable_text(row, 5)},
         {"miner_request_id", nullable_text(row, 6)},
@@ -1990,6 +1936,7 @@ Json SqliteApiReader::share_resource(ReadStatement &row)
         {"height_is_older", row.integer(14) != 0},
         {"claimed_candidate", row.integer(15) != 0},
         {"candidate_admission", row.text(16)},
+        {"retention_reason", nullable_text(row, 36)},
         {"status", row.text(17)},
         {"error_code", nullable_text(row, 18)},
         {"error_message", nullable_text(row, 19)},
@@ -2027,7 +1974,7 @@ Json SqliteApiReader::hash_resource(ReadStatement &row)
          row.is_null(4) ? Json(nullptr) : Json(row.integer(4) != 0)},
         {"received_at", format_rfc3339_utc_us(row.integer(5))},
         {"share_status", row.text(6)},
-        {"connection_id", hex_encode(row.blob(7))},
+        {"connection_id", nullable_blob_hex(row, 7)},
         {"worker_id", nullable_decimal(row, 8)},
         {"job_id", nullable_blob_hex(row, 9)},
         {"assigned_difficulty", nullable_text(row, 10)},
@@ -2044,8 +1991,10 @@ Json SqliteApiReader::submission_resource(ReadStatement &row)
     return Json{
         {"id", std::to_string(row.integer(0))},
         {"candidate_key", hex_encode(row.blob(1))},
-        {"first_share_id", std::to_string(row.integer(2))},
+        {"first_share_id", nullable_decimal(row, 2)},
         {"job_id", hex_encode(row.blob(3))},
+        {"template_generation", std::to_string(row.integer(22))},
+        {"round_id", std::to_string(row.integer(23))},
         {"connection_id", hex_encode(row.blob(4))},
         {"height", row.integer(5)},
         {"peer", peer_text(static_cast<int>(row.integer(6)), row.blob(7))},
@@ -2086,6 +2035,7 @@ Json SqliteApiReader::round_resource(ReadStatement &row)
         {"credited_difficulty", row.text(8)},
         {"estimated_hashes", row.text(8)},
         {"accepted_share_count", std::to_string(row.integer(9))},
+        {"max_share_height", row.integer(12)},
         {"effort_finalized_at", nullable_timestamp(row, 10)},
         {"effort", round_effort(row.integer(0), finalized,
                                 finalized_segment_count)},
@@ -2170,7 +2120,7 @@ Json SqliteApiReader::event_resource(ReadStatement &row)
         {"type", row.text(3)},
         {"connection_id", nullable_blob_hex(row, 4)},
         {"worker_id", nullable_decimal(row, 5)},
-        {"template_id", nullable_decimal(row, 6)},
+        {"template_generation", nullable_decimal(row, 6)},
         {"job_id", nullable_blob_hex(row, 7)},
         {"share_id", nullable_decimal(row, 8)},
         {"candidate_id", nullable_decimal(row, 9)},
@@ -2188,9 +2138,6 @@ ApiCollectionResult SqliteApiReader::collection(
         static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
         return {};
     }
-    const bool include_blobs =
-        request.filters.contains("include_blobs") &&
-        request.filters.at("include_blobs") == "true";
     std::vector<QueryBinding> bindings;
     std::string sql;
     const auto placeholder = [&]() {
@@ -2312,67 +2259,11 @@ ApiCollectionResult SqliteApiReader::collection(
             std::move(sql), std::move(bindings), request,
             [this](ReadStatement &row) { return worker_resource(row); });
     }
-    case ApiCollection::templates: {
-        sql =
-            "SELECT pt.id,ss.public_id,pt.generation,pt.height,pt.prev_hash,"
-            "pt.seed_hash,pt.next_seed_hash,pt.difficulty_dec,"
-            "pt.wide_difficulty_hex,pt.reserved_offset,pt.reserve_size,"
-            "pt.fetched_unix_us,pt.fetch_reason,pt.blocktemplate_blob,"
-            "pt.blockhashing_blob FROM public_templates pt JOIN server_sessions ss "
-            "ON ss.id=pt.session_id WHERE 1=1";
-        add_after_id("pt.id");
-        if (const auto height = request.filters.find("height");
-            height != request.filters.end()) {
-            add_integer("pt.height", std::stoll(height->second));
-        }
-        add_time("pt.fetched_unix_us", "after_time", true);
-        add_time("pt.fetched_unix_us", "before_time", false);
-        sql += " ORDER BY pt.id";
-        return run_collection(
-            std::move(sql), std::move(bindings), request,
-            [this, include_blobs](ReadStatement &row) {
-                return template_resource(row, include_blobs);
-            });
-    }
-    case ApiCollection::jobs: {
-        sql =
-            "SELECT pj.id,pj.public_job_id,c.public_id,pj.template_id,pj.height,"
-            "pj.seed_hash,pj.mspv_seed_id_dec,pj.assigned_difficulty_dec,"
-            "pj.target64_le,pj.network_difficulty_dec,pj.nonce_offset,pj.nonce_size,"
-            "pj.reserved_offset,pj.reserved_size,pj.created_unix_us,pj.queued_unix_us,"
-            "pj.expires_unix_us,pj.retired_unix_us,pj.entropy,pj.private_block_blob,"
-            "pj.hashing_blob FROM private_jobs pj JOIN connections c "
-            "ON c.id=pj.connection_id WHERE 1=1";
-        add_after_id("pj.id");
-        if (const auto connection = request.filters.find("connection_id");
-            connection != request.filters.end()) add_blob("c.public_id", connection->second);
-        if (const auto template_id = request.filters.find("template_id");
-            template_id != request.filters.end()) {
-            add_integer("pj.template_id", std::stoll(template_id->second));
-        }
-        if (const auto height = request.filters.find("height");
-            height != request.filters.end()) {
-            add_integer("pj.height", std::stoll(height->second));
-        }
-        if (const auto active = request.filters.find("active");
-            active != request.filters.end()) {
-            sql += active->second == "true" ? " AND pj.retired_unix_us IS NULL" :
-                                              " AND pj.retired_unix_us IS NOT NULL";
-        }
-        add_time("pj.created_unix_us", "after_time", true);
-        add_time("pj.created_unix_us", "before_time", false);
-        sql += " ORDER BY pj.id";
-        return run_collection(
-            std::move(sql), std::move(bindings), request,
-            [this, include_blobs](ReadStatement &row) {
-                return job_resource(row, include_blobs);
-            });
-    }
     case ApiCollection::shares: {
         sql =
-            "SELECT s.id,c.public_id,s.worker_id,pj.public_job_id,"
+            "SELECT s.id,c.public_id,s.worker_id,s.job_public_id,"
             "s.request_sequence,s.miner_request_id_type,s.miner_request_id_text,"
-            "s.received_unix_us,s.completed_unix_us,s.nonce,pj.height,"
+            "s.received_unix_us,s.completed_unix_us,s.nonce,s.height,"
             "s.assigned_difficulty_dec,s.actual_difficulty_dec,"
             "s.network_difficulty_dec,s.height_is_older,s.claimed_candidate,"
             "s.candidate_admission,s.status,s.error_code,s.error_message,"
@@ -2380,8 +2271,8 @@ ApiCollectionResult SqliteApiReader::collection(
             "s.verifier_seed_id_dec,s.verifier_queue_ns,s.verifier_hash_ns,"
             "s.verifier_total_ns,ch.hash,co.hash,ch.meets_share_target,"
             "co.meets_share_target,ch.meets_network_target,co.meets_network_target,"
-            "s.candidate_id,s.round_id FROM shares s JOIN connections c ON c.id=s.connection_id "
-            "LEFT JOIN private_jobs pj ON pj.id=s.job_id "
+            "s.candidate_id,s.round_id,s.template_generation,s.retention_reason "
+            "FROM shares s LEFT JOIN connections c ON c.id=s.connection_id "
             "LEFT JOIN share_hashes ch ON ch.share_id=s.id AND ch.role='claimed' "
             "LEFT JOIN share_hashes co ON co.share_id=s.id AND co.role='computed' "
             "WHERE 1=1";
@@ -2393,11 +2284,11 @@ ApiCollectionResult SqliteApiReader::collection(
         if (const auto worker = request.filters.find("worker_id");
             worker != request.filters.end()) add_integer("s.worker_id", std::stoll(worker->second));
         if (const auto job = request.filters.find("job_id");
-            job != request.filters.end()) add_blob("pj.public_job_id", job->second);
+            job != request.filters.end()) add_blob("s.job_public_id", job->second);
         if (const auto candidate = request.filters.find("candidate_id");
             candidate != request.filters.end()) add_integer("s.candidate_id", std::stoll(candidate->second));
         if (const auto height = request.filters.find("height");
-            height != request.filters.end()) add_integer("pj.height", std::stoll(height->second));
+            height != request.filters.end()) add_integer("s.height", std::stoll(height->second));
         if (const auto minimum = request.filters.find("min_difficulty");
             minimum != request.filters.end()) {
             const std::string greater_length = placeholder();
@@ -2427,9 +2318,9 @@ ApiCollectionResult SqliteApiReader::collection(
         bounded_request.limit = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(request.limit, configured_limit));
         sql =
-            "SELECT s.id,c.public_id,s.worker_id,pj.public_job_id,"
+            "SELECT s.id,c.public_id,s.worker_id,s.job_public_id,"
             "s.request_sequence,s.miner_request_id_type,s.miner_request_id_text,"
-            "s.received_unix_us,s.completed_unix_us,s.nonce,pj.height,"
+            "s.received_unix_us,s.completed_unix_us,s.nonce,s.height,"
             "s.assigned_difficulty_dec,s.actual_difficulty_dec,"
             "s.network_difficulty_dec,s.height_is_older,s.claimed_candidate,"
             "s.candidate_admission,s.status,s.error_code,s.error_message,"
@@ -2437,8 +2328,8 @@ ApiCollectionResult SqliteApiReader::collection(
             "s.verifier_seed_id_dec,s.verifier_queue_ns,s.verifier_hash_ns,"
             "s.verifier_total_ns,ch.hash,co.hash,ch.meets_share_target,"
             "co.meets_share_target,ch.meets_network_target,co.meets_network_target,"
-            "s.candidate_id,s.round_id FROM shares s JOIN connections c "
-            "ON c.id=s.connection_id LEFT JOIN private_jobs pj ON pj.id=s.job_id "
+            "s.candidate_id,s.round_id,s.template_generation,s.retention_reason "
+            "FROM shares s LEFT JOIN connections c ON c.id=s.connection_id "
             "LEFT JOIN share_hashes ch ON ch.share_id=s.id AND ch.role='claimed' "
             "LEFT JOIN share_hashes co ON co.share_id=s.id AND co.role='computed' "
             "WHERE s.status='accepted' AND s.actual_difficulty_dec IS NOT NULL";
@@ -2473,12 +2364,12 @@ ApiCollectionResult SqliteApiReader::collection(
         sql =
             "SELECT sh.share_id,sh.role,sh.hash,sh.meets_share_target,"
             "sh.meets_network_target,s.received_unix_us,s.status,c.public_id,"
-            "s.worker_id,pj.public_job_id,s.assigned_difficulty_dec,"
+            "s.worker_id,s.job_public_id,s.assigned_difficulty_dec,"
             "s.actual_difficulty_dec,s.network_difficulty_dec,"
             "s.credited_difficulty_dec,s.provenance,s.round_id "
             "FROM share_hashes sh JOIN shares s "
-            "ON s.id=sh.share_id JOIN connections c ON c.id=s.connection_id "
-            "LEFT JOIN private_jobs pj ON pj.id=s.job_id WHERE 1=1";
+            "ON s.id=sh.share_id LEFT JOIN connections c "
+            "ON c.id=s.connection_id WHERE 1=1";
         const std::uint64_t last_share = request.after_database_id / 2U;
         const std::uint64_t last_role = request.after_database_id % 2U;
         if (last_share > static_cast<std::uint64_t>(
@@ -2501,7 +2392,7 @@ ApiCollectionResult SqliteApiReader::collection(
         if (const auto worker = request.filters.find("worker_id");
             worker != request.filters.end()) add_integer("s.worker_id", std::stoll(worker->second));
         if (const auto job = request.filters.find("job_id");
-            job != request.filters.end()) add_blob("pj.public_job_id", job->second);
+            job != request.filters.end()) add_blob("s.job_public_id", job->second);
         add_time("s.received_unix_us", "after_time", true);
         add_time("s.received_unix_us", "before_time", false);
         sql += " ORDER BY sh.share_id,CASE sh.role WHEN 'claimed' THEN 0 ELSE 1 END";
@@ -2511,21 +2402,22 @@ ApiCollectionResult SqliteApiReader::collection(
     }
     case ApiCollection::submissions: {
         sql =
-            "SELECT ca.id,ca.candidate_key,ca.first_share_id,pj.public_job_id,"
+            "SELECT ca.id,ca.candidate_key,ca.first_share_id,ca.job_public_id,"
             "c.public_id,ca.height,ca.peer_family,ca.peer_address,ca.miner_tx_hash,"
             "ca.expected_block_id,ca.canonical_block_id,ca.state,ca.attempt_count,"
             "ca.max_attempts,ca.had_indeterminate,ca.reconciliation_cycle_count,"
             "ca.next_reconciliation_unix_us,ca.reconciliation_exhausted_unix_us,"
             "ca.created_unix_us,ca.updated_unix_us,ca.accepted_unix_us,"
-            "ca.terminal_reason FROM candidates ca JOIN private_jobs pj "
-            "ON pj.id=ca.job_id JOIN connections c ON c.id=ca.connection_id WHERE 1=1";
+            "ca.terminal_reason,ca.template_generation,ca.round_id "
+            "FROM candidates ca LEFT JOIN connections c "
+            "ON c.id=ca.connection_id WHERE 1=1";
         add_after_id("ca.id");
         if (const auto state = request.filters.find("state");
             state != request.filters.end()) add_list("ca.state", state->second);
         if (const auto connection = request.filters.find("connection_id");
             connection != request.filters.end()) add_blob("c.public_id", connection->second);
         if (const auto job = request.filters.find("job_id");
-            job != request.filters.end()) add_blob("pj.public_job_id", job->second);
+            job != request.filters.end()) add_blob("ca.job_public_id", job->second);
         if (const auto height = request.filters.find("height");
             height != request.filters.end()) add_integer("ca.height", std::stoll(height->second));
         add_peer("ca.peer_family", "ca.peer_address");
@@ -2541,7 +2433,8 @@ ApiCollectionResult SqliteApiReader::collection(
             "SELECT r.id,r.opened_unix_us,r.closed_unix_us,r.state,"
             "r.accepted_candidate_id,r.accepted_height,r.miner_tx_hash,r.block_id,"
             "r.credited_difficulty_dec,r.accepted_share_count,"
-            "r.effort_finalized_unix_us,r.finalized_effort_segment_count "
+            "r.effort_finalized_unix_us,r.finalized_effort_segment_count,"
+            "r.max_share_height "
             "FROM rounds r WHERE 1=1";
         add_after_id("r.id");
         if (const auto state = request.filters.find("state");
@@ -2572,10 +2465,10 @@ ApiCollectionResult SqliteApiReader::collection(
     case ApiCollection::events: {
         sql =
             "SELECT e.id,ss.public_id,e.created_unix_us,e.type,c.public_id,"
-            "e.worker_id,e.template_id,pj.public_job_id,e.share_id,e.candidate_id,"
+            "e.worker_id,e.template_generation,e.job_public_id,e.share_id,e.candidate_id,"
             "e.round_id,e.payload_json FROM events e JOIN server_sessions ss "
             "ON ss.id=e.session_id LEFT JOIN connections c ON c.id=e.connection_id "
-            "LEFT JOIN private_jobs pj ON pj.id=e.job_id WHERE 1=1";
+            "WHERE 1=1";
         add_after_id("e.id");
         if (const auto types = request.filters.find("type");
             types != request.filters.end()) add_list("e.type", types->second);
@@ -2583,10 +2476,12 @@ ApiCollectionResult SqliteApiReader::collection(
             connection != request.filters.end()) add_blob("c.public_id", connection->second);
         if (const auto worker = request.filters.find("worker_id");
             worker != request.filters.end()) add_integer("e.worker_id", std::stoll(worker->second));
-        if (const auto template_id = request.filters.find("template_id");
-            template_id != request.filters.end()) add_integer("e.template_id", std::stoll(template_id->second));
+        if (const auto generation = request.filters.find("template_generation");
+            generation != request.filters.end()) {
+            add_integer("e.template_generation", std::stoll(generation->second));
+        }
         if (const auto job = request.filters.find("job_id");
-            job != request.filters.end()) add_blob("pj.public_job_id", job->second);
+            job != request.filters.end()) add_blob("e.job_public_id", job->second);
         if (const auto share = request.filters.find("share_id");
             share != request.filters.end()) add_integer("e.share_id", std::stoll(share->second));
         if (const auto candidate = request.filters.find("candidate_id");
@@ -2648,18 +2543,9 @@ std::optional<Json> SqliteApiReader::connection_detail(const std::string_view id
     counters["pending"] = std::to_string(pending);
     counters["infrastructure_failed"] = std::to_string(infrastructure);
     counters["total"] = std::to_string(total);
+    counters["retained_only"] = true;
 
     Json jobs = Json::array();
-    ReadStatement recent_jobs(
-        database_,
-        "SELECT public_job_id FROM private_jobs WHERE connection_id=?1 "
-        "ORDER BY id DESC LIMIT 20");
-    recent_jobs.bind(1, connection_id);
-    while (recent_jobs.row()) {
-        const std::string public_id = hex_encode(recent_jobs.blob(0));
-        jobs.push_back({{"id", public_id},
-                        {"url", "/v1/jobs?connection_id=" + std::string(id)}});
-    }
     Json shares = Json::array();
     ReadStatement recent_shares(
         database_,
@@ -2679,17 +2565,18 @@ std::optional<Json> SqliteApiReader::share_detail(const std::string_view id)
 {
     ReadStatement row(
         database_,
-        "SELECT s.id,c.public_id,s.worker_id,pj.public_job_id,s.request_sequence,"
+        "SELECT s.id,c.public_id,s.worker_id,s.job_public_id,s.request_sequence,"
         "s.miner_request_id_type,s.miner_request_id_text,s.received_unix_us,"
-        "s.completed_unix_us,s.nonce,pj.height,s.assigned_difficulty_dec,"
+        "s.completed_unix_us,s.nonce,s.height,s.assigned_difficulty_dec,"
         "s.actual_difficulty_dec,s.network_difficulty_dec,s.height_is_older,"
         "s.claimed_candidate,s.candidate_admission,s.status,s.error_code,"
         "s.error_message,s.provenance,s.credited_difficulty_dec,"
         "s.verifier_ticket_dec,s.verifier_seed_id_dec,s.verifier_queue_ns,"
         "s.verifier_hash_ns,s.verifier_total_ns,ch.hash,co.hash,"
         "ch.meets_share_target,co.meets_share_target,ch.meets_network_target,"
-        "co.meets_network_target,s.candidate_id,s.round_id FROM shares s JOIN connections c "
-        "ON c.id=s.connection_id LEFT JOIN private_jobs pj ON pj.id=s.job_id "
+        "co.meets_network_target,s.candidate_id,s.round_id,s.template_generation,"
+        "s.retention_reason FROM shares s LEFT JOIN connections c "
+        "ON c.id=s.connection_id "
         "LEFT JOIN share_hashes ch ON ch.share_id=s.id AND ch.role='claimed' "
         "LEFT JOIN share_hashes co ON co.share_id=s.id AND co.role='computed' "
         "WHERE s.id=?1");
@@ -2710,19 +2597,19 @@ std::optional<Json> SqliteApiReader::submission_detail(
     const std::int64_t candidate_id = std::stoll(std::string(id));
     ReadStatement row(
         database_,
-        "SELECT ca.id,ca.candidate_key,ca.first_share_id,pj.public_job_id,"
+        "SELECT ca.id,ca.candidate_key,ca.first_share_id,ca.job_public_id,"
         "c.public_id,ca.height,ca.peer_family,ca.peer_address,ca.miner_tx_hash,"
         "ca.expected_block_id,ca.canonical_block_id,ca.state,ca.attempt_count,"
         "ca.max_attempts,ca.had_indeterminate,ca.reconciliation_cycle_count,"
         "ca.next_reconciliation_unix_us,ca.reconciliation_exhausted_unix_us,"
         "ca.created_unix_us,ca.updated_unix_us,ca.accepted_unix_us,"
-        "ca.terminal_reason,ca.frozen_block_blob FROM candidates ca "
-        "JOIN private_jobs pj ON pj.id=ca.job_id JOIN connections c "
+        "ca.terminal_reason,ca.template_generation,ca.round_id,"
+        "ca.frozen_block_blob FROM candidates ca LEFT JOIN connections c "
         "ON c.id=ca.connection_id WHERE ca.id=?1");
     row.bind(1, candidate_id);
     if (!row.row()) return std::nullopt;
     Json submission = submission_resource(row);
-    if (include_blobs) submission["frozen_block_blob"] = hex_encode(row.blob(22));
+    if (include_blobs) submission["frozen_block_blob"] = hex_encode(row.blob(24));
     if (row.row()) throw DatabaseError("duplicate candidate database ID");
 
     Json attempts = Json::array();
@@ -2811,7 +2698,8 @@ std::optional<Json> SqliteApiReader::current_round()
         "SELECT id,opened_unix_us,closed_unix_us,state,accepted_candidate_id,"
         "accepted_height,miner_tx_hash,block_id,credited_difficulty_dec,"
         "accepted_share_count,effort_finalized_unix_us,"
-        "finalized_effort_segment_count FROM rounds WHERE state='open'");
+        "finalized_effort_segment_count,max_share_height "
+        "FROM rounds WHERE state='open'");
     if (!row.row()) return std::nullopt;
     Json result = round_resource(row);
     if (row.row()) throw DatabaseError("database contains multiple open rounds");
@@ -2904,34 +2792,75 @@ Json SqliteApiReader::summary(Json live_summary,
         throw DatabaseError("worker summary returned multiple rows");
     }
 
+    std::uint64_t accepted_shares = 0;
+    std::uint64_t stale_shares = 0;
+    std::uint64_t duplicate_shares = 0;
+    std::uint64_t low_difficulty_shares = 0;
+    std::uint64_t invalid_result_shares = 0;
+    std::uint64_t infrastructure_failed_shares = 0;
+    std::uint64_t terminal_shares = 0;
     ReadStatement share_counts(
         database_,
-        "SELECT count(*),"
-        "count(CASE WHEN status IN ('received','verifying') THEN 1 END),"
-        "count(CASE WHEN status='accepted' THEN 1 END),"
-        "count(CASE WHEN status='stale' THEN 1 END),"
-        "count(CASE WHEN status='duplicate' THEN 1 END),"
-        "count(CASE WHEN status='low_difficulty' THEN 1 END),"
-        "count(CASE WHEN status='invalid_result' THEN 1 END),"
-        "count(CASE WHEN status IN "
-        "('server_busy','verifier_failed','cancelled') THEN 1 END) "
-        "FROM shares");
-    if (!share_counts.row()) {
-        throw DatabaseError("could not aggregate API share summary");
+        "SELECT status,sum(share_count) FROM share_totals GROUP BY status");
+    while (share_counts.row()) {
+        const std::string status = share_counts.text(0);
+        const std::int64_t signed_count = share_counts.integer(1);
+        if (signed_count < 0) {
+            throw DatabaseError("negative API aggregate share count");
+        }
+        const auto count = static_cast<std::uint64_t>(signed_count);
+        if (terminal_shares > std::numeric_limits<std::uint64_t>::max() - count) {
+            throw DatabaseError("API aggregate share count overflow");
+        }
+        terminal_shares += count;
+        if (status == "accepted") accepted_shares = count;
+        else if (status == "stale") stale_shares = count;
+        else if (status == "duplicate") duplicate_shares = count;
+        else if (status == "low_difficulty") low_difficulty_shares = count;
+        else if (status == "invalid_result") invalid_result_shares = count;
+        else if (status == "server_busy" || status == "verifier_failed" ||
+                 status == "cancelled") {
+            if (infrastructure_failed_shares >
+                std::numeric_limits<std::uint64_t>::max() - count) {
+                throw DatabaseError(
+                    "API infrastructure share count overflow");
+            }
+            infrastructure_failed_shares += count;
+        }
     }
+    ReadStatement pending_share_counts(
+        database_,
+        "SELECT count(*) FROM shares WHERE status IN ('received','verifying')");
+    if (!pending_share_counts.row() || pending_share_counts.integer(0) < 0) {
+        throw DatabaseError("could not aggregate pending API shares");
+    }
+    const auto retained_pending_shares = static_cast<std::uint64_t>(
+        pending_share_counts.integer(0));
+    const DatabaseWriterStats writer = writer_stats_
+                                           ? writer_stats_()
+                                           : DatabaseWriterStats{};
+    if (pending_share_counts.row() ||
+        retained_pending_shares >
+            std::numeric_limits<std::uint64_t>::max() -
+                writer.pending_transient_shares ||
+        terminal_shares >
+            std::numeric_limits<std::uint64_t>::max() -
+                (retained_pending_shares + writer.pending_transient_shares)) {
+        throw DatabaseError("API total share count overflow");
+    }
+    const std::uint64_t pending_shares = retained_pending_shares +
+                                         writer.pending_transient_shares;
     Json shares{
-        {"pending", std::to_string(share_counts.integer(1))},
-        {"accepted", std::to_string(share_counts.integer(2))},
-        {"stale", std::to_string(share_counts.integer(3))},
-        {"duplicate", std::to_string(share_counts.integer(4))},
-        {"low_difficulty", std::to_string(share_counts.integer(5))},
-        {"invalid_result", std::to_string(share_counts.integer(6))},
-        {"infrastructure_failed", std::to_string(share_counts.integer(7))},
-        {"total", std::to_string(share_counts.integer(0))},
+        {"pending", std::to_string(pending_shares)},
+        {"accepted", std::to_string(accepted_shares)},
+        {"stale", std::to_string(stale_shares)},
+        {"duplicate", std::to_string(duplicate_shares)},
+        {"low_difficulty", std::to_string(low_difficulty_shares)},
+        {"invalid_result", std::to_string(invalid_result_shares)},
+        {"infrastructure_failed",
+         std::to_string(infrastructure_failed_shares)},
+        {"total", std::to_string(terminal_shares + pending_shares)},
     };
-    if (share_counts.row()) {
-        throw DatabaseError("share summary returned multiple rows");
-    }
 
     ReadStatement candidate_counts(
         database_,
@@ -2966,6 +2895,7 @@ Json SqliteApiReader::summary(Json live_summary,
         {"opened_at", open_round->at("opened_at")},
         {"estimated_hashes", open_round->at("estimated_hashes")},
         {"accepted_share_count", open_round->at("accepted_share_count")},
+        {"max_share_height", open_round->at("max_share_height")},
         {"effort", open_round->at("effort")},
     };
 
@@ -3047,7 +2977,7 @@ Json SqliteApiReader::persistence()
     }
 
     return Json{
-        {"schema_version", 2},
+        {"schema_version", 3},
         {"journal_mode", journal},
         {"synchronous", synchronous},
         {"foreign_keys", foreign_keys_enabled},
@@ -3056,6 +2986,8 @@ Json SqliteApiReader::persistence()
         {"writer_queue_items", writer.queued_items},
         {"writer_queue_bytes", writer.queued_bytes},
         {"writer_priority_items", writer.priority_items},
+        {"pending_accounting_items", writer.pending_accounting_items},
+        {"pending_transient_shares", writer.pending_transient_shares},
         {"last_commit_at", std::move(last_commit_at)},
         {"last_writer_error_at", nullptr},
         {"last_writer_error_code", nullptr},

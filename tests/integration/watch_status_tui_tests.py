@@ -155,6 +155,20 @@ class PruneAndExportTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
             self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
 
+    def test_template_formatter_accepts_generation_name(self) -> None:
+        rendered = tui.format_event(entry(
+            8, event(8, "template.refreshed", template_generation=42,
+                     height=100, fetch_reason="poll")))
+        self.assertIn("template#42", rendered)
+
+    def test_share_formatter_uses_stable_submission_without_durable_share(self) -> None:
+        rendered = tui.format_event(entry(
+            9, event(9, "share.completed", status="accepted",
+                     difficulty=4_194_304,
+                     submission_id="0123456789abcdef0123456789abcdef:7")))
+        self.assertIn("submit#0123456789abcdef0123456789abcdef:7", rendered)
+        self.assertNotIn("share#", rendered)
+
     def test_failed_export_does_not_damage_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "existing.json"

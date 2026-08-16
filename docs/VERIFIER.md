@@ -255,8 +255,9 @@ retains an old seed while any live job or accepted verification references it.
 releasing live work.
 
 The adapter keeps seed key storage while preparation is unresolved, tracks
-every submission by durable numeric `user_tag` (the share row ID), retains the
-seed per accepted native job, verifies completion ticket/seed correlation,
+every submission by a process-unique numeric `user_tag` (the server-assigned
+submission/share ID, which need not become a durable row), retains the seed per
+accepted native job, verifies completion ticket/seed correlation,
 and starts a requested native release only when the seed is noncurrent and all
 job/submission references are gone.
 
@@ -275,16 +276,17 @@ if (verifier.activate_seed(prepared.seed.seed_id) != MSPV_OK) {
 auto submitted = verifier.submit_verify(prepared.seed.seed_id,
                                         exact_nonce_mutated_hashing_blob,
                                         claimed_hash,
-                                        durable_share_id);
+                                        submission_user_tag);
 if (submitted.status == MSPV_QUEUE_FULL) {
     /* release only provisional claimed duplicate; return infrastructure busy */
 }
 ```
 
 A dedicated loop clears/consumes the wake hint, calls the adapter's zero-timeout
-drain, looks up `user_tag`, validates correlation, persists the computed hash
-and timing, applies duplicate/target/stale precedence, and then sends exactly
-one share response if the connection/request route still exists.
+drain, looks up `user_tag`, validates correlation, applies
+duplicate/target/stale precedence and selective persistence/accounting, and
+then sends exactly one share response if the connection/request route still
+exists. Computed hash/timing detail becomes durable only for a retained share.
 
 Graceful shutdown uses DRAIN; forced shutdown may cancel pending work. After a
 successful shutdown, all remaining completions are polled/persisted until the

@@ -16,7 +16,7 @@ void require(bool condition, const char *message)
 std::string valid_config()
 {
     return R"json({
-      "schema_version":1,
+      "schema_version":2,
       "network":"mainnet",
       "wallet_address":"44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A",
       "blocknotify":null,
@@ -61,7 +61,7 @@ void test_defaults_and_required_fields()
     const auto config = monero_solo::parse_config_json(
         valid_config(), {.validate_paths = false,
                          .validate_blocknotify_executable = false});
-    require(config.schema_version == 1, "schema version lost");
+    require(config.schema_version == 2, "schema version lost");
     require(config.stratum.max_connections == 2048 &&
                 config.stratum.max_connections_per_ip == 128,
             "stratum connection defaults differ");
@@ -77,10 +77,13 @@ void test_defaults_and_required_fields()
                 config.entropy.max_reseed_age_seconds == 1260 &&
                 config.entropy.max_generate_calls == 1048576,
             "entropy defaults differ");
-    require(config.database.retention_days == 0, "retention default differs");
+    require(config.database.min_persisted_share_difficulty ==
+                80'000'000'000ULL &&
+                config.database.accounting_flush_interval_ms == 1000,
+            "database persistence defaults differ");
     require(config.api.top_shares_limit == 100 &&
                 config.api.recent_high_shares_limit == 100 &&
-                config.api.recent_high_share_min_difficulty == 20'000'000'000ULL,
+                config.api.recent_high_share_min_difficulty == 80'000'000'000ULL,
             "share analytics defaults differ");
     require(!config.stratum.access_password, "null password must stay disabled");
     require(!config.logging.include_private_job_entropy,
@@ -178,6 +181,8 @@ void test_private_job_entropy_logging_gate()
 void test_api_share_analytics_bounds()
 {
     std::string configured = valid_config();
+    configured.replace(configured.find("\"database\":{") + 12, 0,
+                       "\"min_persisted_share_difficulty\":100,");
     configured.replace(configured.find("\"api\":{\"enabled\":false}"), 23,
         "\"api\":{\"enabled\":false,\"top_shares_limit\":7,"
         "\"recent_high_shares_limit\":9,"
@@ -218,13 +223,100 @@ void test_api_share_analytics_bounds()
             zero_threshold, {.validate_paths = false,
                              .validate_blocknotify_executable = false});
     }, "zero recent-high share threshold accepted");
+
+    std::string below_persistence = valid_config();
+    below_persistence.replace(
+        below_persistence.find("\"api\":{\"enabled\":false}"), 23,
+        "\"api\":{\"enabled\":false,"
+        "\"recent_high_share_min_difficulty\":79999999999}");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            below_persistence, {.validate_paths = false,
+                                .validate_blocknotify_executable = false});
+    }, "API recent-high threshold below persistence floor accepted");
+}
+
+void test_database_persistence_bounds()
+{
+    std::string minimum = valid_config();
+    minimum.replace(minimum.find("\"database\":{"), 12,
+                    "\"database\":{"
+                    "\"min_persisted_share_difficulty\":1,"
+                    "\"accounting_flush_interval_ms\":10,");
+    const auto parsed = monero_solo::parse_config_json(
+        minimum, {.validate_paths = false,
+                  .validate_blocknotify_executable = false});
+    require(parsed.database.min_persisted_share_difficulty == 1 &&
+                parsed.database.accounting_flush_interval_ms == 10,
+            "minimum database persistence settings did not parse");
+
+    std::string zero_difficulty = valid_config();
+    zero_difficulty.replace(zero_difficulty.find("\"database\":{"), 12,
+        "\"database\":{\"min_persisted_share_difficulty\":0,");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            zero_difficulty, {.validate_paths = false,
+                              .validate_blocknotify_executable = false});
+    }, "zero persisted-share difficulty accepted");
+
+    std::string short_flush = valid_config();
+    short_flush.replace(short_flush.find("\"database\":{"), 12,
+        "\"database\":{\"accounting_flush_interval_ms\":9,");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            short_flush, {.validate_paths = false,
+                          .validate_blocknotify_executable = false});
+    }, "too-short accounting flush interval accepted");
+
+    std::string long_flush = valid_config();
+    long_flush.replace(long_flush.find("\"database\":{"), 12,
+        "\"database\":{\"accounting_flush_interval_ms\":60001,");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            long_flush, {.validate_paths = false,
+                         .validate_blocknotify_executable = false});
+    }, "too-long accounting flush interval accepted");
+
+    for (const std::string_view removed_key :
+         {std::string_view("\"retention_days\":0,"),
+          std::string_view("\"store_rejected_shares\":false,")}) {
+        std::string legacy = valid_config();
+        legacy.replace(legacy.find("\"database\":{"), 12,
+                       "\"database\":{" + std::string(removed_key));
+        rejects([&] {
+            (void)monero_solo::parse_config_json(
+                legacy, {.validate_paths = false,
+                         .validate_blocknotify_executable = false});
+        }, "removed database persistence key accepted");
+    }
+}
+
+void test_removed_job_history()
+{
+    std::string legacy = valid_config();
+    legacy.replace(legacy.find("\"access_password\":null"), 22,
+                   "\"access_password\":null,\"job_history\":6");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            legacy, {.validate_paths = false,
+                     .validate_blocknotify_executable = false});
+    }, "removed stratum.job_history key accepted");
 }
 
 void test_strict_json_and_unknown_keys()
 {
+    std::string old_schema = valid_config();
+    old_schema.replace(old_schema.find("\"schema_version\":2"), 18,
+                       "\"schema_version\":1");
+    rejects([&] {
+        (void)monero_solo::parse_config_json(
+            old_schema, {.validate_paths = false,
+                         .validate_blocknotify_executable = false});
+    }, "configuration schema version 1 accepted");
+
     std::string duplicate = valid_config();
-    duplicate.replace(duplicate.find("\"schema_version\":1"), 18,
-                      "\"schema_version\":1,\"schema_version\":1");
+    duplicate.replace(duplicate.find("\"schema_version\":2"), 18,
+                      "\"schema_version\":2,\"schema_version\":2");
     rejects([&] {
         (void)monero_solo::parse_config_json(
             duplicate, {.validate_paths = false,
@@ -322,7 +414,7 @@ void test_complete_example_config()
     const auto config = monero_solo::load_config_file(
         (project_root / "config.example.json").string(),
         {.validate_paths = false, .validate_blocknotify_executable = false});
-    require(config.schema_version == 1, "example schema version differs");
+    require(config.schema_version == 2, "example schema version differs");
     require(config.wallet_address ==
                 "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A",
             "example payout address differs");
@@ -330,7 +422,10 @@ void test_complete_example_config()
             "example listener count differs");
     require(config.api.top_shares_limit == 100 &&
                 config.api.recent_high_shares_limit == 100 &&
-                config.api.recent_high_share_min_difficulty == 20'000'000'000ULL,
+                config.api.recent_high_share_min_difficulty == 80'000'000'000ULL &&
+                config.database.min_persisted_share_difficulty ==
+                    80'000'000'000ULL &&
+                config.database.accounting_flush_interval_ms == 1000,
             "example share analytics defaults differ");
     require(config.verifier.enabled, "example must default to verified mode");
     require(config.events.enabled && config.api.enabled && !config.defense.enabled,
@@ -346,6 +441,8 @@ int main(int argc, char **argv)
                 "test executable path is unavailable");
         test_defaults_and_required_fields();
         test_api_share_analytics_bounds();
+        test_database_persistence_bounds();
+        test_removed_job_history();
         test_private_job_entropy_logging_gate();
         test_strict_json_and_unknown_keys();
         test_cross_capacity_and_security_rules();

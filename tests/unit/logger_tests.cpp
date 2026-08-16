@@ -197,6 +197,8 @@ void test_severity_and_json_file()
         logger.log(Severity::info, "runtime.start",
                    {{PublicStringKey::component, "runtime"},
                     {PublicStringKey::network, "mainnet"},
+                    {PublicStringKey::submission_id,
+                     "0123456789abcdef0123456789abcdef:7"},
                     {PublicStringKey::state, "ready\\\"now"}},
                    {{IntegerKey::height, 123},
                     {IntegerKey::difficulty,
@@ -215,6 +217,8 @@ void test_severity_and_json_file()
                 "structured logger envelope is wrong");
         require_timestamp(first["time"].get<std::string>());
         require(first["fields"]["state"] == "ready\\\"now" &&
+                    first["fields"]["submission_id"] ==
+                        "0123456789abcdef0123456789abcdef:7" &&
                     first["fields"]["height"] == 123 &&
                     first["fields"]["difficulty"] ==
                         std::numeric_limits<std::uint64_t>::max(),

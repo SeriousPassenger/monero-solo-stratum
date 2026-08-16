@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <cctype>
 #include <climits>
@@ -16,11 +17,13 @@
 #include <fcntl.h>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -172,6 +175,8 @@ public:
             .queued_items = queued_items_,
             .queued_bytes = queued_bytes_,
             .priority_items = static_cast<std::uint64_t>(priority_.size()),
+            .pending_accounting_items = 0,
+            .pending_transient_shares = 0,
         };
     }
 
@@ -549,36 +554,56 @@ private:
     bool committed_{};
 };
 
+void validate_worker(const WorkerInsert &worker)
+{
+    require(!worker.login.empty(), "worker login is empty");
+    require_no_nul(worker.login, "worker login");
+    require_no_nul(worker.rigid, "worker rigid");
+}
+
+std::int64_t upsert_worker_unlocked(sqlite3 *db, const WorkerInsert &worker)
+{
+    Statement insert(
+        db,
+        "INSERT INTO workers(login,rigid,first_seen_unix_us,last_seen_unix_us) "
+        "VALUES(?1,?2,?3,?3) "
+        "ON CONFLICT(login,rigid) DO UPDATE SET "
+        "last_seen_unix_us=max(last_seen_unix_us,excluded.last_seen_unix_us)");
+    insert.bind(worker.login, 1);
+    insert.bind(worker.rigid, 2);
+    insert.bind(worker.seen_unix_us, 3);
+    insert.done();
+
+    Statement select(
+        db, "SELECT id FROM workers WHERE login=?1 AND rigid=?2");
+    select.bind(worker.login, 1);
+    select.bind(worker.rigid, 2);
+    require(select.row(), "worker upsert did not produce a row");
+    return select.integer(0);
+}
+
+void authenticate_connection_unlocked(sqlite3 *db,
+                                      std::int64_t connection_id,
+                                      std::int64_t worker_id,
+                                      std::string_view agent,
+                                      std::int64_t authenticated_unix_us)
+{
+    Statement statement(
+        db,
+        "UPDATE connections SET worker_id=?1,agent=?2,authenticated_unix_us=?3 "
+        "WHERE id=?4 AND closed_unix_us IS NULL AND authenticated_unix_us IS NULL");
+    statement.bind(worker_id, 1);
+    statement.bind(agent, 2);
+    statement.bind(authenticated_unix_us, 3);
+    statement.bind(connection_id, 4);
+    statement.done();
+    require(sqlite3_changes(db) == 1,
+            "connection is absent, closed, or already authenticated");
+}
+
 std::int64_t last_insert_id(sqlite3 *db)
 {
     return sqlite3_last_insert_rowid(db);
-}
-
-std::string duplicate_role_text(DuplicateRole role)
-{
-    switch (role) {
-    case DuplicateRole::claimed:
-        return "claimed";
-    case DuplicateRole::computed:
-        return "computed";
-    case DuplicateRole::both:
-        return "both";
-    }
-    throw DatabaseError("unknown duplicate role");
-}
-
-DuplicateRole parse_duplicate_role(std::string_view value)
-{
-    if (value == "claimed") {
-        return DuplicateRole::claimed;
-    }
-    if (value == "computed") {
-        return DuplicateRole::computed;
-    }
-    if (value == "both") {
-        return DuplicateRole::both;
-    }
-    throw DatabaseError("database contains an invalid duplicate role");
 }
 
 CandidateState parse_candidate_state(std::string_view value)
@@ -668,6 +693,74 @@ std::string_view to_string(HashrateSource value) noexcept
     return value == HashrateSource::verified ? "verified" : "claimed";
 }
 
+struct StagedShareHash {
+    Hash32 hash{};
+    std::optional<bool> meets_share_target;
+    std::optional<bool> meets_network_target;
+};
+
+struct StagedShare {
+    ShareInsert value;
+    std::int64_t round_id{};
+    std::optional<std::string> verifier_ticket_dec;
+    std::optional<std::string> verifier_seed_id_dec;
+    std::map<std::string, StagedShareHash> hashes;
+};
+
+struct ShareTotalKey {
+    std::string status;
+    std::string provenance;
+
+    [[nodiscard]] bool operator<(const ShareTotalKey &other) const noexcept
+    {
+        return std::tie(status, provenance) <
+               std::tie(other.status, other.provenance);
+    }
+};
+
+struct ShareTotalDelta {
+    std::uint64_t count{};
+    std::int64_t first_unix_us{};
+    std::int64_t last_unix_us{};
+};
+
+struct HashrateKey {
+    std::string scope_type;
+    std::int64_t scope_id{};
+    std::int64_t second_utc{};
+    HashrateSource source{HashrateSource::verified};
+
+    [[nodiscard]] bool operator<(const HashrateKey &other) const noexcept
+    {
+        return std::tie(scope_type, scope_id, second_utc, source) <
+               std::tie(other.scope_type, other.scope_id, other.second_utc,
+                        other.source);
+    }
+};
+
+struct WorkDelta {
+    std::string credited_difficulty_dec{"0"};
+    std::uint64_t accepted_shares{};
+};
+
+struct AccountingApplyResult {
+    std::set<std::int64_t> affected_rounds;
+    std::optional<std::int64_t> hashrate_pruned_through;
+};
+
+struct RoundWorkKey {
+    std::int64_t round_id{};
+    HashrateSource source{HashrateSource::verified};
+    std::string network_difficulty_dec;
+
+    [[nodiscard]] bool operator<(const RoundWorkKey &other) const noexcept
+    {
+        return std::tie(round_id, source, network_difficulty_dec) <
+               std::tie(other.round_id, other.source,
+                        other.network_difficulty_dec);
+    }
+};
+
 struct Database::Impl {
     explicit Impl(DatabaseOptions value)
         : options(std::move(value)), mutex(options)
@@ -675,6 +768,11 @@ struct Database::Impl {
         require(!options.path.empty(), "database path is empty");
         require(options.busy_timeout_ms >= 1 && options.busy_timeout_ms <= 60000,
                 "database busy timeout is outside 1..60000 ms");
+        require(options.min_persisted_share_difficulty >= 1,
+                "minimum persisted share difficulty must be positive");
+        require(options.accounting_flush_interval_ms >= 10 &&
+                    options.accounting_flush_interval_ms <= 60000,
+                "accounting flush interval is outside 10..60000 ms");
 
         // Lock the database inode itself, not a pathname-derived sidecar. A
         // hard-link alias therefore resolves to the same advisory lock and
@@ -840,7 +938,7 @@ struct Database::Impl {
 
             Transaction transaction(db);
             execute(db, kSchemaSql);
-            execute(db, "PRAGMA user_version = 2");
+            execute(db, "PRAGMA user_version = 3");
             transaction.commit();
             return;
         }
@@ -848,8 +946,15 @@ struct Database::Impl {
         Statement statement(
             db, "SELECT value FROM schema_meta WHERE key='schema_version'");
         require(statement.row(), "database schema_version is missing");
-        require(statement.text(0) == "2",
-                "unsupported database schema version (expected clean schema v2)");
+        const std::string version = statement.text(0);
+        if (version == "1" || version == "2") {
+            throw DatabaseError(
+                "database schema version " + version +
+                " requires a clean reset; stop the service and remove the "
+                "SQLite database, WAL, and SHM files");
+        }
+        require(version == "3",
+                "unsupported database schema version (expected clean schema v3)");
         require(!statement.row(), "database has duplicate schema_version metadata");
     }
 
@@ -879,15 +984,15 @@ struct Database::Impl {
         Statement statement(
             db,
             "INSERT INTO events(session_id,created_unix_us,type,connection_id,"
-            "worker_id,template_id,job_id,share_id,candidate_id,round_id,payload_json) "
+            "worker_id,template_generation,job_public_id,share_id,candidate_id,round_id,payload_json) "
             "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)");
         statement.bind(event.session_id, 1);
         statement.bind(event.created_unix_us, 2);
         statement.bind(event.type, 3);
         statement.bind_optional(event.connection_id, 4);
         statement.bind_optional(event.worker_id, 5);
-        statement.bind_optional(event.template_id, 6);
-        statement.bind_optional(event.job_id, 7);
+        statement.bind_optional(event.template_generation, 6);
+        statement.bind_optional(event.job_public_id, 7);
         statement.bind_optional(event.share_id, 8);
         statement.bind_optional(event.candidate_id, 9);
         statement.bind_optional(event.round_id, 10);
@@ -927,11 +1032,11 @@ struct Database::Impl {
 
     struct CandidateContext {
         std::int64_t session_id{};
-        std::int64_t connection_id{};
+        std::optional<std::int64_t> connection_id;
         std::optional<std::int64_t> worker_id;
-        std::int64_t template_id{};
-        std::int64_t job_id{};
-        std::int64_t share_id{};
+        std::int64_t template_generation{};
+        PublicId job_public_id{};
+        std::optional<std::int64_t> share_id;
         std::int64_t round_id{};
         std::int64_t height{};
         Hash32 miner_tx_hash{};
@@ -942,21 +1047,20 @@ struct Database::Impl {
     {
         Statement statement(
             db,
-            "SELECT c.connection_id,s.worker_id,j.template_id,c.job_id,c.first_share_id,"
-            "s.round_id,c.height,c.miner_tx_hash,c.state "
+            "SELECT c.connection_id,s.worker_id,c.template_generation,c.job_public_id,"
+            "c.first_share_id,c.round_id,c.height,c.miner_tx_hash,c.state "
             "FROM candidates c "
-            "JOIN private_jobs j ON j.id=c.job_id "
-            "JOIN shares s ON s.id=c.first_share_id WHERE c.id=?1");
+            "LEFT JOIN shares s ON s.id=c.first_share_id WHERE c.id=?1");
         statement.bind(candidate_id, 1);
         require(statement.row(), "candidate does not exist");
         CandidateContext result;
-        result.connection_id = statement.integer(0);
+        if (!statement.is_null(0)) result.connection_id = statement.integer(0);
         if (!statement.is_null(1)) {
             result.worker_id = statement.integer(1);
         }
-        result.template_id = statement.integer(2);
-        result.job_id = statement.integer(3);
-        result.share_id = statement.integer(4);
+        result.template_generation = statement.integer(2);
+        result.job_public_id = exact_array<16>(statement.blob(3), "candidate job public ID");
+        if (!statement.is_null(4)) result.share_id = statement.integer(4);
         result.round_id = statement.integer(5);
         result.height = statement.integer(6);
         result.miner_tx_hash = exact_array<32>(statement.blob(7), "miner transaction hash");
@@ -981,8 +1085,8 @@ struct Database::Impl {
             .type = std::string(type),
             .connection_id = context.connection_id,
             .worker_id = context.worker_id,
-            .template_id = context.template_id,
-            .job_id = context.job_id,
+            .template_generation = context.template_generation,
+            .job_public_id = context.job_public_id,
             .share_id = context.share_id,
             .candidate_id = candidate_id,
             .round_id = round_id,
@@ -1025,13 +1129,8 @@ struct Database::Impl {
         require(closed_round_id == context.round_id,
                 "candidate origin round is no longer the open round");
 
-        Statement contaminated(
-            db,
-            "SELECT 1 FROM shares s JOIN private_jobs j ON j.id=s.job_id "
-            "WHERE s.round_id=?1 AND j.height>?2 LIMIT 1");
-        contaminated.bind(context.round_id, 1);
-        contaminated.bind(context.height, 2);
-        require(!contaminated.row(),
+        require(!round_has_higher_share_height_unlocked(
+                    context.round_id, context.height),
                 "candidate origin round contains a higher-height share");
 
         const CandidateState accepted_state = by_reconciliation
@@ -1100,8 +1199,8 @@ struct Database::Impl {
             .type = "round_opened",
             .connection_id = std::nullopt,
             .worker_id = std::nullopt,
-            .template_id = std::nullopt,
-            .job_id = std::nullopt,
+            .template_generation = std::nullopt,
+            .job_public_id = std::nullopt,
             .share_id = std::nullopt,
             .candidate_id = std::nullopt,
             .round_id = next_round_id,
@@ -1130,11 +1229,16 @@ struct Database::Impl {
     void add_round_work_segment_unlocked(
         std::int64_t round_id, HashrateSource source,
         std::string_view network_difficulty,
-        std::string_view credited_difficulty)
+        std::string_view credited_difficulty,
+        std::uint64_t accepted_shares = 1)
     {
         require(round_id > 0, "round work segment has an invalid round ID");
         require_uint128(network_difficulty, "round network difficulty", false);
         require_uint128(credited_difficulty, "round credited difficulty", false);
+        require(accepted_shares >= 1 &&
+                    accepted_shares <= static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max()),
+                "round accepted-share delta is outside SQLite range");
 
         Statement select(
             db,
@@ -1148,7 +1252,9 @@ struct Database::Impl {
             const std::string updated = add_uint128(
                 select.text(0), credited_difficulty);
             const std::int64_t count = select.integer(1);
-            require(count < std::numeric_limits<std::int64_t>::max(),
+            const auto count_delta = static_cast<std::int64_t>(accepted_shares);
+            require(count <= std::numeric_limits<std::int64_t>::max() -
+                                 count_delta,
                     "round work segment share counter overflow");
             Statement update(
                 db,
@@ -1156,7 +1262,7 @@ struct Database::Impl {
                 "accepted_share_count=?2 WHERE round_id=?3 AND source=?4 "
                 "AND network_difficulty_dec=?5");
             update.bind(updated, 1);
-            update.bind(count + 1, 2);
+            update.bind(count + count_delta, 2);
             update.bind(round_id, 3);
             update.bind(to_string(source), 4);
             update.bind(network_difficulty, 5);
@@ -1170,16 +1276,18 @@ struct Database::Impl {
             db,
             "INSERT INTO round_work_segments(round_id,source,"
             "network_difficulty_dec,credited_difficulty_dec,accepted_share_count) "
-            "VALUES(?1,?2,?3,?4,1)");
+            "VALUES(?1,?2,?3,?4,?5)");
         insert.bind(round_id, 1);
         insert.bind(to_string(source), 2);
         insert.bind(network_difficulty, 3);
         insert.bind(credited_difficulty, 4);
+        insert.bind(static_cast<std::int64_t>(accepted_shares), 5);
         insert.done();
     }
 
-    bool try_finalize_round_unlocked(std::int64_t round_id,
-                                     std::int64_t finalized_unix_us)
+    bool try_finalize_round_unlocked(
+        std::int64_t round_id, std::int64_t finalized_unix_us,
+        bool pending_accounting_already_applied = false)
     {
         require(round_id > 0, "round finalization has an invalid round ID");
         Statement round(
@@ -1198,6 +1306,21 @@ struct Database::Impl {
         const std::int64_t closed_unix_us = round.integer(1);
         const std::string credited_total = round.text(2);
         const std::int64_t accepted_total = round.integer(3);
+
+        for (const auto &[id, staged] : transient_shares) {
+            (void)id;
+            if (staged.round_id == round_id) {
+                return false;
+            }
+        }
+        if (!pending_accounting_already_applied) {
+            for (const auto &[key, delta] : pending_round_work) {
+                (void)delta;
+                if (key.round_id == round_id) {
+                    return false;
+                }
+            }
+        }
 
         Statement pending(
             db,
@@ -1249,8 +1372,13 @@ struct Database::Impl {
 
     void add_bucket_unlocked(std::string_view scope_type, std::int64_t scope_id,
                              std::int64_t second_utc, std::string_view difficulty,
-                             HashrateSource source)
+                             HashrateSource source,
+                             std::uint64_t accepted_shares_delta = 1)
     {
+        require(accepted_shares_delta >= 1 &&
+                    accepted_shares_delta <= static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max()),
+                "hashrate accepted-share delta is outside SQLite range");
         Statement select(
             db,
             "SELECT credited_difficulty_dec,accepted_shares FROM hashrate_buckets "
@@ -1262,7 +1390,10 @@ struct Database::Impl {
         if (select.row()) {
             const std::string updated = add_uint128(select.text(0), difficulty);
             const std::int64_t accepted_shares = select.integer(1);
-            require(accepted_shares < std::numeric_limits<std::int64_t>::max(),
+            const auto count_delta =
+                static_cast<std::int64_t>(accepted_shares_delta);
+            require(accepted_shares <=
+                        std::numeric_limits<std::int64_t>::max() - count_delta,
                     "hashrate accepted-share counter overflow");
             Statement update(
                 db,
@@ -1270,7 +1401,7 @@ struct Database::Impl {
                 "accepted_shares=?2 WHERE scope_type=?3 AND scope_id=?4 "
                 "AND second_utc=?5 AND source=?6");
             update.bind(updated, 1);
-            update.bind(accepted_shares + 1, 2);
+            update.bind(accepted_shares + count_delta, 2);
             update.bind(scope_type, 3);
             update.bind(scope_id, 4);
             update.bind(second_utc, 5);
@@ -1284,13 +1415,462 @@ struct Database::Impl {
             db,
             "INSERT INTO hashrate_buckets(scope_type,scope_id,second_utc,"
             "credited_difficulty_dec,accepted_shares,source) "
-            "VALUES(?1,?2,?3,?4,1,?5)");
+            "VALUES(?1,?2,?3,?4,?5,?6)");
         insert.bind(scope_type, 1);
         insert.bind(scope_id, 2);
         insert.bind(second_utc, 3);
         insert.bind(difficulty, 4);
-        insert.bind(to_string(source), 5);
+        insert.bind(static_cast<std::int64_t>(accepted_shares_delta), 5);
+        insert.bind(to_string(source), 6);
         insert.done();
+    }
+
+    [[nodiscard]] static bool valid_retention_reason(
+        std::string_view reason) noexcept
+    {
+        return reason == "high_difficulty" || reason == "candidate" ||
+               reason == "security_evidence";
+    }
+
+    [[nodiscard]] bool meets_persistence_threshold(
+        const std::optional<std::string> &actual_difficulty) const
+    {
+        if (!actual_difficulty.has_value()) {
+            return false;
+        }
+        require_uint128(*actual_difficulty, "share actual difficulty");
+        const std::string threshold =
+            std::to_string(options.min_persisted_share_difficulty);
+        return actual_difficulty->size() > threshold.size() ||
+               (actual_difficulty->size() == threshold.size() &&
+               *actual_difficulty >= threshold);
+    }
+
+    void remember_persisted_share_alias(
+        std::int64_t transient_id, PersistedShareIdentity identity)
+    {
+        require(transient_id < 0 && identity.share_id > 0 &&
+                    identity.round_id > 0,
+                "invalid persisted share alias");
+        const auto [iterator, inserted] = persisted_share_aliases.emplace(
+            transient_id, identity);
+        if (!inserted) {
+            require(iterator->second.share_id == identity.share_id &&
+                        iterator->second.round_id == identity.round_id,
+                    "transient share alias changed identity");
+            return;
+        }
+        persisted_share_alias_fifo.push_back(transient_id);
+        while (persisted_share_alias_fifo.size() > 4096U) {
+            persisted_share_aliases.erase(persisted_share_alias_fifo.front());
+            persisted_share_alias_fifo.pop_front();
+        }
+    }
+
+    void erase_transient_share_unlocked(
+        std::map<std::int64_t, StagedShare>::iterator share)
+    {
+        transient_shares.erase(share);
+        pending_transient_shares.store(
+            static_cast<std::uint64_t>(transient_shares.size()),
+            std::memory_order_release);
+    }
+
+    [[nodiscard]] bool round_has_higher_share_height_unlocked(
+        std::int64_t round_id, std::int64_t candidate_height) const
+    {
+        Statement round(
+            db, "SELECT max_share_height FROM rounds WHERE id=?1");
+        round.bind(round_id, 1);
+        require(round.row(), "candidate origin round does not exist");
+        if (round.integer(0) > candidate_height) {
+            return true;
+        }
+        for (const auto &[id, staged] : transient_shares) {
+            (void)id;
+            if (staged.round_id == round_id && staged.value.height.has_value() &&
+                *staged.value.height >
+                    static_cast<std::uint64_t>(candidate_height)) {
+                return true;
+            }
+        }
+        // Belt-and-suspenders protection for a retained row committed just
+        // before an older build crashed without flushing its round maximum.
+        Statement retained(
+            db,
+            "SELECT 1 FROM shares WHERE round_id=?1 AND height>?2 LIMIT 1");
+        retained.bind(round_id, 1);
+        retained.bind(candidate_height, 2);
+        return retained.row();
+    }
+
+    [[nodiscard]] bool transient_references_connection_unlocked(
+        std::int64_t connection_id) const noexcept
+    {
+        for (const auto &[id, staged] : transient_shares) {
+            (void)id;
+            if (staged.value.connection_id == connection_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void prune_worker_if_orphaned_unlocked(std::int64_t worker_id)
+    {
+        Statement prune(
+            db,
+            "DELETE FROM workers WHERE id=?1 "
+            "AND NOT EXISTS(SELECT 1 FROM connections WHERE worker_id=?1) "
+            "AND NOT EXISTS(SELECT 1 FROM shares WHERE worker_id=?1) "
+            "AND NOT EXISTS(SELECT 1 FROM events WHERE worker_id=?1) "
+            "AND NOT EXISTS(SELECT 1 FROM hashrate_buckets "
+            "WHERE scope_type='worker' AND scope_id=?1)");
+        prune.bind(worker_id, 1);
+        prune.done();
+    }
+
+    void prune_closed_connection_unlocked(std::int64_t connection_id,
+                                          std::optional<std::int64_t> worker_id)
+    {
+        if (transient_references_connection_unlocked(connection_id)) {
+            return;
+        }
+        Statement prune(
+            db,
+            "DELETE FROM connections WHERE id=?1 AND closed_unix_us IS NOT NULL "
+            "AND NOT EXISTS(SELECT 1 FROM shares WHERE connection_id=?1) "
+            "AND NOT EXISTS(SELECT 1 FROM candidates WHERE connection_id=?1) "
+            "AND NOT EXISTS(SELECT 1 FROM abuse_events WHERE connection_id=?1) "
+            "AND NOT EXISTS(SELECT 1 FROM events WHERE connection_id=?1) "
+            "AND NOT EXISTS(SELECT 1 FROM hashrate_buckets "
+            "WHERE scope_type='connection' AND scope_id=?1)");
+        prune.bind(connection_id, 1);
+        prune.done();
+        if (sqlite3_changes(db) == 1 && worker_id.has_value()) {
+            prune_worker_if_orphaned_unlocked(*worker_id);
+        }
+    }
+
+    void prune_closed_connections_unlocked()
+    {
+        std::vector<std::pair<std::int64_t, std::optional<std::int64_t>>> rows;
+        Statement query(
+            db,
+            "SELECT id,worker_id FROM connections WHERE closed_unix_us IS NOT NULL");
+        while (query.row()) {
+            rows.emplace_back(
+                query.integer(0),
+                query.is_null(1)
+                    ? std::nullopt
+                    : std::optional<std::int64_t>(query.integer(1)));
+        }
+        for (const auto &[connection_id, worker_id] : rows) {
+            prune_closed_connection_unlocked(connection_id, worker_id);
+        }
+    }
+
+    [[nodiscard]] bool prune_hashrate_unlocked(std::int64_t newest_second)
+    {
+        if (newest_second < last_hashrate_prune_second + 60) {
+            return false;
+        }
+        Statement prune(
+            db, "DELETE FROM hashrate_buckets WHERE second_utc<=?1");
+        prune.bind(newest_second - 86400, 1);
+        prune.done();
+        prune_closed_connections_unlocked();
+        return true;
+    }
+
+    [[nodiscard]] std::int64_t insert_staged_share_unlocked(
+        const StagedShare &staged, std::string_view retention_reason)
+    {
+        require(valid_retention_reason(retention_reason),
+                "invalid share retention reason");
+        require(staged.value.status == "received" ||
+                    staged.value.status == "verifying",
+                "only an active staged share can be persisted");
+        Statement statement(
+            db,
+            "INSERT INTO shares(session_id,round_id,connection_id,worker_id,"
+            "job_public_id,template_generation,height,"
+            "request_sequence,miner_request_id_type,miner_request_id_text,"
+            "received_unix_us,nonce,assigned_difficulty_dec,"
+            "network_difficulty_dec,height_is_older,claimed_candidate,"
+            "candidate_admission,retention_reason,status,provenance,"
+            "verifier_ticket_dec,verifier_seed_id_dec) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,"
+            "?15,?16,?17,?18,?19,?20,?21,?22)");
+        statement.bind(staged.value.session_id, 1);
+        statement.bind(staged.round_id, 2);
+        statement.bind_optional(staged.value.connection_id, 3);
+        statement.bind_optional(staged.value.worker_id, 4);
+        statement.bind_optional(staged.value.job_public_id, 5);
+        statement.bind_optional(staged.value.template_generation, 6);
+        if (staged.value.height) statement.bind(static_cast<std::int64_t>(*staged.value.height), 7);
+        else statement.bind_null(7);
+        statement.bind(
+            static_cast<std::int64_t>(staged.value.request_sequence), 8);
+        statement.bind_optional(staged.value.miner_request_id_type, 9);
+        statement.bind_optional(staged.value.miner_request_id_text, 10);
+        statement.bind(staged.value.received_unix_us, 11);
+        statement.bind_optional(staged.value.nonce, 12);
+        statement.bind_optional(staged.value.assigned_difficulty_dec, 13);
+        statement.bind_optional(staged.value.network_difficulty_dec, 14);
+        statement.bind(staged.value.height_is_older ? 1 : 0, 15);
+        statement.bind(staged.value.claimed_candidate ? 1 : 0, 16);
+        statement.bind(staged.value.candidate_admission, 17);
+        statement.bind(retention_reason, 18);
+        statement.bind(staged.value.status, 19);
+        statement.bind(staged.value.provenance, 20);
+        statement.bind_optional(staged.verifier_ticket_dec, 21);
+        statement.bind_optional(staged.verifier_seed_id_dec, 22);
+        statement.done();
+        const std::int64_t persisted_id = last_insert_id(db);
+
+        for (const auto &[role, value] : staged.hashes) {
+            Statement hash(
+                db,
+                "INSERT INTO share_hashes(share_id,role,hash,"
+                "meets_share_target,meets_network_target) "
+                "VALUES(?1,?2,?3,?4,?5)");
+            hash.bind(persisted_id, 1);
+            hash.bind(role, 2);
+            hash.bind(value.hash, 3);
+            if (value.meets_share_target.has_value()) {
+                hash.bind(*value.meets_share_target ? 1 : 0, 4);
+            }
+            else {
+                hash.bind_null(4);
+            }
+            if (value.meets_network_target.has_value()) {
+                hash.bind(*value.meets_network_target ? 1 : 0, 5);
+            }
+            else {
+                hash.bind_null(5);
+            }
+            hash.done();
+        }
+        if (staged.value.height.has_value()) {
+            Statement height(
+                db,
+                "UPDATE rounds SET max_share_height=max(max_share_height,?1) "
+                "WHERE id=?2");
+            height.bind(static_cast<std::int64_t>(*staged.value.height), 1);
+            height.bind(staged.round_id, 2);
+            height.done();
+            require(sqlite3_changes(db) == 1,
+                    "persisted share round does not exist");
+        }
+        return persisted_id;
+    }
+
+    void record_share_total_unlocked(
+        std::string_view status, std::string_view provenance,
+        std::int64_t completed_unix_us)
+    {
+        auto &delta = pending_share_totals[
+            ShareTotalKey{std::string(status), std::string(provenance)}];
+        require(delta.count <
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max()),
+                "pending share total overflows SQLite INTEGER");
+        if (delta.count == 0) {
+            delta.first_unix_us = completed_unix_us;
+            delta.last_unix_us = completed_unix_us;
+        }
+        else {
+            delta.first_unix_us = std::min(delta.first_unix_us,
+                                           completed_unix_us);
+            delta.last_unix_us = std::max(delta.last_unix_us,
+                                          completed_unix_us);
+        }
+        ++delta.count;
+        const auto prior = pending_accounting_items.load(
+            std::memory_order_relaxed);
+        require(prior < std::numeric_limits<std::uint64_t>::max(),
+                "pending accounting item counter overflow");
+        pending_accounting_items.store(prior + 1U,
+                                       std::memory_order_release);
+        pending_latest_completed_unix_us = std::max(
+            pending_latest_completed_unix_us, completed_unix_us);
+    }
+
+    void add_share_total_unlocked(std::string_view status,
+                                  std::string_view provenance,
+                                  std::int64_t completed_unix_us,
+                                  std::uint64_t count = 1)
+    {
+        require(count >= 1 && count <= static_cast<std::uint64_t>(
+                                      std::numeric_limits<std::int64_t>::max()),
+                "share total delta is outside SQLite range");
+        Statement statement(
+            db,
+            "INSERT INTO share_totals(status,provenance,share_count,"
+            "first_unix_us,last_unix_us) VALUES(?1,?2,?3,?4,?4) "
+            "ON CONFLICT(status,provenance) DO UPDATE SET "
+            "share_count=share_totals.share_count+excluded.share_count,"
+            "first_unix_us=min(share_totals.first_unix_us,excluded.first_unix_us),"
+            "last_unix_us=max(share_totals.last_unix_us,excluded.last_unix_us)");
+        statement.bind(status, 1);
+        statement.bind(provenance, 2);
+        statement.bind(static_cast<std::int64_t>(count), 3);
+        statement.bind(completed_unix_us, 4);
+        statement.done();
+    }
+
+    void record_work_unlocked(const StagedShare &staged,
+                              const ShareAcceptance &acceptance)
+    {
+        require(staged.value.network_difficulty_dec.has_value(),
+                "accepted staged share has no network difficulty");
+        const auto add_work = [&](WorkDelta &delta) {
+            delta.credited_difficulty_dec = add_uint128(
+                delta.credited_difficulty_dec,
+                acceptance.assigned_difficulty_dec);
+            require(delta.accepted_shares <
+                        static_cast<std::uint64_t>(
+                            std::numeric_limits<std::int64_t>::max()),
+                    "pending accepted-share counter overflow");
+            ++delta.accepted_shares;
+        };
+        const std::int64_t second_utc =
+            acceptance.completed_unix_us / 1'000'000;
+        add_work(pending_hashrate[HashrateKey{
+            "global", 0, second_utc, acceptance.source}]);
+        if (staged.value.connection_id.has_value()) {
+            add_work(pending_hashrate[HashrateKey{
+                "connection", *staged.value.connection_id, second_utc,
+                acceptance.source}]);
+        }
+        if (staged.value.worker_id.has_value()) {
+            add_work(pending_hashrate[HashrateKey{
+                "worker", *staged.value.worker_id, second_utc,
+                acceptance.source}]);
+        }
+        add_work(pending_round_work[RoundWorkKey{
+            staged.round_id, acceptance.source,
+            *staged.value.network_difficulty_dec}]);
+    }
+
+    [[nodiscard]] AccountingApplyResult apply_accounting_unlocked()
+    {
+        AccountingApplyResult result;
+        for (const auto &[key, delta] : pending_share_totals) {
+            add_share_total_unlocked(key.status, key.provenance,
+                                     delta.first_unix_us, delta.count);
+            if (delta.last_unix_us != delta.first_unix_us) {
+                Statement update(db, "UPDATE share_totals SET last_unix_us=max(last_unix_us,?1) WHERE status=?2 AND provenance=?3");
+                update.bind(delta.last_unix_us, 1);
+                update.bind(key.status, 2);
+                update.bind(key.provenance, 3);
+                update.done();
+            }
+        }
+
+        for (const auto &[key, delta] : pending_hashrate) {
+            add_bucket_unlocked(
+                key.scope_type, key.scope_id, key.second_utc,
+                delta.credited_difficulty_dec, key.source,
+                delta.accepted_shares);
+        }
+
+        std::map<std::int64_t, WorkDelta> round_totals;
+        for (const auto &[key, delta] : pending_round_work) {
+            add_round_work_segment_unlocked(
+                key.round_id, key.source, key.network_difficulty_dec,
+                delta.credited_difficulty_dec, delta.accepted_shares);
+            auto &total = round_totals[key.round_id];
+            total.credited_difficulty_dec = add_uint128(
+                total.credited_difficulty_dec,
+                delta.credited_difficulty_dec);
+            require(total.accepted_shares <=
+                        std::numeric_limits<std::uint64_t>::max() -
+                            delta.accepted_shares,
+                    "pending round accepted-share count overflow");
+            total.accepted_shares += delta.accepted_shares;
+            result.affected_rounds.insert(key.round_id);
+        }
+        for (const auto &[round_id, delta] : round_totals) {
+            Statement select(
+                db,
+                "SELECT credited_difficulty_dec,accepted_share_count,"
+                "effort_finalized_unix_us FROM rounds WHERE id=?1");
+            select.bind(round_id, 1);
+            require(select.row(), "pending accounting round does not exist");
+            require(select.is_null(2),
+                    "pending accounting targets a finalized round");
+            const std::string credited = add_uint128(
+                select.text(0), delta.credited_difficulty_dec);
+            const std::int64_t prior_count = select.integer(1);
+            require(delta.accepted_shares <= static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max() - prior_count),
+                    "round accepted-share counter overflow");
+            Statement update(
+                db,
+                "UPDATE rounds SET credited_difficulty_dec=?1,"
+                "accepted_share_count=?2 WHERE id=?3 "
+                "AND effort_finalized_unix_us IS NULL");
+            update.bind(credited, 1);
+            update.bind(
+                prior_count +
+                    static_cast<std::int64_t>(delta.accepted_shares),
+                2);
+            update.bind(round_id, 3);
+            update.done();
+            require(sqlite3_changes(db) == 1,
+                    "pending accounting round changed during flush");
+        }
+        for (const auto &[round_id, max_height] : pending_round_max_height) {
+            Statement update(
+                db,
+                "UPDATE rounds SET max_share_height=max(max_share_height,?1) "
+                "WHERE id=?2");
+            update.bind(max_height, 1);
+            update.bind(round_id, 2);
+            update.done();
+            require(sqlite3_changes(db) == 1,
+                    "pending share-height round does not exist");
+        }
+        if (pending_latest_completed_unix_us > 0) {
+            const std::int64_t newest_second =
+                pending_latest_completed_unix_us / 1'000'000;
+            if (prune_hashrate_unlocked(newest_second)) {
+                result.hashrate_pruned_through = newest_second;
+            }
+        }
+        return result;
+    }
+
+    void clear_accounting_unlocked() noexcept
+    {
+        pending_share_totals.clear();
+        pending_hashrate.clear();
+        pending_round_work.clear();
+        pending_round_max_height.clear();
+        pending_accounting_items.store(0, std::memory_order_release);
+        pending_latest_completed_unix_us = 0;
+    }
+
+    void flush_accounting_transaction_unlocked()
+    {
+        if (pending_accounting_items.load(std::memory_order_acquire) == 0U &&
+            pending_round_max_height.empty()) {
+            return;
+        }
+        Transaction transaction(db);
+        const AccountingApplyResult applied = apply_accounting_unlocked();
+        for (const std::int64_t round_id : applied.affected_rounds) {
+            (void)try_finalize_round_unlocked(
+                round_id, pending_latest_completed_unix_us,
+                true);
+        }
+        transaction.commit();
+        if (applied.hashrate_pruned_through.has_value()) {
+            last_hashrate_prune_second = *applied.hashrate_pruned_through;
+        }
+        clear_accounting_unlocked();
     }
 
     std::int64_t insert_abuse_event_unlocked(const AbuseEventInsert &event)
@@ -1436,6 +2016,18 @@ struct Database::Impl {
     DatabaseOptions options;
     sqlite3 *db{};
     mutable WriterScheduler mutex;
+    std::int64_t next_transient_share_id{-1};
+    std::map<std::int64_t, StagedShare> transient_shares;
+    std::map<std::int64_t, PersistedShareIdentity> persisted_share_aliases;
+    std::deque<std::int64_t> persisted_share_alias_fifo;
+    std::map<ShareTotalKey, ShareTotalDelta> pending_share_totals;
+    std::map<HashrateKey, WorkDelta> pending_hashrate;
+    std::map<RoundWorkKey, WorkDelta> pending_round_work;
+    std::map<std::int64_t, std::int64_t> pending_round_max_height;
+    std::atomic<std::uint64_t> pending_accounting_items{0};
+    std::atomic<std::uint64_t> pending_transient_shares{0};
+    std::int64_t pending_latest_completed_unix_us{};
+    std::int64_t last_hashrate_prune_second{};
 };
 
 Database::Database(DatabaseOptions options)
@@ -1452,7 +2044,12 @@ const DatabaseOptions &Database::options() const noexcept
 
 DatabaseWriterStats Database::writer_stats() const noexcept
 {
-    return impl_->mutex.stats();
+    DatabaseWriterStats result = impl_->mutex.stats();
+    result.pending_accounting_items = impl_->pending_accounting_items.load(
+        std::memory_order_acquire);
+    result.pending_transient_shares = impl_->pending_transient_shares.load(
+        std::memory_order_acquire);
+    return result;
 }
 
 DatabasePragmas Database::pragmas() const
@@ -1468,8 +2065,8 @@ std::uint32_t Database::schema_version() const
         impl_->db, "SELECT value FROM schema_meta WHERE key='schema_version'");
     require(statement.row(), "database schema_version is missing");
     const std::string value = statement.text(0);
-    require(value == "2", "unsupported database schema version (expected 2)");
-    return 2;
+    require(value == "3", "unsupported database schema version (expected 3)");
+    return 3;
 }
 
 std::int64_t Database::start_session(const SessionStart &session)
@@ -1513,8 +2110,8 @@ std::int64_t Database::start_session(const SessionStart &session)
         .type = "server_started",
         .connection_id = std::nullopt,
         .worker_id = std::nullopt,
-        .template_id = std::nullopt,
-        .job_id = std::nullopt,
+        .template_generation = std::nullopt,
+        .job_public_id = std::nullopt,
         .share_id = std::nullopt,
         .candidate_id = std::nullopt,
         .round_id = std::nullopt,
@@ -1527,8 +2124,8 @@ std::int64_t Database::start_session(const SessionStart &session)
             .type = "round_opened",
             .connection_id = std::nullopt,
             .worker_id = std::nullopt,
-            .template_id = std::nullopt,
-            .job_id = std::nullopt,
+            .template_generation = std::nullopt,
+            .job_public_id = std::nullopt,
             .share_id = std::nullopt,
             .candidate_id = std::nullopt,
             .round_id = *newly_opened_round,
@@ -1544,50 +2141,45 @@ InterruptedRuntimeRecovery Database::recover_interrupted_runtime(
 {
     require(recovered_unix_us > 0, "runtime recovery time must be positive");
 
-    // Retire jobs through the typed workflow so deferred candidate verdicts
-    // reach their durable terminal disposition.  Each retirement commits on
-    // its own: if recovery itself is interrupted, the next run safely resumes
-    // at the first still-active row.
-    std::vector<std::pair<std::int64_t, std::int64_t>> jobs_to_retire;
-    {
-        std::scoped_lock lock(impl_->mutex);
-        Statement jobs(
-            impl_->db,
-            "SELECT id,created_unix_us FROM private_jobs "
-            "WHERE retired_unix_us IS NULL ORDER BY id");
-        while (jobs.row()) {
-            jobs_to_retire.emplace_back(jobs.integer(0), jobs.integer(1));
-        }
-    }
-
     InterruptedRuntimeRecovery result;
-    for (const auto &[job_id, created_unix_us] : jobs_to_retire) {
-        JobRetirementResult retirement = retire_job(
-            job_id, std::max(recovered_unix_us, created_unix_us));
-        if (!retirement.retired) {
-            continue;
-        }
-        ++result.jobs_retired;
-        result.actionable_verdicts.insert(
-            result.actionable_verdicts.end(),
-            std::make_move_iterator(retirement.actionable_verdicts.begin()),
-            std::make_move_iterator(retirement.actionable_verdicts.end()));
-    }
-
     std::scoped_lock lock(impl_->mutex);
     Transaction transaction(impl_->db);
     std::vector<std::int64_t> pending_rounds;
     Statement pending_round_query(
         impl_->db,
-        "SELECT DISTINCT round_id FROM shares "
-        "WHERE status IN ('received','verifying') ORDER BY round_id");
+        "SELECT id FROM rounds WHERE state='closed' "
+        "AND effort_finalized_unix_us IS NULL ORDER BY id");
     while (pending_round_query.row()) {
         pending_rounds.push_back(pending_round_query.integer(0));
+    }
+    Statement cancelled_totals(
+        impl_->db,
+        "SELECT count(*),"
+        "min(CASE WHEN received_unix_us>?1 THEN received_unix_us ELSE ?1 END),"
+        "max(CASE WHEN received_unix_us>?1 THEN received_unix_us ELSE ?1 END) "
+        "FROM shares WHERE status IN ('received','verifying')");
+    cancelled_totals.bind(recovered_unix_us, 1);
+    require(cancelled_totals.row(), "could not count interrupted shares");
+    if (cancelled_totals.integer(0) > 0) {
+        const std::uint64_t count = static_cast<std::uint64_t>(
+            cancelled_totals.integer(0));
+        const std::int64_t first = cancelled_totals.integer(1);
+        const std::int64_t last = cancelled_totals.integer(2);
+        impl_->add_share_total_unlocked("cancelled", "pending", first, count);
+        if (last != first) {
+            Statement update_last(
+                impl_->db,
+                "UPDATE share_totals SET last_unix_us=max(last_unix_us,?1) "
+                "WHERE status='cancelled' AND provenance='pending'");
+            update_last.bind(last, 1);
+            update_last.done();
+        }
     }
     Statement cancel_shares(
         impl_->db,
         "UPDATE shares SET status='cancelled',provenance='pending',"
         "completed_unix_us=CASE WHEN received_unix_us>?1 THEN received_unix_us ELSE ?1 END,"
+        "retention_reason=coalesce(retention_reason,'security_evidence'),"
         "error_code='process_restarted',"
         "error_message='Server restarted before share completion' "
         "WHERE status IN ('received','verifying')");
@@ -1602,6 +2194,7 @@ InterruptedRuntimeRecovery Database::recover_interrupted_runtime(
     close_connections.done();
     result.connections_closed = static_cast<std::uint64_t>(
         sqlite3_changes(impl_->db));
+    impl_->prune_closed_connections_unlocked();
 
     Statement stop_sessions(
         impl_->db,
@@ -1704,11 +2297,10 @@ std::vector<PersistedEvent> Database::load_events_after(
     Statement statement(
         impl_->db,
         "SELECT e.id,ss.public_id,e.created_unix_us,e.type,cn.public_id,"
-        "e.worker_id,e.template_id,pj.public_job_id,e.share_id,e.candidate_id,"
+        "e.worker_id,e.template_generation,e.job_public_id,e.share_id,e.candidate_id,"
         "e.round_id,e.payload_json FROM events e "
         "JOIN server_sessions ss ON ss.id=e.session_id "
         "LEFT JOIN connections cn ON cn.id=e.connection_id "
-        "LEFT JOIN private_jobs pj ON pj.id=e.job_id "
         "WHERE e.id>?1 ORDER BY e.id ASC LIMIT ?2");
     statement.bind(last_event_id, 1);
     statement.bind(static_cast<std::int64_t>(limit), 2);
@@ -1726,7 +2318,7 @@ std::vector<PersistedEvent> Database::load_events_after(
                 statement.blob(4), "event connection public ID");
         }
         if (!statement.is_null(5)) value.worker_id = statement.integer(5);
-        if (!statement.is_null(6)) value.template_id = statement.integer(6);
+        if (!statement.is_null(6)) value.template_generation = statement.integer(6);
         if (!statement.is_null(7)) {
             value.job_public_id = exact_array<16>(statement.blob(7),
                                                   "event job public ID");
@@ -1743,28 +2335,10 @@ std::vector<PersistedEvent> Database::load_events_after(
 std::int64_t Database::upsert_worker(const WorkerInsert &worker)
 {
     std::scoped_lock lock(impl_->mutex);
-    require(!worker.login.empty(), "worker login is empty");
-    require_no_nul(worker.login, "worker login");
-    require_no_nul(worker.rigid, "worker rigid");
+    validate_worker(worker);
 
     Transaction transaction(impl_->db);
-    Statement insert(
-        impl_->db,
-        "INSERT INTO workers(login,rigid,first_seen_unix_us,last_seen_unix_us) "
-        "VALUES(?1,?2,?3,?3) "
-        "ON CONFLICT(login,rigid) DO UPDATE SET "
-        "last_seen_unix_us=max(last_seen_unix_us,excluded.last_seen_unix_us)");
-    insert.bind(worker.login, 1);
-    insert.bind(worker.rigid, 2);
-    insert.bind(worker.seen_unix_us, 3);
-    insert.done();
-
-    Statement select(
-        impl_->db, "SELECT id FROM workers WHERE login=?1 AND rigid=?2");
-    select.bind(worker.login, 1);
-    select.bind(worker.rigid, 2);
-    require(select.row(), "worker upsert did not produce a row");
-    const std::int64_t id = select.integer(0);
+    const std::int64_t id = upsert_worker_unlocked(impl_->db, worker);
     transaction.commit();
     return id;
 }
@@ -1802,6 +2376,23 @@ std::int64_t Database::insert_connection(const ConnectionInsert &connection)
     return last_insert_id(impl_->db);
 }
 
+std::int64_t Database::upsert_worker_and_authenticate_connection(
+    std::int64_t connection_id, const WorkerInsert &worker,
+    std::string_view agent, std::int64_t authenticated_unix_us)
+{
+    std::scoped_lock lock(impl_->mutex);
+    require(connection_id > 0, "connection ID must be positive");
+    validate_worker(worker);
+    require_no_nul(agent, "connection agent");
+
+    Transaction transaction(impl_->db);
+    const std::int64_t worker_id = upsert_worker_unlocked(impl_->db, worker);
+    authenticate_connection_unlocked(
+        impl_->db, connection_id, worker_id, agent, authenticated_unix_us);
+    transaction.commit();
+    return worker_id;
+}
+
 void Database::authenticate_connection(std::int64_t connection_id,
                                        std::int64_t worker_id,
                                        std::string_view agent,
@@ -1811,17 +2402,35 @@ void Database::authenticate_connection(std::int64_t connection_id,
     require(connection_id > 0 && worker_id > 0,
             "connection/worker IDs must be positive");
     require_no_nul(agent, "connection agent");
-    Statement statement(
+    authenticate_connection_unlocked(
+        impl_->db, connection_id, worker_id, agent, authenticated_unix_us);
+}
+
+bool Database::update_connection_last_sent_height(
+    std::int64_t connection_id, std::uint64_t height)
+{
+    std::scoped_lock lock(impl_->mutex);
+    require(connection_id > 0, "connection ID must be positive");
+    require_i64(height, "connection last-sent height");
+    Statement update(
         impl_->db,
-        "UPDATE connections SET worker_id=?1,agent=?2,authenticated_unix_us=?3 "
-        "WHERE id=?4 AND closed_unix_us IS NULL AND authenticated_unix_us IS NULL");
-    statement.bind(worker_id, 1);
-    statement.bind(agent, 2);
-    statement.bind(authenticated_unix_us, 3);
-    statement.bind(connection_id, 4);
-    statement.done();
-    require(sqlite3_changes(impl_->db) == 1,
-            "connection is absent, closed, or already authenticated");
+        "UPDATE connections SET last_sent_height=?1 WHERE id=?2 "
+        "AND closed_unix_us IS NULL AND last_sent_height!=?1");
+    update.bind(static_cast<std::int64_t>(height), 1);
+    update.bind(connection_id, 2);
+    update.done();
+    if (sqlite3_changes(impl_->db) == 1) {
+        return true;
+    }
+    Statement existing(
+        impl_->db,
+        "SELECT last_sent_height FROM connections WHERE id=?1 "
+        "AND closed_unix_us IS NULL");
+    existing.bind(connection_id, 1);
+    require(existing.row(), "connection is absent or closed");
+    require(existing.integer(0) == static_cast<std::int64_t>(height),
+            "connection last-sent height update failed");
+    return false;
 }
 
 bool Database::close_connection(std::int64_t connection_id,
@@ -1832,6 +2441,18 @@ bool Database::close_connection(std::int64_t connection_id,
     require(connection_id > 0, "connection ID must be positive");
     require(!reason.empty(), "connection close reason is empty");
     require_no_nul(reason, "connection close reason");
+    // Materialize any pending connection/worker buckets before deciding
+    // whether their scope identities can be pruned.
+    impl_->flush_accounting_transaction_unlocked();
+    Transaction transaction(impl_->db);
+    Statement worker(impl_->db, "SELECT worker_id FROM connections WHERE id=?1");
+    worker.bind(connection_id, 1);
+    if (!worker.row()) {
+        transaction.commit();
+        return false;
+    }
+    std::optional<std::int64_t> worker_id;
+    if (!worker.is_null(0)) worker_id = worker.integer(0);
     Statement statement(
         impl_->db,
         "UPDATE connections SET closed_unix_us=?1,close_reason=?2 "
@@ -1840,266 +2461,29 @@ bool Database::close_connection(std::int64_t connection_id,
     statement.bind(reason, 2);
     statement.bind(connection_id, 3);
     statement.done();
-    return sqlite3_changes(impl_->db) == 1;
-}
-
-std::int64_t Database::insert_public_template(const PublicTemplateInsert &value)
-{
-    std::scoped_lock lock(impl_->mutex);
-    require(value.session_id > 0, "template session ID must be positive");
-    require(value.generation > 0, "template generation must be positive");
-    require(value.height > 0, "template height must be positive");
-    require_i64(value.height, "template height");
-    require_uint128(value.difficulty_dec, "template difficulty", false);
-    require_i64(value.reserved_offset, "template reserved offset");
-    require(!value.blocktemplate_blob.empty(), "template block blob is empty");
-    require(!value.blockhashing_blob.empty(), "template hashing blob is empty");
-    require(!value.fetch_reason.empty(), "template fetch reason is empty");
-    require_no_nul(value.fetch_reason, "template fetch reason");
-    if (value.wide_difficulty_hex.has_value()) {
-        require_no_nul(*value.wide_difficulty_hex, "wide difficulty hex");
-    }
-
-    Statement statement(
-        impl_->db,
-        "INSERT INTO public_templates(session_id,generation,height,prev_hash,"
-        "seed_hash,next_seed_hash,difficulty_dec,wide_difficulty_hex,reserved_offset,"
-        "reserve_size,blocktemplate_blob,blockhashing_blob,fetched_unix_us,fetch_reason) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,16,?10,?11,?12,?13)");
-    statement.bind(value.session_id, 1);
-    statement.bind(value.generation, 2);
-    statement.bind(static_cast<std::int64_t>(value.height), 3);
-    statement.bind(value.prev_hash, 4);
-    statement.bind(value.seed_hash, 5);
-    statement.bind_optional(value.next_seed_hash, 6);
-    statement.bind(value.difficulty_dec, 7);
-    statement.bind_optional(value.wide_difficulty_hex, 8);
-    statement.bind(static_cast<std::int64_t>(value.reserved_offset), 9);
-    statement.bind(value.blocktemplate_blob, 10);
-    statement.bind(value.blockhashing_blob, 11);
-    statement.bind(value.fetched_unix_us, 12);
-    statement.bind(value.fetch_reason, 13);
-    statement.done();
-    return last_insert_id(impl_->db);
-}
-
-std::int64_t Database::insert_private_job(const PrivateJobInsert &job)
-{
-    std::scoped_lock lock(impl_->mutex);
-    require(job.connection_id > 0 && job.template_id > 0,
-            "private job references must be positive");
-    require(job.height > 0, "private job height must be positive");
-    require_i64(job.height, "private job height");
-    require_uint128(job.assigned_difficulty_dec, "assigned difficulty", false);
-    require_uint128(job.network_difficulty_dec, "network difficulty", false);
-    if (job.mspv_seed_id_dec.has_value()) {
-        require_uint64_decimal(*job.mspv_seed_id_dec, "MSPV seed ID", false);
-    }
-    require_i64(job.nonce_offset, "nonce offset");
-    require_i64(job.reserved_offset, "reserved offset");
-    require(!job.private_block_blob.empty(), "private block blob is empty");
-    require(!job.hashing_blob.empty(), "private hashing blob is empty");
-    require(job.expires_unix_us >= job.created_unix_us,
-            "private job expiry precedes creation");
-
-    Transaction transaction(impl_->db);
-    Statement statement(
-        impl_->db,
-        "INSERT INTO private_jobs(public_job_id,connection_id,template_id,height,"
-        "entropy,seed_hash,mspv_seed_id_dec,assigned_difficulty_dec,target64_le,"
-        "network_difficulty_dec,nonce_offset,nonce_size,reserved_offset,reserved_size,"
-        "private_block_blob,hashing_blob,created_unix_us,queued_unix_us,expires_unix_us) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,4,?12,16,?13,?14,?15,?16,?17)");
-    statement.bind(job.public_job_id, 1);
-    statement.bind(job.connection_id, 2);
-    statement.bind(job.template_id, 3);
-    statement.bind(static_cast<std::int64_t>(job.height), 4);
-    statement.bind(job.entropy, 5);
-    statement.bind(job.seed_hash, 6);
-    statement.bind_optional(job.mspv_seed_id_dec, 7);
-    statement.bind(job.assigned_difficulty_dec, 8);
-    statement.bind(job.target64_le, 9);
-    statement.bind(job.network_difficulty_dec, 10);
-    statement.bind(static_cast<std::int64_t>(job.nonce_offset), 11);
-    statement.bind(static_cast<std::int64_t>(job.reserved_offset), 12);
-    statement.bind(job.private_block_blob, 13);
-    statement.bind(job.hashing_blob, 14);
-    statement.bind(job.created_unix_us, 15);
-    statement.bind_optional(job.queued_unix_us, 16);
-    statement.bind(job.expires_unix_us, 17);
-    statement.done();
-    const std::int64_t id = last_insert_id(impl_->db);
-    transaction.commit();
-    return id;
-}
-
-void Database::mark_job_queued(std::int64_t job_id, std::int64_t queued_unix_us)
-{
-    std::scoped_lock lock(impl_->mutex);
-    require(job_id > 0, "job ID must be positive");
-    Transaction transaction(impl_->db);
-    Statement select(
-        impl_->db,
-        "SELECT connection_id,height,created_unix_us,queued_unix_us,retired_unix_us "
-        "FROM private_jobs WHERE id=?1");
-    select.bind(job_id, 1);
-    require(select.row(), "job does not exist");
-    require(select.is_null(4), "retired job cannot be queued");
-    require(queued_unix_us >= select.integer(2), "job queue time precedes creation");
-    if (!select.is_null(3)) {
-        require(select.integer(3) == queued_unix_us,
-                "job was already queued at another time");
-        transaction.commit();
-        return;
-    }
-    const std::int64_t connection_id = select.integer(0);
-    const std::int64_t height = select.integer(1);
-    Statement update_job(
-        impl_->db,
-        "UPDATE private_jobs SET queued_unix_us=?1 WHERE id=?2 "
-        "AND queued_unix_us IS NULL AND retired_unix_us IS NULL");
-    update_job.bind(queued_unix_us, 1);
-    update_job.bind(job_id, 2);
-    update_job.done();
-    require(sqlite3_changes(impl_->db) == 1, "job queue state changed concurrently");
-    Statement update_connection(
-        impl_->db,
-        "UPDATE connections SET last_sent_height=?1 WHERE id=?2 "
-        "AND closed_unix_us IS NULL");
-    update_connection.bind(height, 1);
-    update_connection.bind(connection_id, 2);
-    update_connection.done();
-    require(sqlite3_changes(impl_->db) == 1,
-            "job connection is absent or already closed");
-    transaction.commit();
-}
-
-JobRetirementResult Database::retire_job(std::int64_t job_id,
-                                         std::int64_t retired_unix_us)
-{
-    std::scoped_lock lock(impl_->mutex);
-    require(job_id > 0, "job ID must be positive");
-    JobRetirementResult result;
-    Transaction transaction(impl_->db);
-    Statement statement(
-        impl_->db,
-        "UPDATE private_jobs SET retired_unix_us=?1 WHERE id=?2 "
-        "AND retired_unix_us IS NULL AND created_unix_us<=?1");
-    statement.bind(retired_unix_us, 1);
-    statement.bind(job_id, 2);
-    statement.done();
-    const bool retired = sqlite3_changes(impl_->db) == 1;
-    if (!retired) {
-        transaction.commit();
-        return result;
-    }
-    result.retired = true;
-
-    Statement verdicts(
-        impl_->db,
-        "SELECT cv.share_id,cv.kind,cv.candidate_key,s.connection_id,"
-        "c.peer_family,c.peer_address FROM candidate_verdicts cv "
-        "JOIN shares s ON s.id=cv.share_id "
-        "JOIN connections c ON c.id=s.connection_id "
-        "WHERE s.job_id=?1 AND cv.disposition='pending' "
-        "AND cv.candidate_id IS NULL ORDER BY cv.share_id,cv.kind");
-    verdicts.bind(job_id, 1);
-    struct PendingVerdict {
-        std::int64_t share_id{};
-        std::string kind;
-        Hash32 candidate_key{};
-        std::int64_t connection_id{};
-        int peer_family{};
-        ByteVector peer_address;
-    };
-    std::vector<PendingVerdict> pending;
-    while (verdicts.row()) {
-        pending.push_back(PendingVerdict{
-            .share_id = verdicts.integer(0),
-            .kind = verdicts.text(1),
-            .candidate_key = exact_array<32>(verdicts.blob(2),
-                                              "retiring verdict candidate key"),
-            .connection_id = verdicts.integer(3),
-            .peer_family = static_cast<int>(verdicts.integer(4)),
-            .peer_address = verdicts.blob(5),
-        });
-    }
-    for (const PendingVerdict &verdict : pending) {
-        Statement candidate(
-            impl_->db, "SELECT id FROM candidates WHERE candidate_key=?1");
-        candidate.bind(verdict.candidate_key, 1);
-        if (candidate.row()) {
-            Statement link(
-                impl_->db,
-                "UPDATE candidate_verdicts SET candidate_id=?1 WHERE share_id=?2 "
-                "AND kind=?3 AND candidate_id IS NULL AND disposition='pending'");
-            link.bind(candidate.integer(0), 1);
-            link.bind(verdict.share_id, 2);
-            link.bind(verdict.kind, 3);
-            link.done();
-            continue;
-        }
-
-        const std::string abuse_kind = verdict.kind == "false_candidate"
-                                           ? "verified_false_candidate"
-                                           : "candidate_mismatch";
-        const std::int64_t abuse_event_id = impl_->insert_abuse_event_unlocked(
-            AbuseEventInsert{
-                .connection_id = verdict.connection_id,
-                .share_id = verdict.share_id,
-                .candidate_id = std::nullopt,
-                .peer_family = verdict.peer_family,
-                .peer_address = verdict.peer_address,
-                .kind = abuse_kind,
-                .weight = 1,
-                .created_unix_us = retired_unix_us,
-                .detail = std::nullopt,
-            });
-        Statement actionable(
-            impl_->db,
-            "UPDATE candidate_verdicts SET disposition='actionable',"
-            "resolved_unix_us=?1,abuse_event_id=?2 WHERE share_id=?3 AND kind=?4 "
-            "AND candidate_id IS NULL AND disposition='pending'");
-        actionable.bind(retired_unix_us, 1);
-        actionable.bind(abuse_event_id, 2);
-        actionable.bind(verdict.share_id, 3);
-        actionable.bind(verdict.kind, 4);
-        actionable.done();
-        require(sqlite3_changes(impl_->db) == 1,
-                "candidate verdict changed while retiring its job");
-        if (verdict.kind == "false_candidate") {
-            require(result.newly_actionable_false_candidates <
-                        std::numeric_limits<std::uint32_t>::max(),
-                    "newly actionable false-candidate count overflow");
-            ++result.newly_actionable_false_candidates;
-        }
-        else {
-            require(verdict.kind == "candidate_mismatch",
-                    "retiring job found an unknown candidate verdict kind");
-            require(result.newly_actionable_candidate_mismatches <
-                        std::numeric_limits<std::uint32_t>::max(),
-                    "newly actionable candidate-mismatch count overflow");
-            ++result.newly_actionable_candidate_mismatches;
-        }
-        result.actionable_verdicts.push_back(ActionableCandidateVerdict{
-            .abuse_event_id = abuse_event_id,
-            .share_id = verdict.share_id,
-            .connection_id = verdict.connection_id,
-            .kind = verdict.kind == "false_candidate"
-                        ? CandidateVerdictKind::false_candidate
-                        : CandidateVerdictKind::candidate_mismatch,
-            .peer_family = verdict.peer_family,
-            .peer_address = verdict.peer_address,
-        });
+    const bool changed = sqlite3_changes(impl_->db) == 1;
+    if (changed) {
+        impl_->prune_closed_connection_unlocked(connection_id, worker_id);
     }
     transaction.commit();
-    return result;
+    return changed;
 }
 
 std::int64_t Database::insert_share(const ShareInsert &share)
 {
     std::scoped_lock lock(impl_->mutex);
-    require(share.connection_id > 0, "share connection ID must be positive");
+    require(share.session_id > 0, "share session ID must be positive");
+    require(!share.connection_id || *share.connection_id > 0,
+            "share connection ID must be positive when present");
+    require(!share.worker_id || *share.worker_id > 0,
+            "share worker ID must be positive when present");
+    require(!share.template_generation || *share.template_generation > 0,
+            "share template generation must be positive when present");
+    require(!share.height || *share.height > 0,
+            "share height must be positive when present");
+    if (share.height.has_value()) {
+        require_i64(*share.height, "share height");
+    }
     require(share.request_sequence >= 1, "share request sequence must be positive");
     require_i64(share.request_sequence, "share request sequence");
     require(share.miner_request_id_type.has_value() ==
@@ -2122,153 +2506,126 @@ std::int64_t Database::insert_share(const ShareInsert &share)
     require_no_nul(share.candidate_admission, "candidate admission");
     require_no_nul(share.status, "share status");
     require_no_nul(share.provenance, "share provenance");
+    require(share.status == "received" || share.status == "verifying",
+            "new transient share must be active");
 
-    Statement statement(
-        impl_->db,
-        "INSERT INTO shares(round_id,connection_id,worker_id,job_id,request_sequence,"
-        "miner_request_id_type,miner_request_id_text,received_unix_us,nonce,"
-        "assigned_difficulty_dec,network_difficulty_dec,height_is_older,"
-        "claimed_candidate,candidate_admission,status,provenance) "
-        "SELECT id,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15 "
-        "FROM rounds WHERE state='open'");
-    statement.bind(share.connection_id, 1);
-    statement.bind_optional(share.worker_id, 2);
-    statement.bind_optional(share.job_id, 3);
-    statement.bind(static_cast<std::int64_t>(share.request_sequence), 4);
-    statement.bind_optional(share.miner_request_id_type, 5);
-    statement.bind_optional(share.miner_request_id_text, 6);
-    statement.bind(share.received_unix_us, 7);
-    statement.bind_optional(share.nonce, 8);
-    statement.bind_optional(share.assigned_difficulty_dec, 9);
-    statement.bind_optional(share.network_difficulty_dec, 10);
-    statement.bind(share.height_is_older ? 1 : 0, 11);
-    statement.bind(share.claimed_candidate ? 1 : 0, 12);
-    statement.bind(share.candidate_admission, 13);
-    statement.bind(share.status, 14);
-    statement.bind(share.provenance, 15);
-    statement.done();
-    require(sqlite3_changes(impl_->db) == 1,
-            "share insert found no unique open round");
-    return last_insert_id(impl_->db);
-}
-
-DuplicateReservationResult Database::reserve_duplicate(
-    const DuplicateKey &key, std::uint64_t height, std::int64_t first_share_id,
-    DuplicateRole role, std::int64_t reserved_unix_us,
-    std::int64_t generation_token)
-{
-    std::scoped_lock lock(impl_->mutex);
-    require(height > 0, "duplicate height must be positive");
-    require_i64(height, "duplicate height");
-    require(first_share_id > 0, "duplicate first share ID must be positive");
-    require(generation_token > 0, "duplicate generation token must be positive");
-
-    Transaction transaction(impl_->db);
-    Statement insert(
-        impl_->db,
-        "INSERT INTO duplicate_keys(key,height,first_share_id,role,active,"
-        "reserved_unix_us,generation_token) VALUES(?1,?2,?3,?4,1,?5,?6) "
-        "ON CONFLICT(key) DO UPDATE SET height=excluded.height,"
-        "first_share_id=excluded.first_share_id,role=excluded.role,active=1,"
-        "reserved_unix_us=excluded.reserved_unix_us,retired_unix_us=NULL,"
-        "generation_token=excluded.generation_token "
-        "WHERE duplicate_keys.active=0");
-    insert.bind(key, 1);
-    insert.bind(static_cast<std::int64_t>(height), 2);
-    insert.bind(first_share_id, 3);
-    insert.bind(duplicate_role_text(role), 4);
-    insert.bind(reserved_unix_us, 5);
-    insert.bind(generation_token, 6);
-    insert.done();
-    const bool reserved = sqlite3_changes(impl_->db) == 1;
-
-    DuplicateReservationResult result;
-    result.reserved = reserved;
-    if (reserved) {
-        result.already_active = false;
-        result.first_share_id = first_share_id;
-        result.generation_token = generation_token;
-    }
-    else {
-        Statement existing(
+    if (share.connection_id) {
+        Statement connection(
             impl_->db,
-            "SELECT first_share_id,active,generation_token,role FROM duplicate_keys "
-            "WHERE key=?1");
-        existing.bind(key, 1);
-        require(existing.row(), "duplicate key conflict row disappeared");
-        result.first_share_id = existing.integer(0);
-        result.already_active = existing.integer(1) == 1;
-        result.generation_token = existing.integer(2);
-        const DuplicateRole prior_role = parse_duplicate_role(existing.text(3));
-        if (prior_role != role && prior_role != DuplicateRole::both &&
-            role != DuplicateRole::both) {
-            Statement upgrade(
-                impl_->db,
-                "UPDATE duplicate_keys SET role='both' WHERE key=?1 AND role=?2");
-            upgrade.bind(key, 1);
-            upgrade.bind(duplicate_role_text(prior_role), 2);
-            upgrade.done();
+            "SELECT session_id,worker_id,closed_unix_us FROM connections WHERE id=?1");
+        connection.bind(*share.connection_id, 1);
+        require(connection.row(), "share connection does not exist");
+        require(connection.integer(0) == share.session_id,
+                "share session differs from its connection");
+        if (share.worker_id) {
+            require(!connection.is_null(1) &&
+                        connection.integer(1) == *share.worker_id,
+                    "share worker differs from its connection");
         }
-        else if (role == DuplicateRole::both && prior_role != DuplicateRole::both) {
-            Statement upgrade(
-                impl_->db,
-                "UPDATE duplicate_keys SET role='both' WHERE key=?1");
-            upgrade.bind(key, 1);
-            upgrade.done();
-        }
+        require(connection.is_null(2), "share connection is already closed");
     }
+
+    Statement round(impl_->db, "SELECT id FROM rounds WHERE state='open'");
+    require(round.row(), "share insert found no open round");
+    const std::int64_t round_id = round.integer(0);
+    require(!round.row(), "share insert found multiple open rounds");
+
+    require(impl_->next_transient_share_id !=
+                std::numeric_limits<std::int64_t>::min(),
+            "transient share ID space is exhausted");
+    const std::int64_t id = impl_->next_transient_share_id--;
+    const auto [iterator, inserted] = impl_->transient_shares.emplace(
+        id, StagedShare{
+                .value = share,
+                .round_id = round_id,
+                .verifier_ticket_dec = std::nullopt,
+                .verifier_seed_id_dec = std::nullopt,
+                .hashes = {},
+            });
+    (void)iterator;
+    require(inserted, "transient share ID collision");
+    if (share.height.has_value()) {
+        auto &max_height = impl_->pending_round_max_height[round_id];
+        max_height = std::max(
+            max_height, static_cast<std::int64_t>(*share.height));
+    }
+    impl_->pending_transient_shares.store(
+        static_cast<std::uint64_t>(impl_->transient_shares.size()),
+        std::memory_order_release);
+    return id;
+}
+
+PersistedShareIdentity Database::ensure_share_persisted(
+    std::int64_t share_id, std::string_view retention_reason)
+{
+    PriorityWriterLock lock(impl_->mutex);
+    require(impl_->valid_retention_reason(retention_reason),
+            "invalid share retention reason");
+    require(share_id != 0, "share ID must be nonzero");
+    if (share_id > 0) {
+        Statement update(
+            impl_->db,
+            "UPDATE shares SET retention_reason=CASE "
+            "WHEN retention_reason IS NULL OR "
+            "retention_reason='high_difficulty' THEN ?1 "
+            "ELSE retention_reason END WHERE id=?2");
+        update.bind(retention_reason, 1);
+        update.bind(share_id, 2);
+        update.done();
+        require(sqlite3_changes(impl_->db) == 1,
+                "persisted share does not exist");
+        Statement round(impl_->db, "SELECT round_id FROM shares WHERE id=?1");
+        round.bind(share_id, 1);
+        require(round.row(), "persisted share does not exist");
+        return {.share_id = share_id, .round_id = round.integer(0)};
+    }
+
+    if (const auto alias = impl_->persisted_share_aliases.find(share_id);
+        alias != impl_->persisted_share_aliases.end()) {
+        Statement update(
+            impl_->db,
+            "UPDATE shares SET retention_reason=CASE "
+            "WHEN retention_reason IS NULL OR "
+            "retention_reason='high_difficulty' THEN ?1 "
+            "ELSE retention_reason END WHERE id=?2");
+        update.bind(retention_reason, 1);
+        update.bind(alias->second.share_id, 2);
+        update.done();
+        require(sqlite3_changes(impl_->db) == 1,
+                "persisted alias target does not exist");
+        return alias->second;
+    }
+
+    const auto found = impl_->transient_shares.find(share_id);
+    require(found != impl_->transient_shares.end(),
+            "transient share does not exist");
+    Transaction transaction(impl_->db);
+    const std::int64_t persisted_id = impl_->insert_staged_share_unlocked(
+        found->second, retention_reason);
     transaction.commit();
-    return result;
+    const std::int64_t round_id = found->second.round_id;
+    impl_->erase_transient_share_unlocked(found);
+    const PersistedShareIdentity identity{
+        .share_id = persisted_id,
+        .round_id = round_id,
+    };
+    impl_->remember_persisted_share_alias(share_id, identity);
+    return identity;
 }
 
-bool Database::retire_duplicate(const DuplicateKey &key,
-                                std::int64_t generation_token,
-                                std::int64_t retired_unix_us)
+void Database::flush_accounting()
 {
     std::scoped_lock lock(impl_->mutex);
-    Statement statement(
-        impl_->db,
-        "UPDATE duplicate_keys SET active=0,retired_unix_us=?1 "
-        "WHERE key=?2 AND generation_token=?3 AND active=1");
-    statement.bind(retired_unix_us, 1);
-    statement.bind(key, 2);
-    statement.bind(generation_token, 3);
-    statement.done();
-    return sqlite3_changes(impl_->db) == 1;
-}
-
-std::vector<ActiveDuplicate> Database::load_active_duplicates() const
-{
-    std::scoped_lock lock(impl_->mutex);
-    Statement statement(
-        impl_->db,
-        "SELECT d.key,d.height,d.first_share_id,d.role,d.generation_token,"
-        "s.connection_id FROM duplicate_keys d "
-        "JOIN shares s ON s.id=d.first_share_id "
-        "WHERE d.active=1 ORDER BY d.height,d.first_share_id");
-    std::vector<ActiveDuplicate> result;
-    while (statement.row()) {
-        const auto height = statement.integer(1);
-        const auto source_id = statement.integer(5);
-        require(height > 0, "database contains an invalid duplicate height");
-        require(source_id > 0, "database contains an invalid duplicate source");
-        result.push_back(ActiveDuplicate{
-            .key = exact_array<48>(statement.blob(0), "duplicate key"),
-            .source_id = static_cast<std::uint64_t>(source_id),
-            .height = static_cast<std::uint64_t>(height),
-            .first_share_id = statement.integer(2),
-            .role = parse_duplicate_role(statement.text(3)),
-            .generation_token = statement.integer(4),
-        });
-    }
-    return result;
+    impl_->flush_accounting_transaction_unlocked();
 }
 
 CandidateJournalResult Database::journal_candidate(const CandidateJournal &candidate)
 {
     PriorityWriterLock lock(impl_->mutex);
-    require(candidate.first_share_id > 0 && candidate.job_id > 0 &&
-                candidate.connection_id > 0,
+    require(!candidate.first_share_id || *candidate.first_share_id > 0,
+            "candidate share correlation must be positive when present");
+    require(candidate.session_id > 0 && candidate.round_id > 0 &&
+                candidate.template_generation > 0 && candidate.connection_id > 0,
             "candidate references must be positive");
     require(candidate.height > 0, "candidate height must be positive");
     require_i64(candidate.height, "candidate height");
@@ -2281,32 +2638,85 @@ CandidateJournalResult Database::journal_candidate(const CandidateJournal &candi
     require(candidate.max_attempts >= 1 && candidate.max_attempts <= 4,
             "candidate max attempts is outside 1..4");
 
+    if (candidate.first_share_id) {
+        Statement origin(
+            impl_->db,
+            "SELECT session_id,round_id,connection_id,job_public_id,"
+            "template_generation,height FROM shares WHERE id=?1");
+        origin.bind(*candidate.first_share_id, 1);
+        require(origin.row(), "candidate share correlation does not exist");
+        require(origin.integer(0) == candidate.session_id &&
+                    origin.integer(1) == candidate.round_id &&
+                    !origin.is_null(2) &&
+                    origin.integer(2) == candidate.connection_id &&
+                    !origin.is_null(3) &&
+                    exact_array<16>(origin.blob(3), "candidate share job public ID") ==
+                        candidate.job_public_id &&
+                    !origin.is_null(4) &&
+                    origin.integer(4) == candidate.template_generation &&
+                    !origin.is_null(5) &&
+                    origin.integer(5) == static_cast<std::int64_t>(candidate.height),
+                "candidate snapshot differs from its share correlation");
+    }
+
+    impl_->flush_accounting_transaction_unlocked();
     Transaction transaction(impl_->db);
+    Statement existing_candidate(
+        impl_->db,
+        "SELECT 1 FROM candidates WHERE candidate_key=?1");
+    existing_candidate.bind(candidate.candidate_key, 1);
+    const bool already_journaled = existing_candidate.row();
+    if (!already_journaled) {
+        Statement origin_round(
+            impl_->db, "SELECT state FROM rounds WHERE id=?1");
+        origin_round.bind(candidate.round_id, 1);
+        require(origin_round.row(), "candidate origin round does not exist");
+        const std::string origin_state = origin_round.text(0);
+        require(origin_state == "open" || origin_state == "closed",
+                "candidate origin round has an invalid state");
+        if (origin_state != "open" ||
+            impl_->round_has_higher_share_height_unlocked(
+                candidate.round_id,
+                static_cast<std::int64_t>(candidate.height))) {
+            return CandidateJournalResult{
+                .candidate_id = 0,
+                .inserted = false,
+                .state = CandidateState::journaled,
+                .round_contaminated = true,
+            };
+        }
+    }
+
     Statement insert(
         impl_->db,
-        "INSERT INTO candidates(candidate_key,first_share_id,job_id,connection_id,"
-        "height,peer_family,peer_address,frozen_block_blob,miner_tx_hash,"
+        "INSERT INTO candidates(candidate_key,session_id,round_id,first_share_id,"
+        "job_public_id,template_generation,connection_id,height,peer_family,"
+        "peer_address,frozen_block_blob,miner_tx_hash,"
         "expected_block_id,state,max_attempts,created_unix_us,updated_unix_us) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'journaled',?11,?12,?12) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'journaled',?14,?15,?15) "
         "ON CONFLICT(candidate_key) DO NOTHING");
     insert.bind(candidate.candidate_key, 1);
-    insert.bind(candidate.first_share_id, 2);
-    insert.bind(candidate.job_id, 3);
-    insert.bind(candidate.connection_id, 4);
-    insert.bind(static_cast<std::int64_t>(candidate.height), 5);
-    insert.bind(candidate.peer_family, 6);
-    insert.bind(candidate.peer_address, 7);
-    insert.bind(candidate.frozen_block_blob, 8);
-    insert.bind(candidate.miner_tx_hash, 9);
-    insert.bind_optional(candidate.expected_block_id, 10);
-    insert.bind(static_cast<int>(candidate.max_attempts), 11);
-    insert.bind(candidate.created_unix_us, 12);
+    insert.bind(candidate.session_id, 2);
+    insert.bind(candidate.round_id, 3);
+    insert.bind_optional(candidate.first_share_id, 4);
+    insert.bind(candidate.job_public_id, 5);
+    insert.bind(candidate.template_generation, 6);
+    insert.bind(candidate.connection_id, 7);
+    insert.bind(static_cast<std::int64_t>(candidate.height), 8);
+    insert.bind(candidate.peer_family, 9);
+    insert.bind(candidate.peer_address, 10);
+    insert.bind(candidate.frozen_block_blob, 11);
+    insert.bind(candidate.miner_tx_hash, 12);
+    insert.bind_optional(candidate.expected_block_id, 13);
+    insert.bind(static_cast<int>(candidate.max_attempts), 14);
+    insert.bind(candidate.created_unix_us, 15);
     insert.done();
     const bool inserted = sqlite3_changes(impl_->db) == 1;
 
     Statement select(
         impl_->db,
-        "SELECT id,state,frozen_block_blob,miner_tx_hash FROM candidates "
+        "SELECT id,state,frozen_block_blob,miner_tx_hash,session_id,round_id,"
+        "job_public_id,template_generation,connection_id,height FROM candidates "
         "WHERE candidate_key=?1");
     select.bind(candidate.candidate_key, 1);
     require(select.row(), "candidate insert/conflict row disappeared");
@@ -2317,18 +2727,28 @@ CandidateJournalResult Database::journal_candidate(const CandidateJournal &candi
     require(exact_array<32>(select.blob(3), "candidate miner transaction hash") ==
                 candidate.miner_tx_hash,
             "candidate key collision has different miner transaction hash");
+    require(select.integer(4) == candidate.session_id &&
+                select.integer(5) == candidate.round_id &&
+                exact_array<16>(select.blob(6), "stored candidate job public ID") ==
+                    candidate.job_public_id &&
+                select.integer(7) == candidate.template_generation &&
+                select.integer(8) == candidate.connection_id &&
+                select.integer(9) == static_cast<std::int64_t>(candidate.height),
+            "candidate key collision has different snapshotted context");
 
-    Statement attach(
+    if (candidate.first_share_id) {
+      Statement attach(
         impl_->db,
         "UPDATE shares SET candidate_id=?1,candidate_admission="
         "CASE WHEN claimed_candidate=1 THEN ?2 ELSE candidate_admission END "
         "WHERE id=?3 AND (candidate_id IS NULL OR candidate_id=?1)");
     attach.bind(candidate_id, 1);
     attach.bind(inserted ? "admitted" : "existing", 2);
-    attach.bind(candidate.first_share_id, 3);
+    attach.bind(*candidate.first_share_id, 3);
     attach.done();
-    require(sqlite3_changes(impl_->db) == 1,
+      require(sqlite3_changes(impl_->db) == 1,
             "candidate share is absent or attached to another candidate");
+    }
 
     if (inserted) {
         Statement link(
@@ -2349,6 +2769,7 @@ CandidateJournalResult Database::journal_candidate(const CandidateJournal &candi
         .candidate_id = candidate_id,
         .inserted = inserted,
         .state = state,
+        .round_contaminated = false,
     };
 }
 
@@ -2366,6 +2787,7 @@ std::optional<CandidateJournalResult> Database::find_candidate_by_key(
         .candidate_id = statement.integer(0),
         .inserted = false,
         .state = parse_candidate_state(statement.text(1)),
+        .round_contaminated = false,
     };
 }
 
@@ -2468,6 +2890,7 @@ CandidateAttemptResult Database::finish_candidate_attempt(
     const CandidateAttemptCompletion &completion)
 {
     PriorityWriterLock lock(impl_->mutex);
+    impl_->flush_accounting_transaction_unlocked();
     require(candidate_id > 0, "candidate ID must be positive");
     require(attempt_number >= 1 && attempt_number <= 4,
             "candidate attempt number is outside 1..4");
@@ -2761,6 +3184,7 @@ CandidateReconciliationResult Database::finish_candidate_reconciliation(
     const CandidateReconciliationCompletion &completion)
 {
     PriorityWriterLock lock(impl_->mutex);
+    impl_->flush_accounting_transaction_unlocked();
     require(reconciliation_id > 0, "reconciliation ID must be positive");
     if (completion.observed_height.has_value()) {
         require_i64(*completion.observed_height,
@@ -2967,6 +3391,7 @@ bool Database::accept_candidate(std::int64_t candidate_id,
 {
     PriorityWriterLock lock(impl_->mutex);
     require(candidate_id > 0, "candidate ID must be positive");
+    impl_->flush_accounting_transaction_unlocked();
     Transaction transaction(impl_->db);
     const bool accepted = impl_->accept_candidate_in_transaction(
         candidate_id, accepted_unix_us, canonical_block_id, by_reconciliation);
@@ -2979,7 +3404,8 @@ std::vector<CandidateRecovery> Database::recoverable_candidates() const
     std::scoped_lock lock(impl_->mutex);
     Statement statement(
         impl_->db,
-        "SELECT id,candidate_key,first_share_id,job_id,connection_id,height,"
+        "SELECT id,candidate_key,first_share_id,round_id,job_public_id,"
+        "template_generation,connection_id,height,"
         "peer_family,peer_address,frozen_block_blob,miner_tx_hash,expected_block_id,"
         "state,attempt_count,max_attempts,had_indeterminate,"
         "reconciliation_cycle_count,created_unix_us,next_reconciliation_unix_us "
@@ -2991,30 +3417,32 @@ std::vector<CandidateRecovery> Database::recoverable_candidates() const
         CandidateRecovery value;
         value.candidate_id = statement.integer(0);
         value.candidate_key = exact_array<32>(statement.blob(1), "candidate key");
-        value.first_share_id = statement.integer(2);
-        value.job_id = statement.integer(3);
-        value.connection_id = statement.integer(4);
-        const std::int64_t height = statement.integer(5);
+        if (!statement.is_null(2)) value.first_share_id = statement.integer(2);
+        value.round_id = statement.integer(3);
+        value.job_public_id = exact_array<16>(statement.blob(4), "candidate job public ID");
+        value.template_generation = statement.integer(5);
+        value.connection_id = statement.integer(6);
+        const std::int64_t height = statement.integer(7);
         require(height > 0, "recovered candidate height is invalid");
         value.height = static_cast<std::uint64_t>(height);
-        value.peer_family = static_cast<int>(statement.integer(6));
-        value.peer_address = statement.blob(7);
-        value.frozen_block_blob = statement.blob(8);
-        value.miner_tx_hash = exact_array<32>(statement.blob(9),
+        value.peer_family = static_cast<int>(statement.integer(8));
+        value.peer_address = statement.blob(9);
+        value.frozen_block_blob = statement.blob(10);
+        value.miner_tx_hash = exact_array<32>(statement.blob(11),
                                               "candidate miner transaction hash");
-        if (!statement.is_null(10)) {
+        if (!statement.is_null(12)) {
             value.expected_block_id = exact_array<32>(
-                statement.blob(10), "candidate expected block ID");
+                statement.blob(12), "candidate expected block ID");
         }
-        value.state = parse_candidate_state(statement.text(11));
-        value.attempt_count = static_cast<std::uint32_t>(statement.integer(12));
-        value.max_attempts = static_cast<std::uint32_t>(statement.integer(13));
-        value.had_indeterminate = statement.integer(14) == 1;
+        value.state = parse_candidate_state(statement.text(13));
+        value.attempt_count = static_cast<std::uint32_t>(statement.integer(14));
+        value.max_attempts = static_cast<std::uint32_t>(statement.integer(15));
+        value.had_indeterminate = statement.integer(16) == 1;
         value.reconciliation_cycle_count =
-            static_cast<std::uint32_t>(statement.integer(15));
-        value.created_unix_us = statement.integer(16);
-        if (!statement.is_null(17)) {
-            value.next_reconciliation_unix_us = statement.integer(17);
+            static_cast<std::uint32_t>(statement.integer(17));
+        value.created_unix_us = statement.integer(18);
+        if (!statement.is_null(19)) {
+            value.next_reconciliation_unix_us = statement.integer(19);
         }
         result.push_back(std::move(value));
     }
@@ -3042,7 +3470,7 @@ ShareAcceptanceResult Database::accept_share(
 ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
 {
     PriorityWriterLock lock(impl_->mutex);
-    require(acceptance.share_id > 0, "share ID must be positive");
+    require(acceptance.share_id != 0, "share ID must be nonzero");
     require_uint128(acceptance.assigned_difficulty_dec,
                     "assigned difficulty", false);
     require(acceptance.completed_unix_us >= 0, "share completion time is negative");
@@ -3068,26 +3496,69 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
     require_timing(acceptance.verifier_hash_ns, "verifier hash time");
     require_timing(acceptance.verifier_total_ns, "verifier total time");
 
+    std::int64_t effective_share_id = acceptance.share_id;
+    if (effective_share_id < 0) {
+        const auto found = impl_->transient_shares.find(effective_share_id);
+        require(found != impl_->transient_shares.end(), "transient share does not exist");
+        StagedShare &staged = found->second;
+        require(staged.value.status == "received" || staged.value.status == "verifying",
+                "transient share is already terminal");
+        if (staged.value.assigned_difficulty_dec) {
+            require(*staged.value.assigned_difficulty_dec == acceptance.assigned_difficulty_dec,
+                    "accepted difficulty differs from staged share assignment");
+        }
+        require(staged.value.provenance == "pending" ||
+                    staged.value.provenance == to_string(acceptance.source),
+                "share provenance conflicts with active accounting mode");
+        if (!impl_->meets_persistence_threshold(acceptance.actual_difficulty_dec)) {
+            const std::int64_t round_id = staged.round_id;
+            impl_->record_share_total_unlocked("accepted", to_string(acceptance.source),
+                                               acceptance.completed_unix_us);
+            impl_->record_work_unlocked(staged, acceptance);
+            impl_->erase_transient_share_unlocked(found);
+            if (impl_->pending_accounting_items.load(std::memory_order_acquire) >= 4096) {
+                impl_->flush_accounting_transaction_unlocked();
+            }
+            return {
+                .accepted = true,
+                .round_id = round_id,
+                .event_id = 0,
+                .persisted_share_id = 0,
+            };
+        }
+        impl_->flush_accounting_transaction_unlocked();
+        const std::int64_t transient_alias = effective_share_id;
+        const std::int64_t promoted_round_id = staged.round_id;
+        Transaction promote(impl_->db);
+        effective_share_id = impl_->insert_staged_share_unlocked(staged, "high_difficulty");
+        promote.commit();
+        impl_->erase_transient_share_unlocked(found);
+        impl_->remember_persisted_share_alias(
+            transient_alias, PersistedShareIdentity{effective_share_id,
+                                                     promoted_round_id});
+    }
+    else {
+        impl_->flush_accounting_transaction_unlocked();
+    }
+
     Transaction transaction(impl_->db);
     Statement share(
         impl_->db,
-        "SELECT s.status,s.connection_id,s.worker_id,s.job_id,"
-        "s.assigned_difficulty_dec,s.provenance,c.session_id,j.template_id,"
-        "s.round_id,s.network_difficulty_dec,j.network_difficulty_dec,"
-        "j.assigned_difficulty_dec "
-        "FROM shares s JOIN connections c ON c.id=s.connection_id "
-        "LEFT JOIN private_jobs j ON j.id=s.job_id WHERE s.id=?1");
-    share.bind(acceptance.share_id, 1);
+        "SELECT status,connection_id,worker_id,job_public_id,"
+        "assigned_difficulty_dec,provenance,session_id,template_generation,"
+        "round_id,network_difficulty_dec FROM shares WHERE id=?1");
+    share.bind(effective_share_id, 1);
     require(share.row(), "share does not exist");
     const std::string prior_status = share.text(0);
-    const std::int64_t connection_id = share.integer(1);
+    std::optional<std::int64_t> connection_id;
+    if (!share.is_null(1)) connection_id = share.integer(1);
     std::optional<std::int64_t> worker_id;
     if (!share.is_null(2)) {
         worker_id = share.integer(2);
     }
-    std::optional<std::int64_t> job_id;
+    std::optional<PublicId> job_public_id;
     if (!share.is_null(3)) {
-        job_id = share.integer(3);
+        job_public_id = exact_array<16>(share.blob(3), "share job public ID");
     }
     if (!share.is_null(4)) {
         require(share.text(4) == acceptance.assigned_difficulty_dec,
@@ -3095,27 +3566,24 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
     }
     const std::string prior_provenance = share.text(5);
     const std::int64_t session_id = share.integer(6);
-    std::optional<std::int64_t> template_id;
+    std::optional<std::int64_t> template_generation;
     if (!share.is_null(7)) {
-        template_id = share.integer(7);
+        template_generation = share.integer(7);
     }
     const std::int64_t round_id = share.integer(8);
     require(!share.is_null(9),
             "accepted share has no snapshotted network difficulty");
     const std::string network_difficulty = share.text(9);
     require_uint128(network_difficulty, "share network difficulty", false);
-    if (!share.is_null(10)) {
-        require(share.text(10) == network_difficulty,
-                "share network difficulty differs from its private job");
-    }
-    if (!share.is_null(11)) {
-        require(share.text(11) == acceptance.assigned_difficulty_dec,
-                "accepted difficulty differs from the private job assignment");
-    }
 
     if (prior_status != "received" && prior_status != "verifying") {
         transaction.commit();
-        return ShareAcceptanceResult{};
+        return ShareAcceptanceResult{
+            .accepted = false,
+            .round_id = round_id,
+            .event_id = 0,
+            .persisted_share_id = effective_share_id,
+        };
     }
     require(prior_provenance == "pending" ||
                 prior_provenance == to_string(acceptance.source),
@@ -3149,25 +3617,31 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
         update.bind(static_cast<std::int64_t>(*acceptance.verifier_total_ns), 9);
     }
     else update.bind_null(9);
-    update.bind(acceptance.share_id, 10);
+    update.bind(effective_share_id, 10);
     update.done();
     if (sqlite3_changes(impl_->db) == 0) {
         transaction.commit();
-        return ShareAcceptanceResult{};
+        return ShareAcceptanceResult{
+            .accepted = false,
+            .round_id = round_id,
+            .event_id = 0,
+            .persisted_share_id = effective_share_id,
+        };
     }
 
     const std::int64_t second_utc = acceptance.completed_unix_us / 1'000'000;
     impl_->add_bucket_unlocked("global", 0, second_utc,
                                acceptance.assigned_difficulty_dec,
                                acceptance.source);
-    impl_->add_bucket_unlocked("connection", connection_id, second_utc,
-                               acceptance.assigned_difficulty_dec,
-                               acceptance.source);
+    if (connection_id) impl_->add_bucket_unlocked("connection", *connection_id, second_utc,
+                                                   acceptance.assigned_difficulty_dec,
+                                                   acceptance.source);
     if (worker_id.has_value()) {
         impl_->add_bucket_unlocked("worker", *worker_id, second_utc,
                                    acceptance.assigned_difficulty_dec,
                                    acceptance.source);
     }
+    const bool pruned_hashrate = impl_->prune_hashrate_unlocked(second_utc);
 
     Statement round(
         impl_->db,
@@ -3200,6 +3674,8 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
     update_round.done();
     require(sqlite3_changes(impl_->db) == 1,
             "assigned round changed during share acceptance");
+    impl_->add_share_total_unlocked("accepted", to_string(acceptance.source),
+                                    acceptance.completed_unix_us);
 
     const std::int64_t event_id = impl_->insert_event_unlocked(EventInsert{
         .session_id = session_id,
@@ -3207,9 +3683,9 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
         .type = "share_result",
         .connection_id = connection_id,
         .worker_id = worker_id,
-        .template_id = template_id,
-        .job_id = job_id,
-        .share_id = acceptance.share_id,
+        .template_generation = template_generation,
+        .job_public_id = job_public_id,
+        .share_id = effective_share_id,
         .candidate_id = std::nullopt,
         .round_id = round_id,
         .payload_json = std::string(kEmptyPayload),
@@ -3219,10 +3695,14 @@ ShareAcceptanceResult Database::accept_share(const ShareAcceptance &acceptance)
             round_id, acceptance.completed_unix_us);
     }
     transaction.commit();
+    if (pruned_hashrate) {
+        impl_->last_hashrate_prune_second = second_utc;
+    }
     return ShareAcceptanceResult{
         .accepted = true,
         .round_id = round_id,
         .event_id = event_id,
+        .persisted_share_id = effective_share_id,
     };
 }
 
@@ -3366,8 +3846,8 @@ std::int64_t Database::create_ban(const BanInsert &ban)
             .type = "ban_created",
             .connection_id = std::nullopt,
             .worker_id = std::nullopt,
-            .template_id = std::nullopt,
-            .job_id = std::nullopt,
+            .template_generation = std::nullopt,
+            .job_public_id = std::nullopt,
             .share_id = std::nullopt,
             .candidate_id = std::nullopt,
             .round_id = std::nullopt,
@@ -3405,8 +3885,8 @@ std::vector<ActiveBan> Database::load_active_bans(std::int64_t now_unix_us)
                     .type = "ban_expired",
                     .connection_id = std::nullopt,
                     .worker_id = std::nullopt,
-                    .template_id = std::nullopt,
-                    .job_id = std::nullopt,
+                    .template_generation = std::nullopt,
+                    .job_public_id = std::nullopt,
                     .share_id = std::nullopt,
                     .candidate_id = std::nullopt,
                     .round_id = std::nullopt,
@@ -3469,8 +3949,8 @@ std::uint64_t Database::expire_bans(std::int64_t now_unix_us,
                     .type = "ban_expired",
                     .connection_id = std::nullopt,
                     .worker_id = std::nullopt,
-                    .template_id = std::nullopt,
-                    .job_id = std::nullopt,
+                    .template_generation = std::nullopt,
+                    .job_public_id = std::nullopt,
                     .share_id = std::nullopt,
                     .candidate_id = std::nullopt,
                     .round_id = std::nullopt,
@@ -3578,6 +4058,31 @@ CandidateVerdictResult Database::record_candidate_verdict(
                 disposition = CandidateVerdictDisposition::suppressed;
             }
         }
+    }
+    else {
+        Statement evidence(
+            impl_->db,
+            "SELECT s.connection_id,c.peer_family,c.peer_address FROM shares s "
+            "JOIN connections c ON c.id=s.connection_id WHERE s.id=?1");
+        evidence.bind(verdict.share_id, 1);
+        require(evidence.row(),
+                "candidate verdict share has no durable peer evidence");
+        const std::string abuse_kind =
+            verdict.kind == CandidateVerdictKind::false_candidate
+                ? "verified_false_candidate"
+                : "candidate_mismatch";
+        abuse_event_id = impl_->insert_abuse_event_unlocked(AbuseEventInsert{
+            .connection_id = evidence.integer(0),
+            .share_id = verdict.share_id,
+            .candidate_id = std::nullopt,
+            .peer_family = static_cast<int>(evidence.integer(1)),
+            .peer_address = evidence.blob(2),
+            .kind = abuse_kind,
+            .weight = 1,
+            .created_unix_us = verdict.created_unix_us,
+            .detail = std::nullopt,
+        });
+        disposition = CandidateVerdictDisposition::actionable;
     }
 
     const char *disposition_text = "pending";
@@ -3767,9 +4272,19 @@ void Database::mark_share_verifying(std::int64_t share_id,
                                     std::string_view verifier_seed_id_dec)
 {
     std::scoped_lock lock(impl_->mutex);
-    require(share_id > 0, "share ID must be positive");
+    require(share_id != 0, "share ID must be nonzero");
     require_uint64_decimal(verifier_ticket_dec, "verifier ticket", false);
     require_uint64_decimal(verifier_seed_id_dec, "verifier seed ID", false);
+    if (share_id < 0) {
+        auto found = impl_->transient_shares.find(share_id);
+        require(found != impl_->transient_shares.end(), "transient share does not exist");
+        require(found->second.value.status == "received",
+                "share changed while marking verifier admission");
+        found->second.value.status = "verifying";
+        found->second.verifier_ticket_dec = std::string(verifier_ticket_dec);
+        found->second.verifier_seed_id_dec = std::string(verifier_seed_id_dec);
+        return;
+    }
     Statement statement(
         impl_->db,
         "UPDATE shares SET status='verifying',verifier_ticket_dec=?1,"
@@ -3786,7 +4301,13 @@ void Database::set_share_height_is_older(std::int64_t share_id,
                                          bool height_is_older)
 {
     PriorityWriterLock lock(impl_->mutex);
-    require(share_id > 0, "share ID must be positive");
+    require(share_id != 0, "share ID must be nonzero");
+    if (share_id < 0) {
+        auto found = impl_->transient_shares.find(share_id);
+        require(found != impl_->transient_shares.end(), "transient share does not exist");
+        found->second.value.height_is_older = height_is_older;
+        return;
+    }
     Statement statement(
         impl_->db,
         "UPDATE shares SET height_is_older=?1 WHERE id=?2 "
@@ -3804,8 +4325,21 @@ void Database::insert_share_hash(std::int64_t share_id, std::string_view role,
                                  std::optional<bool> network_target)
 {
     PriorityWriterLock lock(impl_->mutex);
-    require(share_id > 0, "share ID must be positive");
+    require(share_id != 0, "share ID must be nonzero");
     require(role == "claimed" || role == "computed", "invalid share hash role");
+    if (share_id < 0) {
+        auto found = impl_->transient_shares.find(share_id);
+        require(found != impl_->transient_shares.end(), "transient share does not exist");
+        auto [it, inserted] = found->second.hashes.emplace(
+            std::string(role), StagedShareHash{hash, share_target, network_target});
+        if (!inserted) {
+            require(it->second.hash == hash &&
+                        it->second.meets_share_target == share_target &&
+                        it->second.meets_network_target == network_target,
+                    "share hash role was staged with another value");
+        }
+        return;
+    }
     Transaction transaction(impl_->db);
     Statement statement(
         impl_->db,
@@ -3844,11 +4378,11 @@ void Database::insert_share_hash(std::int64_t share_id, std::string_view role,
     transaction.commit();
 }
 
-bool Database::finalize_share(std::int64_t share_id,
-                              const ShareFinalization &value)
+ShareFinalizationResult Database::finalize_share(
+    std::int64_t share_id, const ShareFinalization &value)
 {
     PriorityWriterLock lock(impl_->mutex);
-    require(share_id > 0, "share ID must be positive");
+    require(share_id != 0, "share ID must be nonzero");
     static constexpr std::array<std::string_view, 10> terminal{
         "stale", "duplicate", "low_difficulty", "invalid_result", "unknown_job",
         "malformed", "unauthenticated", "server_busy", "verifier_failed", "cancelled"};
@@ -3881,6 +4415,41 @@ bool Database::finalize_share(std::int64_t share_id,
     if (value.verifier_total_ns) {
         require_i64(*value.verifier_total_ns, "verifier total time");
     }
+    if (share_id < 0) {
+        auto found = impl_->transient_shares.find(share_id);
+        require(found != impl_->transient_shares.end(), "transient share does not exist");
+        if (!impl_->meets_persistence_threshold(value.actual_difficulty_dec)) {
+            const std::int64_t round_id = found->second.round_id;
+            impl_->record_share_total_unlocked(value.status, value.provenance,
+                                               value.completed_unix_us);
+            impl_->erase_transient_share_unlocked(found);
+            if (impl_->pending_accounting_items.load(std::memory_order_acquire) >= 4096) {
+                impl_->flush_accounting_transaction_unlocked();
+            }
+            Transaction finalize_round(impl_->db);
+            (void)impl_->try_finalize_round_unlocked(
+                round_id, value.completed_unix_us);
+            finalize_round.commit();
+            return {
+                .finalized = true,
+                .persisted_share_id = 0,
+            };
+        }
+        impl_->flush_accounting_transaction_unlocked();
+        const std::int64_t transient_alias = share_id;
+        const std::int64_t promoted_round_id = found->second.round_id;
+        Transaction promote(impl_->db);
+        share_id = impl_->insert_staged_share_unlocked(found->second,
+                                                       "high_difficulty");
+        promote.commit();
+        impl_->erase_transient_share_unlocked(found);
+        impl_->remember_persisted_share_alias(
+            transient_alias,
+            PersistedShareIdentity{share_id, promoted_round_id});
+    }
+    else {
+        impl_->flush_accounting_transaction_unlocked();
+    }
     Transaction transaction(impl_->db);
     Statement update(
         impl_->db,
@@ -3910,10 +4479,8 @@ bool Database::finalize_share(std::int64_t share_id,
     if (changed) {
         Statement context(
             impl_->db,
-            "SELECT c.session_id,s.connection_id,s.worker_id,p.template_id,s.job_id,"
-            "s.candidate_id,s.round_id FROM shares s "
-            "JOIN connections c ON c.id=s.connection_id "
-            "LEFT JOIN private_jobs p ON p.id=s.job_id WHERE s.id=?1");
+            "SELECT session_id,connection_id,worker_id,template_generation,"
+            "job_public_id,candidate_id,round_id FROM shares WHERE id=?1");
         context.bind(share_id, 1);
         require(context.row(), "finalized share context disappeared");
         const std::int64_t round_id = context.integer(6);
@@ -3921,24 +4488,30 @@ bool Database::finalize_share(std::int64_t share_id,
             .session_id = context.integer(0),
             .created_unix_us = value.completed_unix_us,
             .type = "share_result",
-            .connection_id = context.integer(1),
+            .connection_id = context.is_null(1) ? std::nullopt
+                                                : std::optional<std::int64_t>(context.integer(1)),
             .worker_id = context.is_null(2) ? std::nullopt
                                             : std::optional<std::int64_t>(context.integer(2)),
-            .template_id = context.is_null(3) ? std::nullopt
-                                              : std::optional<std::int64_t>(context.integer(3)),
-            .job_id = context.is_null(4) ? std::nullopt
-                                         : std::optional<std::int64_t>(context.integer(4)),
+            .template_generation = context.is_null(3) ? std::nullopt
+                                                       : std::optional<std::int64_t>(context.integer(3)),
+            .job_public_id = context.is_null(4) ? std::nullopt
+                : std::optional<PublicId>(exact_array<16>(context.blob(4), "share job public ID")),
             .share_id = share_id,
             .candidate_id = context.is_null(5) ? std::nullopt
                                                : std::optional<std::int64_t>(context.integer(5)),
             .round_id = round_id,
             .payload_json = std::string(kEmptyPayload),
         });
+        impl_->add_share_total_unlocked(value.status, value.provenance,
+                                        value.completed_unix_us);
         (void)impl_->try_finalize_round_unlocked(
             round_id, value.completed_unix_us);
     }
     transaction.commit();
-    return changed;
+    return {
+        .finalized = changed,
+        .persisted_share_id = share_id,
+    };
 }
 
 void Database::set_candidate_admission(std::int64_t share_id,
@@ -3949,6 +4522,13 @@ void Database::set_candidate_admission(std::int64_t share_id,
         "not_candidate", "admitted", "deferred", "existing", "trusted_rate_limited"};
     require(std::find(allowed.begin(), allowed.end(), admission) != allowed.end(),
             "invalid candidate admission");
+    require(share_id != 0, "share ID must be nonzero");
+    if (share_id < 0) {
+        auto found = impl_->transient_shares.find(share_id);
+        require(found != impl_->transient_shares.end(), "transient share does not exist");
+        found->second.value.candidate_admission = std::string(admission);
+        return;
+    }
     Statement update(impl_->db,
                      "UPDATE shares SET candidate_admission=?1 WHERE id=?2");
     update.bind(admission, 1);

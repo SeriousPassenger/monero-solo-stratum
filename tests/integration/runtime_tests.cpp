@@ -38,6 +38,15 @@ namespace monero_solo::detail {
 using JobPostCommitFaultHook = void (*)();
 void set_job_post_commit_fault_hook_for_testing(
     JobPostCommitFaultHook hook) noexcept;
+using ShareBeforeInsertHook = void (*)();
+void set_share_before_insert_hook_for_testing(
+    ShareBeforeInsertHook hook) noexcept;
+using CandidateBeforeBoundaryHook = void (*)();
+void set_candidate_before_boundary_hook_for_testing(
+    CandidateBeforeBoundaryHook hook) noexcept;
+using DeferredConnectionCloseHook = void (*)();
+void set_deferred_connection_close_hook_for_testing(
+    DeferredConnectionCloseHook hook) noexcept;
 
 } // namespace monero_solo::detail
 
@@ -578,7 +587,7 @@ monero_solo::Config config_for(const MockDaemon &daemon,
                                const std::filesystem::path &database)
 {
     const Json document = {
-        {"schema_version", 1},
+        {"schema_version", 2},
         {"network", "mainnet"},
         {"wallet_address", kWalletAddress},
         {"blocknotify", nullptr},
@@ -629,6 +638,52 @@ void throw_after_job_commit()
     throw std::runtime_error("injected post-commit job handoff failure");
 }
 
+std::atomic<bool> share_insert_hook_entered{};
+std::atomic<bool> share_insert_hook_release{};
+std::atomic<unsigned> candidate_boundary_hook_calls{};
+std::atomic<bool> candidate_boundary_hook_entered{};
+std::atomic<bool> candidate_boundary_hook_release{};
+std::atomic<bool> deferred_close_hook_entered{};
+
+void block_before_share_insert()
+{
+    share_insert_hook_entered.store(true, std::memory_order_release);
+    while (!share_insert_hook_release.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(1ms);
+    }
+}
+
+void block_first_candidate_before_boundary()
+{
+    if (candidate_boundary_hook_calls.fetch_add(
+            1U, std::memory_order_acq_rel) != 0U) {
+        return;
+    }
+    candidate_boundary_hook_entered.store(true, std::memory_order_release);
+    while (!candidate_boundary_hook_release.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(1ms);
+    }
+}
+
+void observe_deferred_connection_close()
+{
+    deferred_close_hook_entered.store(true, std::memory_order_release);
+}
+
+class ShareHookReset final {
+public:
+    ~ShareHookReset()
+    {
+        share_insert_hook_release.store(true, std::memory_order_release);
+        candidate_boundary_hook_release.store(true, std::memory_order_release);
+        monero_solo::detail::set_share_before_insert_hook_for_testing(nullptr);
+        monero_solo::detail::set_candidate_before_boundary_hook_for_testing(
+            nullptr);
+        monero_solo::detail::set_deferred_connection_close_hook_for_testing(
+            nullptr);
+    }
+};
+
 void test_same_height_poll_refresh()
 {
     MockDaemon daemon;
@@ -640,6 +695,7 @@ void test_same_height_poll_refresh()
         daemon, stratum_port, api_port, database.path());
     const std::string log_path = database.path().string() + ".jsonl";
     config.daemon.poll_interval_ms = 1000;
+    config.stratum.job_ttl_ms = 1000;
     config.logging.level = "trace";
     config.logging.file = log_path;
     config.logging.include_private_job_entropy = false;
@@ -689,8 +745,12 @@ void test_same_height_poll_refresh()
                     "same-height poll did not send a job notification");
             return notification.at("params");
         };
-        const Json first_refreshed = read_job(first.socket.get());
-        const Json second_refreshed = read_job(second.socket.get());
+        Json first_refreshed;
+        Json second_refreshed;
+        for (unsigned refresh = 0; refresh < 7U; ++refresh) {
+            first_refreshed = read_job(first.socket.get());
+            second_refreshed = read_job(second.socket.get());
+        }
         first_refreshed_job_id =
             first_refreshed.at("job_id").get<std::string>();
         second_refreshed_job_id =
@@ -735,30 +795,63 @@ void test_same_height_poll_refresh()
                     accepted.at("result").at("status") == "OK",
                 "prior same-height job was not retained as valid work");
 
+        daemon.publish_successor();
+        Json successor;
+        do {
+            successor = read_job(first.socket.get());
+        } while (successor.at("height") == kHeight);
+        require(successor.at("height") == kHeight + 1U,
+                "successor height was not queued to the connection");
+        const Json retired_submit = {
+            {"id", "retired-lower-height-job"},
+            {"jsonrpc", "2.0"},
+            {"method", "submit"},
+            {"params", {{"id", first_connection_id},
+                        {"job_id", first_initial_job_id},
+                        {"nonce", "05060708"},
+                        {"result", ordinary_claimed_hash},
+                        {"algo", "rx/0"}}},
+        };
+        send_all(first.socket.get(), retired_submit.dump() + "\n");
+        Json retired_response;
+        for (unsigned attempt = 0; attempt < 16U; ++attempt) {
+            Json message = Json::parse(read_line(first.socket.get()));
+            if (message.contains("id") && message.at("id").is_string() &&
+                message.at("id") == "retired-lower-height-job") {
+                retired_response = std::move(message);
+                break;
+            }
+        }
+        require(!retired_response.is_null() &&
+                    retired_response.at("result").is_null() &&
+                    retired_response.at("error").at("message") ==
+                        "Unknown job",
+                "lower-height job survived a queued successor");
+
         first.socket.reset();
         second.socket.reset();
         runtime.stop();
     }
 
-    require(daemon.calls("getblocktemplate") >= 2U,
-            "same-height fixture did not execute a polling refresh");
+    require(daemon.calls("getblocktemplate") >= 8U,
+            "same-height fixture did not exercise repeated poll refreshes");
     require(sqlite_scalar(
                 database.path(),
-                "SELECT count(*) FROM public_templates") >= 2,
-            "same-height polling did not persist another generation");
+                "SELECT count(*) FROM sqlite_master WHERE type='table' "
+                "AND name IN ('public_templates','private_jobs')") == 0,
+            "runtime unexpectedly persisted transient templates/jobs");
     require(sqlite_scalar(
                 database.path(),
-                "SELECT count(DISTINCT height) FROM public_templates") == 1 &&
-                sqlite_scalar(
-                    database.path(),
-                    "SELECT count(DISTINCT blocktemplate_blob) "
-                    "FROM public_templates") == 1,
-            "same-height fixture did not remain byte-identical");
-    require(sqlite_scalar(
-                database.path(),
-                "SELECT count(*) FROM shares WHERE status='accepted' "
-                "AND height_is_older=0") == 1,
-            "prior same-height share was persisted as stale");
+                "SELECT sum(share_count) FROM share_totals "
+                "WHERE status='accepted'") == 1 &&
+                sqlite_scalar(database.path(),
+                              "SELECT count(*) FROM shares "
+                              "WHERE status='accepted'") == 0,
+            "prior same-height share was not compactly accounted");
+    require(sqlite_scalar(database.path(),
+                          "SELECT max(last_sent_height) FROM connections") ==
+                static_cast<std::int64_t>(kHeight + 1U),
+            "queued successor height was not durably recorded");
 
     const std::map<std::string, std::string> expected_jobs{
         {first_initial_job_id, first_connection_id},
@@ -850,8 +943,9 @@ void test_idle_entropy_maintenance_keeps_job_issuance_ready()
     }
 
     require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM private_jobs") == 1,
-            "idle entropy fixture did not persist the returning miner job");
+                          "SELECT count(*) FROM sqlite_master WHERE type='table' "
+                          "AND name='private_jobs'") == 0,
+            "idle entropy fixture unexpectedly persisted a private job");
     if (const auto failure = daemon.failure(); failure.has_value()) {
         throw std::runtime_error("mock daemon failure: " + *failure);
     }
@@ -900,19 +994,227 @@ void test_post_commit_job_rollback()
     monero_solo::detail::set_job_post_commit_fault_hook_for_testing(nullptr);
 
     require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM private_jobs") == 1,
-            "post-commit fault did not exercise a durable private job");
-    require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM private_jobs "
-                          "WHERE retired_unix_us IS NULL") == 0,
-            "post-commit fault stranded an active durable private job");
-    require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM duplicate_keys WHERE active=1") == 0,
-            "post-commit fault leaked durable duplicate ownership");
+                          "SELECT count(*) FROM sqlite_master WHERE type='table' "
+                          "AND name IN ('private_jobs','duplicate_keys')") == 0,
+            "post-commit fault recreated removed durable transient tables");
     require(sqlite_scalar(database.path(),
                           "SELECT count(*) FROM server_sessions "
                           "WHERE clean_shutdown=0 AND stopped_unix_us IS NOT NULL") == 1,
             "post-commit job fault was incorrectly recorded as a clean session");
+}
+
+void test_disconnect_during_submit_defers_connection_close()
+{
+    MockDaemon daemon;
+    TemporaryDatabase database("disconnect-mid-submit");
+    const std::uint16_t stratum_port = unused_tcp_port();
+    std::uint16_t api_port = unused_tcp_port();
+    while (api_port == stratum_port) api_port = unused_tcp_port();
+    monero_solo::Config config = config_for(
+        daemon, stratum_port, api_port, database.path());
+
+    monero_solo::Runtime runtime(config);
+    runtime.start();
+    require(runtime.running() && runtime.ready(),
+            "disconnect-race runtime did not become ready");
+
+    share_insert_hook_entered.store(false, std::memory_order_release);
+    share_insert_hook_release.store(false, std::memory_order_release);
+    deferred_close_hook_entered.store(false, std::memory_order_release);
+    monero_solo::detail::set_share_before_insert_hook_for_testing(
+        &block_before_share_insert);
+    monero_solo::detail::set_deferred_connection_close_hook_for_testing(
+        &observe_deferred_connection_close);
+    ShareHookReset reset_hooks;
+
+    LoggedInClient miner = login_client(stratum_port);
+    const Json &login = miner.response.at("result");
+    const Json submit = {
+        {"id", "disconnect-mid-submit"},
+        {"jsonrpc", "2.0"},
+        {"method", "submit"},
+        {"params", {{"id", login.at("id")},
+                    {"job_id", login.at("job").at("job_id")},
+                    {"nonce", "0a0b0c0d"},
+                    {"result", std::string(48, 'f') +
+                                   "feffffffffffffff"},
+                    {"algo", "rx/0"}}},
+    };
+    send_all(miner.socket.get(), submit.dump() + "\n");
+    for (unsigned wait = 0;
+         wait < 400U &&
+         !share_insert_hook_entered.load(std::memory_order_acquire);
+         ++wait) {
+        std::this_thread::sleep_for(5ms);
+    }
+    require(share_insert_hook_entered.load(std::memory_order_acquire),
+            "share worker did not reach the disconnect-race barrier");
+
+    miner.socket.reset();
+    for (unsigned wait = 0;
+         wait < 400U &&
+         !deferred_close_hook_entered.load(std::memory_order_acquire);
+         ++wait) {
+        std::this_thread::sleep_for(5ms);
+    }
+    require(deferred_close_hook_entered.load(std::memory_order_acquire),
+            "connection close was not deferred while its submit was active");
+    require(sqlite_scalar(database.path(),
+                          "SELECT count(*) FROM connections "
+                          "WHERE closed_unix_us IS NULL") == 1,
+            "connection was durably closed before its submit completed");
+
+    share_insert_hook_release.store(true, std::memory_order_release);
+    for (unsigned wait = 0; wait < 400U; ++wait) {
+        if (sqlite_scalar(database.path(),
+                          "SELECT coalesce(sum(share_count),0) "
+                          "FROM share_totals WHERE status='accepted'") == 1 &&
+            sqlite_scalar(database.path(),
+                          "SELECT count(*) FROM connections "
+                          "WHERE closed_unix_us IS NOT NULL") == 1) {
+            break;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    require(sqlite_scalar(database.path(),
+                          "SELECT coalesce(sum(share_count),0) "
+                          "FROM share_totals WHERE status='accepted'") == 1 &&
+                sqlite_scalar(database.path(),
+                              "SELECT count(*) FROM shares") == 0 &&
+                sqlite_scalar(database.path(),
+                              "SELECT count(*) FROM connections "
+                              "WHERE closed_unix_us IS NOT NULL") == 1 &&
+                runtime.running() && runtime.ready(),
+            "disconnect-mid-submit did not finalize accounting before close");
+
+    runtime.stop();
+}
+
+void test_late_candidate_journal_refuses_closed_origin_round()
+{
+    MockDaemon daemon;
+    TemporaryDatabase database("candidate-closed-origin");
+    const std::uint16_t stratum_port = unused_tcp_port();
+    std::uint16_t api_port = unused_tcp_port();
+    while (api_port == stratum_port) api_port = unused_tcp_port();
+    monero_solo::Config config = config_for(
+        daemon, stratum_port, api_port, database.path());
+    config.stratum.submit_workers = 2;
+    config.daemon.poll_interval_ms = 100;
+
+    monero_solo::Runtime runtime(config);
+    runtime.start();
+    require(runtime.running() && runtime.ready(),
+            "candidate-boundary runtime did not become ready");
+
+    ShareHookReset reset_hooks;
+    candidate_boundary_hook_calls.store(0U, std::memory_order_release);
+    candidate_boundary_hook_entered.store(false, std::memory_order_release);
+    candidate_boundary_hook_release.store(false, std::memory_order_release);
+    monero_solo::detail::set_candidate_before_boundary_hook_for_testing(
+        &block_first_candidate_before_boundary);
+
+    LoggedInClient delayed = login_client(
+        stratum_port, {}, "closed-origin-delayed/1");
+    LoggedInClient winner = login_client(
+        stratum_port, {}, "closed-origin-winner/1");
+    const Json &delayed_login = delayed.response.at("result");
+    const Json &winner_login = winner.response.at("result");
+    const Json delayed_submit = {
+        {"id", "closed-origin-delayed"},
+        {"jsonrpc", "2.0"},
+        {"method", "submit"},
+        {"params", {{"id", delayed_login.at("id")},
+                    {"job_id", delayed_login.at("job").at("job_id")},
+                    {"nonce", "11111111"},
+                    {"result", std::string(64, '0')},
+                    {"algo", "rx/0"}}},
+    };
+    send_all(delayed.socket.get(), delayed_submit.dump() + "\n");
+    for (unsigned wait = 0;
+         wait < 400U &&
+         !candidate_boundary_hook_entered.load(std::memory_order_acquire);
+         ++wait) {
+        std::this_thread::sleep_for(5ms);
+    }
+    require(candidate_boundary_hook_entered.load(std::memory_order_acquire),
+            "delayed candidate did not reach the pre-boundary barrier");
+
+    const Json winner_submit = {
+        {"id", "closed-origin-winner"},
+        {"jsonrpc", "2.0"},
+        {"method", "submit"},
+        {"params", {{"id", winner_login.at("id")},
+                    {"job_id", winner_login.at("job").at("job_id")},
+                    {"nonce", "22222222"},
+                    {"result", std::string(64, '0')},
+                    {"algo", "rx/0"}}},
+    };
+    send_all(winner.socket.get(), winner_submit.dump() + "\n");
+    Json winner_response;
+    for (unsigned frame = 0; frame < 32U; ++frame) {
+        Json message = Json::parse(read_line(winner.socket.get()));
+        if (message.value("id", std::string{}) == "closed-origin-winner") {
+            winner_response = std::move(message);
+            break;
+        }
+        require(message.value("method", std::string{}) == "job",
+                "unexpected frame before candidate winner response");
+    }
+    require(!winner_response.is_null() &&
+                winner_response.at("error").is_null() &&
+                winner_response.at("result").at("status") == "OK",
+            "candidate winner did not receive ordinary share credit");
+
+    for (unsigned wait = 0;
+         wait < 400U &&
+         sqlite_scalar(database.path(),
+                       "SELECT count(*) FROM rounds WHERE state='closed'") != 1;
+         ++wait) {
+        std::this_thread::sleep_for(5ms);
+    }
+    require(sqlite_scalar(database.path(),
+                          "SELECT count(*) FROM rounds WHERE state='closed'") == 1 &&
+                daemon.calls("submitblock") == 1U && !runtime.ready(),
+            "candidate winner did not close its origin round exactly once");
+
+    daemon.publish_successor();
+    for (unsigned wait = 0; wait < 400U && !runtime.ready(); ++wait) {
+        std::this_thread::sleep_for(5ms);
+    }
+    require(runtime.ready(),
+            "successor template did not release the accepted-height fence");
+
+    candidate_boundary_hook_release.store(true, std::memory_order_release);
+    Json delayed_response;
+    for (unsigned frame = 0; frame < 32U; ++frame) {
+        Json message = Json::parse(read_line(delayed.socket.get()));
+        if (message.value("id", std::string{}) == "closed-origin-delayed") {
+            delayed_response = std::move(message);
+            break;
+        }
+        require(message.value("method", std::string{}) == "job",
+                "unexpected frame before delayed candidate response");
+    }
+    require(!delayed_response.is_null() &&
+                delayed_response.at("result").is_null() &&
+                delayed_response.at("error").at("message") == "Stale share",
+            "candidate from a closed origin round was not refused as stale");
+    require(candidate_boundary_hook_calls.load(std::memory_order_acquire) >= 2U &&
+                daemon.calls("submitblock") == 1U &&
+                sqlite_scalar(database.path(),
+                              "SELECT count(*) FROM candidates") == 1 &&
+                sqlite_scalar(database.path(),
+                              "SELECT count(*) FROM candidate_attempts") == 1 &&
+                sqlite_scalar(database.path(),
+                              "SELECT count(*) FROM shares WHERE status='stale' "
+                              "AND candidate_id IS NULL") == 1 &&
+                runtime.running() && runtime.ready(),
+            "closed-origin refusal was not atomic and side-effect free");
+
+    delayed.socket.reset();
+    winner.socket.reset();
+    runtime.stop();
 }
 
 void test_verified_share_debug_jsonl()
@@ -940,6 +1242,7 @@ void test_verified_share_debug_jsonl()
 
     const std::string claimed_hash(64, 'f');
     std::string job_id;
+    std::string connection_public_id;
     {
         monero_solo::Runtime runtime(config);
         runtime.start();
@@ -949,14 +1252,14 @@ void test_verified_share_debug_jsonl()
         LoggedInClient miner = login_client(
             stratum_port, {}, "runtime-verified-test/1");
         const Json &login_result = miner.response.at("result");
-        const std::string connection_id =
+        connection_public_id =
             login_result.at("id").get<std::string>();
         job_id = login_result.at("job").at("job_id").get<std::string>();
         const Json submit = {
             {"id", "verified-mismatch"},
             {"jsonrpc", "2.0"},
             {"method", "submit"},
-            {"params", {{"id", connection_id}, {"job_id", job_id},
+            {"params", {{"id", connection_public_id}, {"job_id", job_id},
                         {"nonce", "0a0b0c0d"}, {"result", claimed_hash},
                         {"algo", "rx/0"}}},
         };
@@ -969,6 +1272,8 @@ void test_verified_share_debug_jsonl()
         runtime.stop();
     }
 
+    const std::string expected_submission_id = connection_public_id + ":1";
+    std::size_t matching_receipts = 0;
     std::size_t matching_completions = 0;
     {
         std::ifstream input(log_path);
@@ -977,17 +1282,28 @@ void test_verified_share_debug_jsonl()
         std::string encoded;
         while (std::getline(input, encoded)) {
             const Json record = Json::parse(encoded);
-            if (record.at("code") != "share.completed") continue;
             const Json &fields = record.at("fields");
             if (fields.value("job_public_id", std::string{}) != job_id ||
-                fields.value("claimed_hash", std::string{}) != claimed_hash ||
+                fields.value("claimed_hash", std::string{}) != claimed_hash) {
+                continue;
+            }
+            if (record.at("code") == "share.received") {
+                ++matching_receipts;
+                require(fields.at("submission_id") == expected_submission_id &&
+                            !fields.contains("share_id"),
+                        "transient share receipt correlation is ambiguous");
+                continue;
+            }
+            if (record.at("code") != "share.completed" ||
                 fields.value("status", std::string{}) != "invalid_result") {
                 continue;
             }
             ++matching_completions;
             require(fields.at("provenance") == "verified" &&
                         fields.at("reason_code") == "hash_mismatch" &&
-                        fields.at("credited_difficulty") == "0",
+                        fields.at("credited_difficulty") == "0" &&
+                        fields.at("submission_id") == expected_submission_id &&
+                        !fields.contains("share_id"),
                     "verified completion classification fields are wrong");
 
             const std::string actual =
@@ -1010,7 +1326,7 @@ void test_verified_share_debug_jsonl()
                     "verified completion computed hash is malformed");
 
             for (const std::string_view name : {
-                     "connection_id", "job_id", "template_id", "share_id",
+                     "connection_id", "job_id", "template_id",
                      "height", "duration_us", "verifier_queue_ns",
                      "verifier_hash_ns", "verifier_total_ns"}) {
                 require(fields.at(name).is_number_unsigned(),
@@ -1019,9 +1335,8 @@ void test_verified_share_debug_jsonl()
             require(fields.at("connection_id").get<std::uint64_t>() != 0U &&
                         fields.at("job_id").get<std::uint64_t>() != 0U &&
                         fields.at("template_id").get<std::uint64_t>() != 0U &&
-                        fields.at("share_id").get<std::uint64_t>() != 0U &&
                         fields.at("height") == kHeight,
-                    "verified completion durable correlation IDs are wrong");
+                    "verified completion correlation IDs are wrong");
             const auto queue_ns =
                 fields.at("verifier_queue_ns").get<std::uint64_t>();
             const auto hash_ns =
@@ -1035,13 +1350,15 @@ void test_verified_share_debug_jsonl()
                     "verified share completion leaked private job entropy");
         }
     }
-    require(matching_completions == 1U,
-            "verified mismatch completion JSONL record was not unique");
+    require(matching_receipts == 1U && matching_completions == 1U,
+            "verified mismatch JSONL correlation records were not unique");
     require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM shares "
+                          "SELECT sum(share_count) FROM share_totals "
                           "WHERE status='invalid_result' "
-                          "AND provenance='verified'") == 1,
-            "verified mismatch was not persisted exactly once");
+                          "AND provenance='verified'") == 1 &&
+                sqlite_scalar(database.path(),
+                              "SELECT count(*) FROM shares") == 0,
+            "verified mismatch was not compactly accounted exactly once");
     require(sqlite_scalar(database.path(),
                           "SELECT count(*) FROM candidates") == 0,
             "verified noncandidate mismatch created a candidate");
@@ -1121,16 +1438,22 @@ void test_runtime_end_to_end()
 
         const HttpResult shares = http_get(
             api_port, "/v1/shares?status=accepted&limit=10");
-        require(shares.status == 200 && shares.document.at("data").size() == 1U,
-                "accepted share was not visible through the API");
-        const Json &share = shares.document.at("data").at(0);
-        require(share.at("status") == "accepted" &&
-                    share.at("provenance") == "claimed" &&
-                    share.at("claimed_hash") == ordinary_claimed_hash &&
-                    share.at("claimed_meets_share_target") == true &&
-                    share.at("claimed_meets_network_target") == false &&
-                    share.at("credited_difficulty") == "1",
-                "persisted trusted share fields were wrong");
+        require(shares.status == 200 && shares.document.at("data").empty(),
+                "sub-threshold ordinary share was individually retained");
+        HttpResult compact;
+        for (unsigned attempt = 0; attempt < 100U; ++attempt) {
+            compact = http_get(api_port, "/v1/summary");
+            if (compact.status == 200 &&
+                compact.document.at("data").at("shares").at("accepted") ==
+                    "1") {
+                break;
+            }
+            std::this_thread::sleep_for(20ms);
+        }
+        require(compact.status == 200 &&
+                    compact.document.at("data").at("shares").at("accepted") ==
+                        "1",
+                "sub-threshold ordinary share was not compactly accounted");
 
         const auto submit_candidate = [&](std::string_view request_id,
                                           std::string_view claimed_hash) {
@@ -1209,12 +1532,9 @@ void test_runtime_end_to_end()
                 "runtime did not stop cleanly");
     }
     require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM duplicate_keys WHERE active=1") == 0,
-            "clean job retirement leaked an active durable duplicate key");
-    require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM private_jobs "
-                          "WHERE retired_unix_us IS NULL") == 0,
-            "clean shutdown left a private job active");
+                          "SELECT count(*) FROM sqlite_master WHERE type='table' "
+                          "AND name IN ('private_jobs','duplicate_keys')") == 0,
+            "clean shutdown recreated removed transient tables");
     require(sqlite_scalar(database.path(),
                           "SELECT count(*) FROM connections "
                           "WHERE closed_unix_us IS NULL") == 0,
@@ -1229,9 +1549,9 @@ void test_runtime_end_to_end()
                 "runtime did not become ready after restart");
         const HttpResult recovered = http_get(
             api_port, "/v1/shares?status=accepted&limit=10");
-        require(recovered.status == 200 && recovered.document.at("data").size() == 2U &&
+        require(recovered.status == 200 && recovered.document.at("data").size() == 1U &&
                     recovered.document.at("data").at(0).at("job_id") == first_job_id,
-                "persisted accepted share was not recovered after restart");
+                "retained candidate share was not recovered after restart");
         LoggedInClient miner = login_client(
             stratum_port, configured_secret, configured_secret);
         second_connection_public_id =
@@ -1249,6 +1569,14 @@ void test_runtime_end_to_end()
     bool saw_second_job = false;
     bool saw_share_received = false;
     bool saw_share_completed = false;
+    bool saw_candidate_received = false;
+    bool saw_candidate_journaled = false;
+    bool saw_candidate_completed = false;
+    std::uint64_t candidate_share_id = 0;
+    const std::string ordinary_submission_id =
+        first_connection_public_id + ":1";
+    const std::string candidate_submission_id =
+        first_connection_public_id + ":2";
     {
         std::ifstream input(log_path);
         require(static_cast<bool>(input), "runtime JSONL log was not created");
@@ -1298,7 +1626,10 @@ void test_runtime_end_to_end()
                 fields.value("claimed_hash", std::string{}) == ordinary_claimed_hash) {
                 require(fields.at("nonce") == "01020304" &&
                             fields.at("job_public_id") == first_job_id &&
-                            fields.at("assigned_difficulty") == "1",
+                            fields.at("assigned_difficulty") == "1" &&
+                            fields.at("submission_id") ==
+                                ordinary_submission_id &&
+                            !fields.contains("share_id"),
                         "share admission debug record is not correlated");
                 saw_share_received = true;
             }
@@ -1307,16 +1638,49 @@ void test_runtime_end_to_end()
                 fields.value("status", std::string{}) == "accepted") {
                 require(fields.at("provenance") == "claimed" &&
                             fields.at("credited_difficulty") == "1" &&
-                            fields.at("job_public_id") == first_job_id,
+                            fields.at("job_public_id") == first_job_id &&
+                            fields.at("submission_id") ==
+                                ordinary_submission_id &&
+                            !fields.contains("share_id"),
                         "share completion debug record is not correlated");
                 saw_share_completed = true;
+            }
+            if (code == "share.received" &&
+                fields.value("claimed_hash", std::string{}) ==
+                    std::string(64, '0')) {
+                require(fields.at("submission_id") == candidate_submission_id &&
+                            !fields.contains("share_id"),
+                        "candidate receipt exposed a transient share ID");
+                saw_candidate_received = true;
+            }
+            if (code == "candidate.journaled" &&
+                fields.value("submission_id", std::string{}) ==
+                    candidate_submission_id) {
+                require(fields.at("share_id").is_number_unsigned() &&
+                            fields.at("share_id").get<std::uint64_t>() != 0U,
+                        "candidate journal omitted its durable share ID");
+                candidate_share_id =
+                    fields.at("share_id").get<std::uint64_t>();
+                saw_candidate_journaled = true;
+            }
+            if (code == "share.completed" &&
+                fields.value("claimed_hash", std::string{}) ==
+                    std::string(64, '0') &&
+                fields.value("status", std::string{}) == "accepted") {
+                require(fields.at("submission_id") == candidate_submission_id &&
+                            fields.at("share_id").is_number_unsigned() &&
+                            fields.at("share_id").get<std::uint64_t>() ==
+                                candidate_share_id,
+                        "candidate completion changed durable correlation IDs");
+                saw_candidate_completed = true;
             }
         }
         require(complete_log.find(configured_secret) == std::string::npos,
                 "runtime JSONL log leaked a configured secret");
     }
     require(saw_first_job && saw_second_job && saw_share_received &&
-                saw_share_completed,
+                saw_share_completed && saw_candidate_received &&
+                saw_candidate_journaled && saw_candidate_completed,
             "runtime JSONL omitted detailed job/share diagnostic records");
     for (const std::string_view code : {
              "runtime.starting", "verifier.disabled", "daemon.ready",
@@ -1342,12 +1706,12 @@ void test_runtime_end_to_end()
                           "WHERE clean_shutdown=1 AND stopped_unix_us IS NOT NULL") == 2,
             "clean shutdown was not persisted for both sessions");
     require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM public_templates") == 3,
-            "startup/successor templates were not durably persisted");
-    require(sqlite_scalar(database.path(),
                           "SELECT count(*) FROM shares WHERE status='accepted' "
-                          "AND provenance='claimed'") == 2,
-            "trusted accepted share did not survive restart");
+                          "AND provenance='claimed'") == 1 &&
+                sqlite_scalar(database.path(),
+                              "SELECT sum(share_count) FROM share_totals "
+                              "WHERE status='accepted'") == 2,
+            "selective trusted-share persistence/accounting is wrong");
     require(sqlite_scalar(database.path(),
                           "SELECT count(*) FROM candidates") == 1 &&
                 sqlite_scalar(database.path(),
@@ -1355,9 +1719,6 @@ void test_runtime_end_to_end()
                 sqlite_scalar(database.path(),
                               "SELECT count(*) FROM shares WHERE status='duplicate'") == 1,
             "trusted frozen-candidate replay was not journaled idempotently");
-    require(sqlite_scalar(database.path(),
-                          "SELECT count(*) FROM duplicate_keys WHERE active=1") == 0,
-            "restart leaked an ordinary durable duplicate key");
 
     TemporaryDatabase rejected_database("rejected");
     daemon.reject_template(true);
@@ -1375,8 +1736,8 @@ void test_runtime_end_to_end()
     require(mismatch_rejected,
             "runtime accepted a daemon prev_hash/template mismatch");
     require(sqlite_scalar(rejected_database.path(),
-                          "SELECT count(*) FROM public_templates") == 0,
-            "rejected template was persisted as valid");
+                          "SELECT count(*) FROM shares") == 0,
+            "rejected template created share state");
     require(sqlite_scalar(rejected_database.path(),
                           "SELECT count(*) FROM server_sessions "
                           "WHERE clean_shutdown=0 AND stopped_unix_us IS NOT NULL") == 1,
@@ -1402,8 +1763,8 @@ void test_runtime_end_to_end()
             require(rejected_status,
                     "runtime accepted a daemon result without status");
             require(sqlite_scalar(fault_database.path(),
-                                  "SELECT count(*) FROM public_templates") == 0,
-                    "status-invalid template was persisted as valid");
+                                  "SELECT count(*) FROM shares") == 0,
+                    "status-invalid template created share state");
         };
     require_missing_status_rejected("get_info", "missing-info-status");
     require_missing_status_rejected("getblocktemplate", "missing-template-status");
@@ -1424,6 +1785,8 @@ int main()
         test_same_height_poll_refresh();
         test_idle_entropy_maintenance_keeps_job_issuance_ready();
         test_post_commit_job_rollback();
+        test_disconnect_during_submit_defers_connection_close();
+        test_late_candidate_journal_refuses_closed_origin_round();
         test_verified_share_debug_jsonl();
         test_runtime_end_to_end();
         std::cout << "runtime integration tests passed\n";
