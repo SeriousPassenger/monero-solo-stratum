@@ -20,6 +20,20 @@ struct EntropyConfig {
     std::uint32_t max_generate_calls{1048576};
 };
 
+enum class EntropyReseedReason : std::uint8_t {
+    none,
+    timed,
+    fork,
+};
+
+struct EntropyMaintenanceResult {
+    bool attempted{};
+    bool succeeded{};
+    bool issuance_allowed{};
+    bool degraded{};
+    EntropyReseedReason reason{EntropyReseedReason::none};
+};
+
 class EntropyManager final {
 public:
     using Clock = std::chrono::steady_clock;
@@ -41,6 +55,7 @@ public:
     [[nodiscard]] Id16 generate_id(std::string_view additional_domain);
     [[nodiscard]] Id16 private_template_entropy();
     [[nodiscard]] Id16 private_job_id();
+    [[nodiscard]] EntropyMaintenanceResult maintain();
 
     [[nodiscard]] bool degraded() const;
     [[nodiscard]] bool issuance_allowed() const;
@@ -52,7 +67,8 @@ private:
     void reseed_locked(std::array<std::uint8_t, 32> &sample,
                        std::string_view reason);
     void mandatory_reseed_locked(std::string_view reason);
-    void try_timed_reseed_locked(Clock::time_point now);
+    [[nodiscard]] bool try_timed_reseed_locked(Clock::time_point now);
+    [[nodiscard]] bool issuance_allowed_locked(Clock::time_point now) const;
     [[nodiscard]] Clock::time_point now() const;
     [[nodiscard]] pid_t pid() const;
 

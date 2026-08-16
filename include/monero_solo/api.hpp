@@ -136,7 +136,7 @@ struct SqliteApiDataSourceOptions {
     SqliteApiDataSourceOptions options);
 
 struct ApiIdentity {
-    std::string version{"0.1.0"};
+    std::string version{"unknown"};
     std::string git_commit{"0000000000000000000000000000000000000000"};
     std::string session_id{"00000000000000000000000000000000"};
     std::int64_t started_unix_us{};

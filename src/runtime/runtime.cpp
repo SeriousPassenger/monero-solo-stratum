@@ -1,4 +1,5 @@
 #include "monero_solo/runtime.hpp"
+#include "monero_solo/build_version.hpp"
 #include "monero_solo/share_policy.hpp"
 
 #include "monero_solo/util.hpp"
@@ -1143,7 +1144,7 @@ std::optional<StratumJob> Runtime::make_job(const MinerConnection &connection) {
             const auto worker = worker_ids_.find(connection.public_id);
             if (worker != worker_ids_.end()) worker_id = worker->second;
         }
-        if (!snapshot || connection_id <= 0 || !entropy_.issuance_allowed()) {
+        if (!snapshot || connection_id <= 0) {
             return std::nullopt;
         }
         const std::int64_t created = unix_time_us();
@@ -1416,6 +1417,7 @@ std::optional<StratumJob> Runtime::make_job(const MinerConnection &connection) {
                 if (retired_job) retire_job_context(retired_job, created);
                 emit("job_derived", {{"height", context->height}},
                      connection_id, database_id);
+                update_readiness();
                 return job;
             }
             catch (const DatabaseError &) {
@@ -3354,6 +3356,51 @@ void Runtime::template_loop(std::stop_token token) noexcept {
     }
 }
 
+void Runtime::entropy_loop(std::stop_token token) noexcept {
+    bool previously_allowed = entropy_.issuance_allowed();
+    while (!token.stop_requested()) {
+        try {
+            const EntropyMaintenanceResult result = entropy_.maintain();
+            if (result.attempted) {
+                const std::string_view reason =
+                    result.reason == EntropyReseedReason::fork ? "fork" : "timed";
+                logger_.log(
+                    result.succeeded ? logging::Severity::info
+                                     : logging::Severity::warning,
+                    result.succeeded ? "entropy.reseed_succeeded"
+                                     : "entropy.reseed_failed",
+                    {{logging::PublicStringKey::component, "entropy"},
+                     {logging::PublicStringKey::reason_code, reason},
+                     {logging::PublicStringKey::state,
+                      result.succeeded
+                          ? "ready"
+                          : result.issuance_allowed ? "degraded" : "unavailable"}});
+            }
+            if (previously_allowed && !result.issuance_allowed) {
+                logger_.log(
+                    logging::Severity::warning, "entropy.issuance_blocked",
+                    {{logging::PublicStringKey::component, "entropy"},
+                     {logging::PublicStringKey::reason_code,
+                      "maximum_reseed_age_exceeded"},
+                     {logging::PublicStringKey::state, "unavailable"}});
+            }
+            previously_allowed = result.issuance_allowed;
+        }
+        catch (...) {
+            previously_allowed = false;
+            logger_.log(
+                logging::Severity::warning, "entropy.reseed_failed",
+                {{logging::PublicStringKey::component, "entropy"},
+                 {logging::PublicStringKey::reason_code, "fork"},
+                 {logging::PublicStringKey::state, "unavailable"}});
+        }
+        update_readiness();
+        for (unsigned tick = 0; tick < 20U && !token.stop_requested(); ++tick) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+}
+
 void Runtime::committed_event_loop(std::stop_token token) noexcept {
     std::int64_t last = event_stream_start_id_;
     for (;;) {
@@ -4005,6 +4052,8 @@ void Runtime::start() {
                                         {"message", error.what()}});
             }
         }
+        entropy_thread_ = std::jthread(
+            [this](std::stop_token token) { entropy_loop(token); });
         template_thread_ = std::jthread(
             [this](std::stop_token token) { template_loop(token); });
         startup_complete_.store(true, std::memory_order_release);
@@ -4055,6 +4104,9 @@ void Runtime::stop_locked() noexcept {
     // while the completion mailbox, verifier, and daemon are still live.
     if (stratum_) stratum_->stop();
     stratum_operational_.store(false, std::memory_order_release);
+    if (entropy_thread_.joinable()) {
+        entropy_thread_.request_stop(); entropy_thread_.join();
+    }
     {
         std::lock_guard lock(state_mutex_);
         const bool verification_waiters_drained = std::all_of(

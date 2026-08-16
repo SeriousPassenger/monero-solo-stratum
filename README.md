@@ -70,10 +70,30 @@ ctest --test-dir build-package --output-on-failure
 DESTDIR="$PWD/package-root" cmake --install build-package
 ```
 
-For a committed release, pass the exact lowercase revision at configure time,
-for example `-DMSS_GIT_COMMIT="$(git rev-parse HEAD)"`. The safe default is
-forty zeroes, which explicitly identifies an uncommitted source tree instead
-of mislabeling local work as its starting snapshot.
+Git checkouts derive a human build revision and exact provenance automatically.
+The version is SemVer with build metadata, for example `0.1.1+rev.18`, where
+`18` is `git rev-list --count HEAD`; the separate 40-hex commit remains the
+exact source identity. Tracked local changes are reported as `.dirty` and use
+the all-zero commit rather than claiming that the binary matches `HEAD`.
+Automatic revisioning requires a full, non-shallow history.
+
+`monero-solo-stratum --version` also reports the UTC binary build time. It
+honors `SOURCE_DATE_EPOCH` from the `cmake --build` environment, so release and
+distribution builds can remain reproducible. Git-free package builds may set
+all provenance inputs explicitly:
+
+```sh
+cmake -S . -B build-package \
+  -DMSS_GIT_COMMIT=0123456789abcdef0123456789abcdef01234567 \
+  -DMSS_BUILD_REVISION=18 \
+  -DMSS_BUILD_TIMESTAMP="2026-08-17 00:00:00 UTC"
+```
+
+With no Git metadata or explicit overrides, the honest fallback is
+`0.1.1+rev.0.unknown` with an all-zero commit.
+
+The exact output is a five-line identity block containing the version, build
+time, copyright, MIT license, and canonical GitHub source URL.
 
 The supplied source archive contains dereferenced copies of every dependency;
 OpenSSL, libcurl, the compiler, and CMake remain system prerequisites. The

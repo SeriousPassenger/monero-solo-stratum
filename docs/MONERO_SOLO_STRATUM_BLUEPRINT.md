@@ -2562,7 +2562,7 @@ There are no POST, PUT, PATCH, or DELETE control endpoints in v1.
   "generated_at": "2026-08-12T05:30:00.000000Z",
   "data": {
     "server": {
-      "version": "0.1.0",
+      "version": "0.1.1+rev.123",
       "git_commit": "0123456789abcdef0123456789abcdef01234567",
       "session_id": "0123456789abcdef0123456789abcdef",
       "started_at": "2026-08-11T05:30:00.000000Z",

@@ -802,6 +802,61 @@ void test_same_height_poll_refresh()
     }
 }
 
+void test_idle_entropy_maintenance_keeps_job_issuance_ready()
+{
+    MockDaemon daemon;
+    TemporaryDatabase database("idle-entropy-maintenance");
+    const std::uint16_t stratum_port = unused_tcp_port();
+    std::uint16_t api_port = unused_tcp_port();
+    while (api_port == stratum_port) api_port = unused_tcp_port();
+    monero_solo::Config config = config_for(
+        daemon, stratum_port, api_port, database.path());
+    config.entropy.reseed_interval_seconds = 1;
+    config.entropy.max_reseed_age_seconds = 1;
+
+    {
+        monero_solo::Runtime runtime(config);
+        runtime.start();
+        require(runtime.running() && runtime.ready(),
+                "idle-entropy runtime did not become ready");
+
+        // No miner is connected and the daemon poll is five minutes away.
+        // The old implementation expired here permanently because only job
+        // generation attempted a timed reseed, while make_job rejected the
+        // first returning miner before generation could run.
+        std::this_thread::sleep_for(1500ms);
+        HttpResult ready;
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        do {
+            ready = http_get(api_port, "/v1/health/ready");
+            if (ready.status == 200) break;
+            std::this_thread::sleep_for(50ms);
+        } while (std::chrono::steady_clock::now() < deadline);
+        require(ready.status == 200 &&
+                    ready.document.at("data").at("ready") == true &&
+                    ready.document.at("data").at("components")
+                        .at("entropy").at("ready") == true,
+                "idle entropy maintenance did not preserve readiness");
+        require(daemon.calls("getblocktemplate") == 1U,
+                "idle entropy test accidentally relied on a template poll");
+
+        LoggedInClient miner = login_client(
+            stratum_port, {}, "idle-entropy-returning-miner/1");
+        require(miner.response.at("result").at("job").at("job_id")
+                    .get<std::string>().size() == 32U,
+                "returning miner did not receive a private job");
+        miner.socket.reset();
+        runtime.stop();
+    }
+
+    require(sqlite_scalar(database.path(),
+                          "SELECT count(*) FROM private_jobs") == 1,
+            "idle entropy fixture did not persist the returning miner job");
+    if (const auto failure = daemon.failure(); failure.has_value()) {
+        throw std::runtime_error("mock daemon failure: " + *failure);
+    }
+}
+
 void test_post_commit_job_rollback()
 {
     MockDaemon daemon;
@@ -1367,6 +1422,7 @@ int main()
 {
     try {
         test_same_height_poll_refresh();
+        test_idle_entropy_maintenance_keeps_job_issuance_ready();
         test_post_commit_job_rollback();
         test_verified_share_debug_jsonl();
         test_runtime_end_to_end();
