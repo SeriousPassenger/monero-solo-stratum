@@ -42,7 +42,7 @@ Example success and error envelopes:
 {
   "schema_version": 1,
   "generated_at": "2026-08-12T05:30:00.000000Z",
-  "data": {"alive": true, "version": "0.1.0", "uptime_seconds": 30}
+  "data": {"alive": true, "version": "0.1.1+rev.123", "uptime_seconds": 30}
 }
 ```
 
@@ -205,7 +205,7 @@ database when replacing a schema-1 test installation.
   "generated_at": "2026-08-12T05:30:00.000000Z",
   "data": {
     "server": {
-      "version": "0.1.0",
+      "version": "0.1.1+rev.123",
       "git_commit": "b1f1e365d7ab344ca5ca7f3334fdfbea5da7f9fd",
       "session_id": "0123456789abcdef0123456789abcdef",
       "started_at": "2026-08-12T05:00:00.000000Z",

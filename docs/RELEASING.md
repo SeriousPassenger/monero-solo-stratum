@@ -1,5 +1,23 @@
 # Reproducible source release
 
+## Version and provenance
+
+Release versions follow SemVer. Bug fixes increment PATCH, so this change is
+`0.1.1`; backward-compatible features increment MINOR, and incompatible
+configuration, protocol, persistence, or API changes increment MAJOR.
+
+A Git build appends the automatically derived full-history counter as SemVer
+build metadata (`0.1.1+rev.N`). The 40-hex commit remains a separate exact
+provenance field rather than serving as the human version. Release CI must use
+a full checkout (`fetch-depth: 0`). Tag the reviewed merged commit, not a PR
+head, with an annotated or signed `v0.1.1` tag.
+
+The embedded UTC build timestamp is derived at binary build time and honors
+`SOURCE_DATE_EPOCH` exported for each `cmake --build` invocation. Record that
+epoch with published artifacts. Git-free builds must pass `MSS_GIT_COMMIT`,
+`MSS_BUILD_REVISION`, and `MSS_BUILD_TIMESTAMP` explicitly when exact
+provenance is required.
+
 Release archives are produced from a frozen source tree with the checked-in
 tools under `scripts/`. They require Bash, GNU tar, gzip, GNU coreutils and
 findutils, and Python 3.10 or newer. The application build remains completely

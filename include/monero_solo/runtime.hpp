@@ -78,6 +78,7 @@ private:
     [[nodiscard]] std::optional<verifier::Completion> wait_verification(
         std::uint64_t share_id);
     void template_loop(std::stop_token token) noexcept;
+    void entropy_loop(std::stop_token token) noexcept;
     [[nodiscard]] bool wait_for_zmq_tip_change(std::stop_token token);
     void candidate_loop(std::stop_token token) noexcept;
     void committed_event_loop(std::stop_token token) noexcept;
@@ -163,6 +164,7 @@ private:
     mutable std::mutex candidate_boundary_mutex_;
     std::map<std::int64_t, std::uint64_t> unresolved_candidate_heights_;
     std::optional<std::uint64_t> accepted_candidate_height_fence_;
+    std::jthread entropy_thread_;
     std::jthread template_thread_;
     std::jthread committed_event_thread_;
 };

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(monero-solo-stratum VERSION 0.1.0 LANGUAGES C CXX)
+project(monero-solo-stratum VERSION 0.1.1 LANGUAGES C CXX)
 
 include(CTest)
 include(GNUInstallDirs)
@@ -8,15 +8,39 @@ include(GNUInstallDirs)
 option(MSS_BUILD_TESTS "Build the monero-solo-stratum test suite" ON)
 option(MSS_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(MSS_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
-set(MSS_GIT_COMMIT "0000000000000000000000000000000000000000" CACHE STRING
-    "Exact commit for runtime provenance; all zeroes means an uncommitted source tree")
+set(MSS_GIT_COMMIT "AUTO" CACHE STRING
+    "Exact commit for runtime provenance, AUTO, or forty zeroes for unknown source")
+set(MSS_BUILD_REVISION "AUTO" CACHE STRING
+    "Human build revision, or AUTO for the full Git history commit count")
+set(MSS_BUILD_TIMESTAMP "AUTO" CACHE STRING
+    "UTC build timestamp, or AUTO (honors SOURCE_DATE_EPOCH)")
 set(MSS_SYSTEMD_UNIT_DIR "lib/systemd/system" CACHE PATH
     "Install destination for the systemd service unit")
-string(LENGTH "${MSS_GIT_COMMIT}" MSS_GIT_COMMIT_LENGTH)
-if(NOT MSS_GIT_COMMIT_LENGTH EQUAL 40 OR
-   NOT MSS_GIT_COMMIT MATCHES "^[0-9a-f]+$")
-    message(FATAL_ERROR "MSS_GIT_COMMIT must be exactly 40 lowercase hexadecimal characters")
+
+find_package(Git QUIET)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git" AND NOT Git_FOUND)
+    message(FATAL_ERROR "Git is required to derive source provenance")
 endif()
+if(NOT MSS_GIT_COMMIT STREQUAL "AUTO")
+    string(LENGTH "${MSS_GIT_COMMIT}" MSS_GIT_COMMIT_LENGTH)
+    if(NOT MSS_GIT_COMMIT_LENGTH EQUAL 40 OR
+       NOT MSS_GIT_COMMIT MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR
+            "MSS_GIT_COMMIT must be AUTO or exactly 40 lowercase hexadecimal characters")
+    endif()
+endif()
+if(NOT MSS_BUILD_REVISION STREQUAL "AUTO" AND
+   NOT MSS_BUILD_REVISION MATCHES "^(0|[1-9][0-9]*)$")
+    message(FATAL_ERROR
+        "MSS_BUILD_REVISION must be AUTO or a nonnegative integer without leading zeroes")
+endif()
+if(NOT MSS_BUILD_TIMESTAMP STREQUAL "AUTO" AND
+   NOT MSS_BUILD_TIMESTAMP MATCHES
+   "^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] UTC$")
+    message(FATAL_ERROR
+        "MSS_BUILD_TIMESTAMP must be AUTO or YYYY-MM-DD HH:MM:SS UTC")
+endif()
+message(STATUS "Build version and timestamp will be resolved at build time")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -44,7 +68,6 @@ endforeach()
 # binary and documentation. Flattened release archives have no .git metadata;
 # their complete dependency bytes are instead covered by SHA256SUMS.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-    find_package(Git REQUIRED)
     function(mss_require_git_revision relative_path expected_revision)
         execute_process(
             COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
@@ -90,6 +113,30 @@ find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 
+set(MSS_GENERATED_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(MSS_BUILD_VERSION_HEADER
+    "${MSS_GENERATED_INCLUDE_DIR}/monero_solo/build_version.hpp")
+set(MSS_BUILD_TIMESTAMP_HEADER
+    "${MSS_GENERATED_INCLUDE_DIR}/monero_solo/build_timestamp.hpp")
+add_custom_target(mss_build_info ALL
+    COMMAND "${CMAKE_COMMAND}"
+        "-DMSS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DMSS_VERSION_BASE=${PROJECT_VERSION}"
+        "-DMSS_GIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DMSS_GIT_COMMIT_INPUT=${MSS_GIT_COMMIT}"
+        "-DMSS_BUILD_REVISION_INPUT=${MSS_BUILD_REVISION}"
+        "-DMSS_BUILD_TIMESTAMP_INPUT=${MSS_BUILD_TIMESTAMP}"
+        "-DMSS_VERSION_HEADER=${MSS_BUILD_VERSION_HEADER}"
+        "-DMSS_TIMESTAMP_HEADER=${MSS_BUILD_TIMESTAMP_HEADER}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateBuildInfo.cmake"
+    BYPRODUCTS
+        "${MSS_BUILD_VERSION_HEADER}"
+        "${MSS_BUILD_TIMESTAMP_HEADER}"
+    COMMENT "Refreshing build version and timestamp"
+    VERBATIM
+)
+
 add_library(mss_sqlite STATIC third_party/sqlite-amalgamation/sqlite3.c)
 target_include_directories(mss_sqlite PUBLIC third_party/sqlite-amalgamation)
 target_compile_definitions(mss_sqlite PRIVATE
@@ -121,12 +168,13 @@ target_include_directories(monero_solo_core
     PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+    PRIVATE
+        "${MSS_GENERATED_INCLUDE_DIR}"
 )
 target_compile_definitions(monero_solo_core PUBLIC
-    MSS_VERSION="${PROJECT_VERSION}"
-    MSS_GIT_COMMIT="${MSS_GIT_COMMIT}"
     MSS_MSPV_COMMIT="856c015de433a23fe45d88a18dc08c821e50f1cb"
 )
+add_dependencies(monero_solo_core mss_build_info)
 target_link_libraries(monero_solo_core
     PUBLIC
         mspv::verifier
@@ -160,6 +208,9 @@ if(MSS_ENABLE_TSAN AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_executable(monero-solo-stratum src/main.cpp)
+target_include_directories(monero-solo-stratum PRIVATE
+    "${MSS_GENERATED_INCLUDE_DIR}")
+add_dependencies(monero-solo-stratum mss_build_info)
 target_link_libraries(monero-solo-stratum PRIVATE monero_solo::core)
 
 install(TARGETS monero-solo-stratum RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

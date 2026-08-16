@@ -127,12 +127,13 @@ void EntropyManager::mandatory_reseed_locked(std::string_view reason)
     reseed_locked(sample, reason);
 }
 
-void EntropyManager::try_timed_reseed_locked(Clock::time_point current)
+bool EntropyManager::try_timed_reseed_locked(Clock::time_point current)
 {
     std::array<std::uint8_t, 32> sample{};
     try {
         entropy_source_(sample, true);
         reseed_locked(sample, kTimeReason);
+        return true;
     } catch (...) {
         OPENSSL_cleanse(sample.data(), sample.size());
         degraded_ = true;
@@ -140,6 +141,7 @@ void EntropyManager::try_timed_reseed_locked(Clock::time_point current)
             current + std::chrono::seconds(timed_retry_delay_seconds_);
         timed_retry_delay_seconds_ =
             std::min<std::uint32_t>(timed_retry_delay_seconds_ * 2, 60);
+        return false;
     }
 }
 
@@ -158,7 +160,7 @@ Bytes EntropyManager::generate(std::size_t bytes,
     const auto interval = std::chrono::seconds(config_.reseed_interval_seconds);
     if (current - last_successful_reseed_ >= interval &&
         current >= next_timed_reseed_retry_) {
-        try_timed_reseed_locked(current);
+        (void)try_timed_reseed_locked(current);
         current = now();
     }
     if (current - last_successful_reseed_ >=
@@ -199,6 +201,38 @@ Id16 EntropyManager::private_job_id()
     return generate_id("private-job-id/v1");
 }
 
+EntropyMaintenanceResult EntropyManager::maintain()
+{
+    std::lock_guard lock(mutex_);
+    if (pid() != creator_pid_) {
+        mandatory_reseed_locked(kForkReason);
+        const Clock::time_point current = now();
+        return {.attempted = true,
+                .succeeded = true,
+                .issuance_allowed = issuance_allowed_locked(current),
+                .degraded = degraded_,
+                .reason = EntropyReseedReason::fork};
+    }
+
+    Clock::time_point current = now();
+    const auto interval = std::chrono::seconds(config_.reseed_interval_seconds);
+    if (current - last_successful_reseed_ >= interval &&
+        current >= next_timed_reseed_retry_) {
+        const bool succeeded = try_timed_reseed_locked(current);
+        current = now();
+        return {.attempted = true,
+                .succeeded = succeeded,
+                .issuance_allowed = issuance_allowed_locked(current),
+                .degraded = degraded_,
+                .reason = EntropyReseedReason::timed};
+    }
+    return {.attempted = false,
+            .succeeded = false,
+            .issuance_allowed = issuance_allowed_locked(current),
+            .degraded = degraded_,
+            .reason = EntropyReseedReason::none};
+}
+
 bool EntropyManager::degraded() const
 {
     std::lock_guard lock(mutex_);
@@ -208,8 +242,14 @@ bool EntropyManager::degraded() const
 bool EntropyManager::issuance_allowed() const
 {
     std::lock_guard lock(mutex_);
-    return now() - last_successful_reseed_ <
-           std::chrono::seconds(config_.max_reseed_age_seconds);
+    return issuance_allowed_locked(now());
+}
+
+bool EntropyManager::issuance_allowed_locked(const Clock::time_point current) const
+{
+    return pid() == creator_pid_ &&
+           current - last_successful_reseed_ <
+               std::chrono::seconds(config_.max_reseed_age_seconds);
 }
 
 std::uint64_t EntropyManager::generate_calls() const

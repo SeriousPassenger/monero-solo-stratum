@@ -166,6 +166,134 @@ void test_default_max_reseed_age_fails_closed()
             "maximum reseed age bypassed the timed reseed retry schedule");
 }
 
+void test_idle_maintenance_reseeds_without_output()
+{
+    using Clock = monero_solo::EntropyManager::Clock;
+    Clock::time_point now{};
+    unsigned reads = 0;
+    std::vector<bool> nonblocking_reads;
+    const auto source = [&](std::span<std::uint8_t> output, bool nonblocking) {
+        ++reads;
+        nonblocking_reads.push_back(nonblocking);
+        std::fill(output.begin(), output.end(), static_cast<std::uint8_t>(reads));
+    };
+    monero_solo::EntropyConfig config;
+    config.reseed_interval_seconds = 2;
+    config.max_reseed_age_seconds = 3;
+    monero_solo::EntropyManager manager(config, source, [&] { return now; });
+
+    now += std::chrono::seconds(3);
+    require(!manager.issuance_allowed(),
+            "idle entropy remained available at the maximum age");
+    const auto result = manager.maintain();
+    require(result.attempted && result.succeeded && result.issuance_allowed &&
+                !result.degraded &&
+                result.reason == monero_solo::EntropyReseedReason::timed,
+            "idle maintenance did not recover timed entropy");
+    require(reads == 2 && !nonblocking_reads.front() &&
+                nonblocking_reads.back(),
+            "idle maintenance used the wrong entropy source mode");
+    require(manager.generate_calls() == 0,
+            "idle maintenance generated output or changed the call counter");
+}
+
+void test_idle_maintenance_retries_after_expiry()
+{
+    using Clock = monero_solo::EntropyManager::Clock;
+    Clock::time_point now{};
+    unsigned reads = 0;
+    const auto source = [&](std::span<std::uint8_t> output, bool nonblocking) {
+        ++reads;
+        if (reads == 1 || reads == 9) {
+            require(nonblocking == (reads != 1),
+                    "maintenance entropy source mode mismatch");
+            std::fill(output.begin(), output.end(), static_cast<std::uint8_t>(reads));
+            return;
+        }
+        require(nonblocking, "timed maintenance retry was blocking");
+        throw monero_solo::EntropyError("injected maintenance failure");
+    };
+    monero_solo::EntropyConfig config;
+    config.reseed_interval_seconds = 2;
+    config.max_reseed_age_seconds = 4;
+    monero_solo::EntropyManager manager(config, source, [&] { return now; });
+
+    const std::array<unsigned, 8> retry_deadlines{2, 3, 5, 9, 17, 33, 65, 125};
+    const std::array<std::uint32_t, 7> retry_delays{2, 4, 8, 16, 32, 60, 60};
+    for (std::size_t index = 0; index < retry_deadlines.size(); ++index) {
+        if (index != 0) {
+            now = Clock::time_point{} +
+                  std::chrono::seconds(retry_deadlines[index] - 1U);
+            const auto early = manager.maintain();
+            require(!early.attempted,
+                    "maintenance touched the source before its retry deadline");
+        }
+        now = Clock::time_point{} +
+              std::chrono::seconds(retry_deadlines[index]);
+        const auto result = manager.maintain();
+        require(result.attempted &&
+                    result.reason == monero_solo::EntropyReseedReason::timed,
+                "maintenance skipped a retry deadline");
+        if (index + 1U < retry_deadlines.size()) {
+            require(!result.succeeded && result.degraded &&
+                        manager.timed_retry_delay_seconds() ==
+                            retry_delays[index],
+                    "maintenance retry backoff mismatch");
+            if (retry_deadlines[index] >= config.max_reseed_age_seconds) {
+                require(!result.issuance_allowed,
+                        "expired entropy remained available after retry failure");
+            }
+        }
+        else {
+            require(result.succeeded && result.issuance_allowed &&
+                        !result.degraded &&
+                        manager.timed_retry_delay_seconds() == 1,
+                    "maintenance did not recover after maximum-age expiry");
+        }
+        require(manager.generate_calls() == 0,
+                "maintenance retry generated DRBG output");
+    }
+    require(reads == 9, "maintenance retry touched the entropy source unexpectedly");
+}
+
+void test_maintenance_preserves_count_and_fork_semantics()
+{
+    using Clock = monero_solo::EntropyManager::Clock;
+    Clock::time_point now{};
+    pid_t process_id = 10;
+    unsigned reads = 0;
+    std::vector<bool> nonblocking_reads;
+    const auto source = [&](std::span<std::uint8_t> output, bool nonblocking) {
+        ++reads;
+        nonblocking_reads.push_back(nonblocking);
+        std::fill(output.begin(), output.end(), static_cast<std::uint8_t>(reads));
+    };
+    monero_solo::EntropyConfig config;
+    config.reseed_interval_seconds = 100;
+    config.max_reseed_age_seconds = 200;
+    config.max_generate_calls = 1;
+    monero_solo::EntropyManager manager(
+        config, source, [&] { return now; }, [&] { return process_id; });
+    (void)manager.private_job_id();
+    require(manager.generate_calls() == 1, "count fixture did not generate output");
+    require(!manager.maintain().attempted && manager.generate_calls() == 1 &&
+                reads == 1,
+            "maintenance consumed the count-reseed budget");
+    (void)manager.private_job_id();
+    require(reads == 2 && !nonblocking_reads.back(),
+            "count reseed was not left to output generation");
+
+    process_id = 11;
+    now += std::chrono::seconds(100);
+    const auto fork = manager.maintain();
+    require(fork.attempted && fork.succeeded && fork.issuance_allowed &&
+                fork.reason == monero_solo::EntropyReseedReason::fork &&
+                reads == 3 && !nonblocking_reads.back(),
+            "maintenance did not perform a mandatory fork reseed first");
+    require(manager.generate_calls() == 0,
+            "fork maintenance generated output");
+}
+
 } // namespace
 
 int main()
@@ -176,6 +304,9 @@ int main()
         test_timed_backoff();
         test_default_timed_reseed_boundary();
         test_default_max_reseed_age_fails_closed();
+        test_idle_maintenance_reseeds_without_output();
+        test_idle_maintenance_retries_after_expiry();
+        test_maintenance_preserves_count_and_fork_semantics();
         std::cout << "entropy tests passed\n";
         return 0;
     } catch (const std::exception &error) {

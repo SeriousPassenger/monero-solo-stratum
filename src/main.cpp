@@ -1,4 +1,6 @@
 #include "monero_solo/config.hpp"
+#include "monero_solo/build_timestamp.hpp"
+#include "monero_solo/build_version.hpp"
 #include "monero_solo/logger.hpp"
 #include "monero_solo/runtime.hpp"
 
@@ -36,7 +38,12 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (argument == "--version") {
-            std::cout << "monero-solo-stratum " << MSS_VERSION << "\n";
+            std::cout
+                << "monero-solo-stratum " << MSS_VERSION << '\n'
+                << "Built: " << MSS_BUILD_TIMESTAMP << '\n'
+                << "Copyright (c) 2026 SeriousPassenger\n"
+                << "License: MIT\n"
+                << "Source: https://github.com/SeriousPassenger/monero-solo-stratum\n";
             return 0;
         }
         if (argument == "--check-config") {
